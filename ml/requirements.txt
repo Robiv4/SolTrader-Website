@@ -1,0 +1,6 @@
+# SolTrader offline ML (CPU only, open-source). Pinned for reproducibility.
+numpy==2.2.6
+pandas==2.2.3
+scikit-learn==1.6.1
+lightgbm==4.6.0
+pytest==8.3.5

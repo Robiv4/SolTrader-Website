@@ -1,0 +1,61 @@
+{
+  "name": "soltrader",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "packageManager": "pnpm@9.12.3",
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "dev": "pnpm -r --parallel dev",
+    "build": "pnpm -r --parallel build",
+    "lint": "pnpm -r --parallel lint",
+    "typecheck": "pnpm -r --parallel typecheck",
+    "test": "vitest run",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "db:generate": "prisma generate",
+    "db:check": "node scripts/db-guard.mjs check",
+    "db:backup": "node scripts/db-guard.mjs backup",
+    "db:verify-backup": "node scripts/db-guard.mjs verify-backup",
+    "db:create-migration": "node scripts/db-guard.mjs create-migration",
+    "db:migrate": "node scripts/db-guard.mjs migrate-dev",
+    "db:deploy": "node scripts/db-guard.mjs deploy",
+    "db:prisma": "node scripts/db-guard.mjs prisma",
+    "ml:setup": "pnpm --silent --filter @soltrader/worker run ml setup",
+    "ml:schema": "pnpm --silent --filter @soltrader/worker run ml schema",
+    "ml:dataset": "pnpm --silent --filter @soltrader/worker run ml dataset",
+    "ml:train": "pnpm --silent --filter @soltrader/worker run ml train",
+    "ml:status": "pnpm --silent --filter @soltrader/worker run ml status",
+    "ml:test": "pnpm --silent --filter @soltrader/worker run ml test"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.16.0",
+    "@prisma/client": "5.22.0",
+    "@types/node": "^22.10.2",
+    "@typescript-eslint/eslint-plugin": "^8.17.0",
+    "@typescript-eslint/parser": "^8.17.0",
+    "eslint": "^9.16.0",
+    "eslint-config-next": "^15.0.3",
+    "eslint-config-prettier": "^10.0.0",
+    "eslint-plugin-import": "^2.0.0",
+    "prettier": "^3.3.1",
+    "prisma": "^5.22.0",
+    "typescript": "^5.8.0",
+    "vitest": "^2.1.4"
+  },
+  "dependencies": {
+    "@types/cookie-parser": "^1.4.10",
+    "bcryptjs": "^3.0.3",
+    "cookie-parser": "^1.4.7",
+    "express-rate-limit": "^8.7.0"
+  },
+  "pnpm": {
+    "overrides": {
+      "sharp": ">=0.35.4",
+      "postcss": ">=8.5.18"
+    }
+  }
+}

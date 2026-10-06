@@ -1,0 +1,14 @@
+node_modules/
+.pnpm-store/
+.env
+.env.local
+.env.*.local
+.next/
+out/
+dist/
+coverage/
+*.log
+.DS_Store
+.vscode/
+postgres-data/
+redis-data/

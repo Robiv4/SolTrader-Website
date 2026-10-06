@@ -1,0 +1,1 @@
+CREATE UNIQUE INDEX "PaperOrder_signalId_key" ON "PaperOrder"("signalId");

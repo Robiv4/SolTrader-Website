@@ -1,0 +1,367 @@
+{
+  "featureVersion": "ML-FEATURES-v1",
+  "features": [
+    {
+      "name": "source",
+      "group": "SOURCE",
+      "type": "category",
+      "values": [
+        "PUMP_FUN",
+        "RAYDIUM",
+        "METEORA"
+      ],
+      "description": "Discovery source"
+    },
+    {
+      "name": "observationAgeSeconds",
+      "group": "AGE",
+      "type": "number",
+      "description": "snapshotAt - detectedAt (s)"
+    },
+    {
+      "name": "tokenAgeSeconds",
+      "group": "AGE",
+      "type": "number",
+      "description": "snapshotAt - on-chain createdAt (s); null if createdAt unknown"
+    },
+    {
+      "name": "tradableAgeSeconds",
+      "group": "AGE",
+      "type": "number",
+      "description": "snapshotAt - first trade (s); null before the first trade"
+    },
+    {
+      "name": "liquidityUsd",
+      "group": "MARKET",
+      "type": "number",
+      "transform": "log1p",
+      "description": "Liquidity (bonding curve: 2 x real SOL reserve in USD)"
+    },
+    {
+      "name": "priceChangeSinceDetectionPct",
+      "group": "MARKET",
+      "type": "number",
+      "transform": "signed_log1p",
+      "description": "Price change since the first observation (%)"
+    },
+    {
+      "name": "volumeUsd",
+      "group": "MARKET",
+      "type": "number",
+      "transform": "log1p",
+      "description": "Cumulative traded volume since detection (USD)"
+    },
+    {
+      "name": "volume10sUsd",
+      "group": "MARKET",
+      "type": "number",
+      "transform": "log1p",
+      "description": "Volume in the last 10 s (null if not covered)"
+    },
+    {
+      "name": "volume30sUsd",
+      "group": "MARKET",
+      "type": "number",
+      "transform": "log1p",
+      "description": "Volume in the last 30 s (null if not covered)"
+    },
+    {
+      "name": "volume1mUsd",
+      "group": "MARKET",
+      "type": "number",
+      "transform": "log1p",
+      "description": "Volume in the last 60 s (null if not covered)"
+    },
+    {
+      "name": "buyVolumeUsd",
+      "group": "MARKET",
+      "type": "number",
+      "transform": "log1p",
+      "description": "Cumulative buy volume (USD)"
+    },
+    {
+      "name": "sellVolumeUsd",
+      "group": "MARKET",
+      "type": "number",
+      "transform": "log1p",
+      "description": "Cumulative sell volume (USD)"
+    },
+    {
+      "name": "buyCount",
+      "group": "MARKET",
+      "type": "number",
+      "transform": "log1p",
+      "description": "Cumulative buys"
+    },
+    {
+      "name": "sellCount",
+      "group": "MARKET",
+      "type": "number",
+      "transform": "log1p",
+      "description": "Cumulative sells"
+    },
+    {
+      "name": "buySellRatio",
+      "group": "MARKET",
+      "type": "number",
+      "transform": "log1p",
+      "description": "Buy count / sell count"
+    },
+    {
+      "name": "buySellVolumeRatio",
+      "group": "MARKET",
+      "type": "number",
+      "transform": "log1p",
+      "description": "Buy volume / sell volume"
+    },
+    {
+      "name": "transactionRate",
+      "group": "MARKET",
+      "type": "number",
+      "transform": "log1p",
+      "description": "Transactions per second since detection"
+    },
+    {
+      "name": "uniqueBuyers",
+      "group": "MARKET",
+      "type": "number",
+      "transform": "log1p",
+      "description": "Distinct buying wallets"
+    },
+    {
+      "name": "uniqueSellers",
+      "group": "MARKET",
+      "type": "number",
+      "transform": "log1p",
+      "description": "Distinct selling wallets"
+    },
+    {
+      "name": "uniqueBuyerGrowthPct",
+      "group": "MARKET",
+      "type": "number",
+      "transform": "signed_log1p",
+      "description": "Unique buyer growth over the observation (%)"
+    },
+    {
+      "name": "priceVelocityPctPerMin",
+      "group": "MARKET",
+      "type": "number",
+      "transform": "signed_log1p",
+      "description": "Price change per minute (%)"
+    },
+    {
+      "name": "volumeVelocityUsdPerMin",
+      "group": "MARKET",
+      "type": "number",
+      "transform": "log1p",
+      "description": "Volume per minute (USD)"
+    },
+    {
+      "name": "transactionAcceleration",
+      "group": "MARKET",
+      "type": "number",
+      "transform": "log1p",
+      "description": "Recent-half / first-half transactions (> 1 accelerating)"
+    },
+    {
+      "name": "buyVolumeAcceleration",
+      "group": "MARKET",
+      "type": "number",
+      "transform": "log1p",
+      "description": "Recent-half / first-half buy volume"
+    },
+    {
+      "name": "liquidityChangePct",
+      "group": "MARKET",
+      "type": "number",
+      "transform": "signed_log1p",
+      "description": "Liquidity change since detection (%)"
+    },
+    {
+      "name": "volatilityPct",
+      "group": "MARKET",
+      "type": "number",
+      "transform": "log1p",
+      "description": "Launch volatility (%)"
+    },
+    {
+      "name": "drawdownFromHighPct",
+      "group": "MARKET",
+      "type": "number",
+      "description": "Drawdown from the launch high (%, <= 0)"
+    },
+    {
+      "name": "recentSellShare",
+      "group": "MARKET",
+      "type": "number",
+      "description": "Sell share of recent transactions (0-1)"
+    },
+    {
+      "name": "estimatedBuyImpactPct",
+      "group": "STRUCTURE",
+      "type": "number",
+      "transform": "log1p",
+      "description": "Price impact of the 20 USD reference order (%)"
+    },
+    {
+      "name": "largestBuyerShare",
+      "group": "STRUCTURE",
+      "type": "number",
+      "description": "Largest buyer share of buy volume (0-1)"
+    },
+    {
+      "name": "buysPerBuyer",
+      "group": "STRUCTURE",
+      "type": "number",
+      "transform": "log1p",
+      "description": "Buys per distinct buyer"
+    },
+    {
+      "name": "creatorSoldRatio",
+      "group": "STRUCTURE",
+      "type": "number",
+      "description": "Creator sold / bought tokens (observed in the trade stream)"
+    },
+    {
+      "name": "largestHolderSupplyShare",
+      "group": "STRUCTURE",
+      "type": "number",
+      "description": "Largest observed wallet holding / total supply (trade stream, not on-chain holders)"
+    },
+    {
+      "name": "creatorHoldingShare",
+      "group": "STRUCTURE",
+      "type": "number",
+      "description": "Creator net holding / total supply (dev allocation, observed)"
+    },
+    {
+      "name": "mintAuthorityRevoked",
+      "group": "SECURITY",
+      "type": "boolean",
+      "description": "Mint authority revoked (null = unknown)"
+    },
+    {
+      "name": "freezeAuthorityRevoked",
+      "group": "SECURITY",
+      "type": "boolean",
+      "description": "Freeze authority revoked (null = unknown)"
+    },
+    {
+      "name": "tokenProgram2022",
+      "group": "SECURITY",
+      "type": "boolean",
+      "description": "Token-2022 program (null = unknown)"
+    },
+    {
+      "name": "restrictedExtension",
+      "group": "SECURITY",
+      "type": "boolean",
+      "description": "Has a transfer-restricting Token-2022 extension (null = unknown)"
+    },
+    {
+      "name": "sellabilityVerified",
+      "group": "SECURITY",
+      "type": "boolean",
+      "description": "Real sells observed from non-creator wallets"
+    },
+    {
+      "name": "riskScore",
+      "group": "RISK",
+      "type": "number",
+      "description": "Risk engine score at snapshot time (null = not assessed)"
+    },
+    {
+      "name": "launchScore",
+      "group": "LAUNCH",
+      "type": "number",
+      "description": "Launch Score (ML reference settings, not the per-user config)"
+    },
+    {
+      "name": "launchMomentumScore",
+      "group": "LAUNCH",
+      "type": "number",
+      "description": "Launch Momentum score"
+    },
+    {
+      "name": "launchExhaustionScore",
+      "group": "LAUNCH",
+      "type": "number",
+      "description": "Launch Exhaustion score"
+    },
+    {
+      "name": "launchDataQuality",
+      "group": "LAUNCH",
+      "type": "number",
+      "description": "Launch data quality (reference settings)"
+    },
+    {
+      "name": "socialAvailable",
+      "group": "SOCIAL",
+      "type": "boolean",
+      "description": "A social provider had usable data for this token"
+    },
+    {
+      "name": "telegramMomentum",
+      "group": "SOCIAL",
+      "type": "number",
+      "description": "Telegram Momentum (null = no Telegram data)"
+    },
+    {
+      "name": "telegramQuality",
+      "group": "SOCIAL",
+      "type": "number",
+      "description": "Telegram Quality"
+    },
+    {
+      "name": "telegramSpam",
+      "group": "SOCIAL",
+      "type": "number",
+      "description": "Telegram spam / coordination likelihood"
+    },
+    {
+      "name": "telegramExhaustion",
+      "group": "SOCIAL",
+      "type": "number",
+      "description": "Telegram exhaustion"
+    },
+    {
+      "name": "telegramDataQuality",
+      "group": "SOCIAL",
+      "type": "number",
+      "description": "Telegram data quality"
+    },
+    {
+      "name": "telegramMessages1m",
+      "group": "SOCIAL",
+      "type": "number",
+      "transform": "log1p",
+      "description": "Telegram messages in the last minute"
+    },
+    {
+      "name": "telegramMessages5m",
+      "group": "SOCIAL",
+      "type": "number",
+      "transform": "log1p",
+      "description": "Telegram messages in the last 5 minutes"
+    },
+    {
+      "name": "telegramUniqueUsers5m",
+      "group": "SOCIAL",
+      "type": "number",
+      "transform": "log1p",
+      "description": "Telegram active users (5 min)"
+    },
+    {
+      "name": "telegramUserGrowth1m",
+      "group": "SOCIAL",
+      "type": "number",
+      "description": "Telegram active user growth (1 min)"
+    },
+    {
+      "name": "telegramTop3Share",
+      "group": "SOCIAL",
+      "type": "number",
+      "description": "Top-3 user share of Telegram messages"
+    }
+  ]
+}

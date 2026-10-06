@@ -1,0 +1,1456 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+  // Prisma RESETS the shadow database. It must be a separate, dedicated database (never DATABASE_URL);
+  // scripts/db-guard.mjs validates this. Not needed for generate / migrate deploy.
+  shadowDatabaseUrl = env("SHADOW_DATABASE_URL")
+}
+
+enum TradingMode {
+  PAPER
+  LIVE
+  SEMI_AUTO
+  SCANNER
+}
+
+enum TradeSide {
+  BUY
+  SELL
+}
+
+enum TradeStatus {
+  PENDING
+  OPEN
+  CLOSED
+  FAILED
+}
+
+enum ExecutionMode {
+  PAPER
+  LIVE
+  SEMI_AUTO
+  SCANNER
+}
+
+enum BotStatus {
+  STOPPED
+  RUNNING
+  PAUSED
+  EMERGENCY_STOP
+}
+
+enum RiskEventType {
+  POSITION_LIMIT
+  DRAWDOWN
+  VOLATILITY
+  SLIPPAGE
+  MANUAL_OVERRIDE
+}
+
+enum NotificationType {
+  INFO
+  WARNING
+  ERROR
+  SUCCESS
+}
+
+enum UserRole {
+  ADMIN
+  USER
+}
+
+enum WalletType {
+  USER
+  BOT_TRADING
+}
+
+enum RiskDecision {
+  ACCEPT
+  WATCH
+  REJECT
+}
+
+enum RiskClassification {
+  LOW
+  MODERATE
+  HIGH
+  VERY_HIGH
+  EXTREME
+  BLOCKED
+}
+
+enum RiskPolicy {
+  CONSERVATIVE
+  BALANCED
+  EXPLORATORY
+}
+
+enum PaperOrderStatus {
+  QUEUED
+  PARTIALLY_FILLED
+  FILLED
+  REJECTED
+  CANCELLED
+}
+
+enum ApprovalStatus {
+  PENDING
+  APPROVED
+  REJECTED
+  EXPIRED
+  STALE
+  EXECUTED
+}
+
+enum SignalDirection {
+  BUY
+  SELL
+  WATCH
+}
+
+model User {
+  id           String   @id @default(cuid())
+  email        String   @unique
+  passwordHash String?
+  name         String?
+  role         UserRole @default(USER)
+  /// Profile picture (max 128x128, PNG / JPEG / WebP, <= 200 KB), served by GET /api/users/:id/avatar.
+  avatarImage     Bytes?
+  avatarMime      String?
+  avatarUpdatedAt DateTime?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  botConfigs          BotConfig[]
+  advancedStrategyConfig AdvancedStrategyConfig?
+  riskConfigs         RiskConfig[]
+  strategyConfigs     StrategyConfig[]
+  notificationConfigs NotificationConfig[]
+  wallets            Wallet[]
+  auditLogs           AuditLog[]
+  trades              Trade[]
+  positions           Position[]
+  sessions            Session[]
+  riskAssessments     RiskAssessment[]
+  signals             Signal[]
+  paperAccounts       PaperAccount[]
+  paperOrders         PaperOrder[]
+    approvalRequests    ApprovalRequest[]
+  backtestRuns        BacktestRun[]
+    executionAttempts   ExecutionAttempt[]
+  aiConfig AiConfig?
+  aiAnalyses AiAnalysis[]
+  newLaunchConfig NewLaunchConfig?
+  launchDecisions LaunchDecision[]
+  newLaunchConfigVersions NewLaunchConfigVersion[]
+  newLaunchOptimizationRuns NewLaunchOptimizationRun[]
+  newLaunchRecommendations NewLaunchOptimizationRecommendation[]
+  trustedLoginIps     TrustedLoginIp[]
+  verificationChallenges VerificationChallenge[]
+}
+
+model PaperAccount {
+  id             String   @id @default(cuid())
+  userId         String   @unique
+  currency       String   @default("USDC")
+  initialBalance Decimal  @db.Decimal(18, 8)
+  cashBalance    Decimal  @db.Decimal(18, 8)
+  equity         Decimal  @db.Decimal(18, 8)
+  realizedPnl    Decimal  @db.Decimal(18, 8) @default(0)
+  unrealizedPnl  Decimal  @db.Decimal(18, 8) @default(0)
+  totalFees      Decimal  @db.Decimal(18, 8) @default(0)
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  orders PaperOrder[]
+
+  @@index([userId])
+}
+
+model PaperOrder {
+  id                 String           @id @default(cuid())
+  paperAccountId     String
+  userId             String
+  tokenAddress       String
+  symbol             String
+  side               TradeSide
+  strategyName       String?
+  signalId           String?
+  status             PaperOrderStatus @default(QUEUED)
+  requestedNotionalUsd Decimal        @db.Decimal(18, 8)
+  filledNotionalUsd  Decimal        @db.Decimal(18, 8) @default(0)
+  quantity           Decimal        @db.Decimal(18, 8) @default(0)
+  executionPriceUsd  Decimal?       @db.Decimal(30, 18)
+  feeUsd             Decimal        @db.Decimal(18, 8) @default(0)
+  slippageUsd        Decimal        @db.Decimal(18, 8) @default(0)
+  priorityFeeUsd     Decimal        @db.Decimal(18, 8) @default(0)
+  executionDelayMs   Int            @default(0)
+  partialFillRatio   Decimal?       @db.Decimal(5, 4)
+  signalScore        Decimal?       @db.Decimal(5, 2)
+  riskScore          Decimal?       @db.Decimal(5, 2)
+  rejectionReason    String?
+  metadata           Json?
+  createdAt          DateTime       @default(now())
+  updatedAt          DateTime       @updatedAt
+
+  paperAccount PaperAccount @relation(fields: [paperAccountId], references: [id], onDelete: Cascade)
+  user         User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  fills        PaperFill[]
+
+  @@index([paperAccountId, createdAt])
+  @@index([userId, createdAt])
+  @@unique([signalId])
+}
+
+model PaperFill {
+  id            String   @id @default(cuid())
+  paperOrderId  String
+  tokenAddress  String
+  symbol        String
+  quantity      Decimal  @db.Decimal(18, 8)
+  priceUsd      Decimal  @db.Decimal(30, 18)
+  notionalUsd   Decimal  @db.Decimal(18, 8)
+  feeUsd        Decimal  @db.Decimal(18, 8)
+  slippageUsd   Decimal  @db.Decimal(18, 8)
+  filledAt      DateTime @default(now())
+
+  paperOrder PaperOrder @relation(fields: [paperOrderId], references: [id], onDelete: Cascade)
+
+  @@index([paperOrderId])
+}
+
+model ApprovalRequest {
+  id                String         @id @default(cuid())
+  userId            String
+  signalId          String
+  tokenId           String
+  status            ApprovalStatus @default(PENDING)
+  direction         TradeSide
+  signalScore       Decimal        @db.Decimal(5, 2)
+  riskScore         Decimal        @db.Decimal(5, 2)
+  entryPrice        Decimal        @db.Decimal(30, 18)
+  positionSize      Decimal        @db.Decimal(18, 8)
+  stopLoss          Decimal?       @db.Decimal(30, 18)
+  takeProfit        Decimal?       @db.Decimal(30, 18)
+  trailingStop      Decimal?       @db.Decimal(5, 4)
+  reasons           Json
+  proposedOrderHash String         @unique
+  proposedAt        DateTime       @default(now())
+  expiresAt         DateTime
+  reviewedAt        DateTime?
+  executedAt        DateTime?
+  rejectionReason   String?
+  createdAt         DateTime       @default(now())
+  updatedAt         DateTime       @updatedAt
+
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  signal Signal @relation(fields: [signalId], references: [id], onDelete: Cascade)
+  token  Token  @relation(fields: [tokenId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, signalId])
+  @@index([userId, status, expiresAt])
+  @@index([signalId])
+}
+
+model ExecutionAttempt {
+  id                String   @id @default(cuid())
+  userId            String
+  idempotencyKey    String
+  requestFingerprint String
+  state             String
+  attemptCount      Int      @default(1)
+  transactionSignature String?
+  request           Json
+  record            Json
+  lastError         String?
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, idempotencyKey])
+  @@index([userId, state, updatedAt])
+  @@index([transactionSignature])
+}
+
+model BotState {
+  id        String    @id
+  status    BotStatus @default(STOPPED)
+  updatedAt DateTime  @updatedAt
+  updatedBy String?
+
+  @@index([status])
+  @@index([updatedAt])
+}
+
+model BotStrategyConfig {
+  id           String   @id @default(cuid())
+  strategyName String   @unique
+  isEnabled    Boolean  @default(false)
+  configJson   Json
+  maxExposure  Decimal? @db.Decimal(18, 8)
+  maxPositions Int?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  @@index([isEnabled])
+}
+
+model Session {
+  id        String   @id @default(cuid())
+  userId    String
+  tokenHash String   @unique
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([expiresAt])
+}
+
+model BotConfig {
+  id                    String      @id @default(cuid())
+  userId                String      @unique
+  botName               String      @default("main-bot")
+  tradingMode           TradingMode @default(PAPER)
+  isLiveEnabled         Boolean     @default(false)
+  liveApprovalCompleted Boolean     @default(false)
+  isScannerEnabled      Boolean     @default(true)
+  isPaperModeDefault    Boolean     @default(true)
+  isEmergencyStop       Boolean     @default(false)
+  status                BotStatus   @default(STOPPED)
+  maxPositionSize       Decimal?    @db.Decimal(18, 8)
+  maxDailyLoss          Decimal?    @db.Decimal(18, 8)
+  riskThreshold         Decimal?    @db.Decimal(5, 2)
+  preferredQuoteCurrency String     @default("USDC")
+  maxTokenAgeHours      Int?        @default(168)
+  minLiquidityUsd       Decimal?    @db.Decimal(18, 8)
+  minVolumeUsd          Decimal?    @db.Decimal(18, 8)
+  botTradingWalletAddress String?   @db.VarChar(255)
+  /// Skip a token for this user once it has stayed blocked/unbuyable this many minutes (0 = never skip).
+  skipUnbuyableAfterMinutes Int     @default(0)
+  /// How long a skipped token is left out of scanning, strategy evaluation and automatic buying.
+  skipUnbuyableForMinutes   Int     @default(60)
+  /// How many tokens the scanner keeps in its rotating pool / the token monitor shows (10-300).
+  maxMonitoredTokens        Int     @default(50)
+  createdAt             DateTime    @default(now())
+  updatedAt             DateTime    @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([status])
+  @@index([tradingMode])
+}
+
+model RiskConfig {
+  id                         String   @id @default(cuid())
+  userId                     String   @unique
+  maxPositionPercent         Decimal? @db.Decimal(5, 2)
+  maxTotalExposurePercent    Decimal? @db.Decimal(5, 2)
+  maxConcurrentPositions     Int?     @default(3)
+  dailyLossLimitPercent      Decimal? @db.Decimal(5, 2)
+  maxSlippagePercent         Decimal? @db.Decimal(5, 2)
+  minSignalScore             Decimal? @db.Decimal(5, 2)
+  cooldownSeconds            Int?     @default(60)
+  stopLossPercent            Decimal? @db.Decimal(5, 2)
+  takeProfitPercent          Decimal? @db.Decimal(5, 2)
+  trailingStopPercent        Decimal? @db.Decimal(5, 2)
+  /// Gain (percent above the entry fill) at which the trailing stop arms; null/0 = armed from entry (legacy).
+  trailingActivationPercent  Decimal? @db.Decimal(5, 2)
+  /// Optional: gain at which the stop loss is raised to the net break-even price; null/0 = disabled.
+  breakEvenActivationPercent Decimal? @db.Decimal(5, 2)
+  riskPolicy                 RiskPolicy @default(BALANCED)
+  lowRiskMax                 Int      @default(30)
+  moderateRiskMax            Int      @default(50)
+  highRiskMax                Int      @default(70)
+  veryHighRiskMax            Int      @default(85)
+  lowPositionMultiplier      Decimal  @default(1.000) @db.Decimal(4, 3)
+  moderatePositionMultiplier Decimal  @default(0.750) @db.Decimal(4, 3)
+  highPositionMultiplier     Decimal  @default(0.350) @db.Decimal(4, 3)
+  veryHighPositionMultiplier Decimal  @default(0.150) @db.Decimal(4, 3)
+  aiAnalysisEnabled          Boolean  @default(false)
+  aiRequiredForHighRisk       Boolean  @default(false)
+  aiRequiredForVeryHighRisk   Boolean  @default(false)
+  allowManualPaperWatchBuy    Boolean  @default(true)
+  createdAt                  DateTime @default(now())
+  updatedAt                  DateTime @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+/// Per-user settings of the New Launch / Sniper strategy (PAPER only). Defaults are PAPER experiment values.
+model NewLaunchConfig {
+  id                         String   @id @default(cuid())
+  userId                     String   @unique
+  enabled                    Boolean  @default(false)
+  minAgeSeconds              Int      @default(5)
+  maxAgeSeconds              Int      @default(90)
+  observationSeconds         Int      @default(10)
+  cooldownSeconds            Int      @default(60)
+  minTransactions            Int      @default(15)
+  minUniqueBuyers            Int      @default(10)
+  minBuySellRatio            Decimal  @default(1.5) @db.Decimal(6, 2)
+  minLaunchVolumeUsd         Decimal  @default(2000) @db.Decimal(14, 2)
+  minScore                   Int      @default(70)
+  maxExhaustionScore         Int      @default(70)
+  minLiquidityUsd            Decimal  @default(10000) @db.Decimal(14, 2)
+  maxLiquidityUsd            Decimal? @db.Decimal(14, 2)
+  maxPriceImpactPercent      Decimal  @default(3) @db.Decimal(6, 2)
+  liquidityOutflowWarningPercent Decimal @default(25) @db.Decimal(6, 2)
+  liquidityCriticalPercent   Decimal  @default(50) @db.Decimal(6, 2)
+  maxRiskScore               Int      @default(80)
+  maxPositionPercent         Decimal  @default(1) @db.Decimal(6, 2)
+  maxConcurrentPositions     Int      @default(2)
+  /// Distinct non-creator wallets whose sells must be observed before sellability counts as verified.
+  minObservedSellers         Int      @default(1)
+  /// Runs as a separate PAPER experiment next to Strategy/AI mode (central duplicate/risk controls still apply).
+  independentMode            Boolean  @default(true)
+  useAiConfirmation          Boolean  @default(false)
+  /// Active experiment/config version (NL-v1, NL-v2, ...); a new version is created on every settings change.
+  configVersion              String   @default("NL-v1")
+  // --- NewLaunch-only exit strategy (independent of the Strategy/AI exit settings) ---
+  stopLossPercent            Decimal  @default(20) @db.Decimal(6, 2)
+  takeProfitPercent          Decimal  @default(25) @db.Decimal(7, 2)
+  breakEvenEnabled           Boolean  @default(true)
+  breakEvenActivationPercent Decimal  @default(10) @db.Decimal(6, 2)
+  /// Break-even stop = entry fill * (1 + buffer%); 0.6 = the two PAPER fees (2 x 0.30%).
+  breakEvenCostBufferPercent Decimal  @default(0.6) @db.Decimal(6, 3)
+  // Exit capacity / dynamic position sizing (MONITOR_ONLY by default: recommendation only, size unchanged)
+  dynamicPositionSizingEnabled   Boolean @default(true)
+  exitCapacityMode               String  @default("MONITOR_ONLY")
+  maxEstimatedEntryImpactPct     Decimal @default(3) @db.Decimal(6, 3)
+  maxEstimatedExitImpactPct      Decimal @default(3) @db.Decimal(6, 3)
+  maxEstimatedRoundTripImpactPct Decimal @default(6) @db.Decimal(6, 3)
+  minExitCapacityScore           Int     @default(50)
+  maxLiquidityUtilizationPct     Decimal @default(5) @db.Decimal(6, 3)
+  minimumExecutablePosition      Decimal @default(5) @db.Decimal(18, 6)
+  positionSizeStep               Decimal @default(1) @db.Decimal(18, 6)
+  // Social Intelligence (deterministic; MONITOR_ONLY by default: never changes a decision)
+  socialIntelligenceEnabled      Boolean @default(true)
+  socialDecisionMode             String  @default("MONITOR_ONLY")
+  aiSocialAnalysisEnabled        Boolean @default(false)
+  trailingEnabled            Boolean  @default(true)
+  trailingActivationPercent  Decimal  @default(15) @db.Decimal(6, 2)
+  trailingDistancePercent    Decimal  @default(8) @db.Decimal(6, 2)
+  /// Prepared only: tiered take-profit levels [{profitPercent, sellPercent}]; not executed while disabled.
+  tieredTakeProfitEnabled    Boolean  @default(false)
+  tieredTakeProfitLevels     Json?
+  maxHoldEnabled             Boolean  @default(false)
+  maxHoldMinutes             Int      @default(30)
+  liquiditySafetyExitEnabled Boolean  @default(true)
+  liquidityDropExitPercent   Decimal  @default(50) @db.Decimal(6, 2)
+  /// Entry quality gate: {mode: OFF|MONITOR_ONLY|ENFORCE_PAPER, thresholds...}; null = MONITOR_ONLY defaults.
+  qualityGate                Json?
+  minimumRecommendationSampleSize Int @default(50)
+  createdAt                  DateTime @default(now())
+  updatedAt                  DateTime @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+/// Immutable history of NewLaunch configurations; trades reference the version they were opened with.
+model NewLaunchConfigVersion {
+  id                          String   @id @default(cuid())
+  userId                      String
+  version                     String
+  versionNumber               Int
+  entryConfig                 Json
+  exitConfig                  Json
+  qualityGate                 Json
+  parentVersion               String?
+  createdFromRecommendationId String?
+  note                        String?
+  createdAt                   DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, version])
+  @@index([userId, createdAt])
+}
+
+/// Real price-path metrics of a position (MFE / MAE / milestones), tracked live or backfilled from stored snapshots.
+model PositionPathMetric {
+  id                 String    @id @default(cuid())
+  positionId         String    @unique
+  userId             String
+  decisionSource     String?
+  configVersion      String?
+  entryPrice         Decimal   @db.Decimal(30, 18)
+  entryAt            DateTime
+  quantity           Decimal   @db.Decimal(18, 8)
+  maxPriceAfterEntry Decimal?  @db.Decimal(30, 18)
+  minPriceAfterEntry Decimal?  @db.Decimal(30, 18)
+  mfePercent         Decimal?  @db.Decimal(12, 4)
+  mfeUsd             Decimal?  @db.Decimal(18, 8)
+  timeToMfeMs        Int?
+  maePercent         Decimal?  @db.Decimal(12, 4)
+  maeUsd             Decimal?  @db.Decimal(18, 8)
+  timeToMaeMs        Int?
+  /// First time (ms after entry) each milestone was reached: {"+3": 1200, "-5": 8000, ...}.
+  milestones         Json
+  liquidityAtEntry   Decimal?  @db.Decimal(24, 8)
+  lastLiquidityUsd   Decimal?  @db.Decimal(24, 8)
+  minLiquidityUsd    Decimal?  @db.Decimal(24, 8)
+  sampleCount        Int       @default(0)
+  lastPriceAt        DateTime?
+  /// LIVE_TRACKING (monitor loop) or SNAPSHOT_BACKFILL (stored market snapshots).
+  source             String
+  updatedAt          DateTime  @updatedAt
+
+  position Position @relation(fields: [positionId], references: [id], onDelete: Cascade)
+
+  @@index([userId, decisionSource])
+  @@index([userId, configVersion])
+}
+
+/// A completed (or failed) NewLaunch analysis/optimizer run; results are cached here for the UI.
+model NewLaunchOptimizationRun {
+  id          String    @id @default(cuid())
+  userId      String
+  status      String
+  scope       Json
+  sampleSize  Int       @default(0)
+  result      Json?
+  error       String?
+  startedAt   DateTime  @default(now())
+  completedAt DateTime?
+
+  user            User                              @relation(fields: [userId], references: [id], onDelete: Cascade)
+  recommendations NewLaunchOptimizationRecommendation[]
+
+  @@index([userId, startedAt])
+}
+
+/// A PAPER experiment suggestion; never applied without an explicit user action.
+model NewLaunchOptimizationRecommendation {
+  id              String    @id @default(cuid())
+  userId          String
+  runId           String
+  parameter       String
+  currentValue    Decimal?  @db.Decimal(20, 6)
+  suggestedValue  Decimal?  @db.Decimal(20, 6)
+  sampleSize      Int
+  confidenceLevel String
+  trainingMetrics Json
+  validationMetrics Json
+  tradeRetention  Decimal?  @db.Decimal(7, 4)
+  winnerRetention Decimal?  @db.Decimal(7, 4)
+  loserRejection  Decimal?  @db.Decimal(7, 4)
+  reason          String
+  warnings        Json
+  /// PENDING | ACCEPTED | DISMISSED
+  status          String    @default("PENDING")
+  createdVersion  String?
+  createdAt       DateTime  @default(now())
+  decidedAt       DateTime?
+
+  user User                     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  run  NewLaunchOptimizationRun @relation(fields: [runId], references: [id], onDelete: Cascade)
+
+  @@index([userId, status])
+}
+
+/// A newly detected token / pool (market-level, shared by all users). One row per mint.
+model LaunchCandidate {
+  id              String    @id @default(cuid())
+  mint            String    @unique
+  source          String
+  poolAddress     String?
+  bondingCurve    String?
+  quoteMint       String?
+  creator         String?
+  name            String?
+  symbol          String?
+  /// When our system saw the event.
+  detectedAt      DateTime
+  /// Mint creation time on-chain, when known (block time of the create transaction).
+  createdAt       DateTime?
+  /// First time the token was tradable (first pool / bonding curve activity), when known.
+  firstTradableAt DateTime?
+  initialLiquidityUsd Decimal? @db.Decimal(18, 2)
+  detectedPriceUsd    Decimal? @db.Decimal(30, 18)
+  /// OBSERVING | EXPIRED | MIGRATED
+  status          String    @default("OBSERVING")
+  security        Json?
+  /// Official social links from token metadata (twitter / telegram / website); null = not resolved yet
+  socialLinks     Json?
+  lastMetrics     Json?
+  updatedAt       DateTime  @updatedAt
+
+  snapshots LaunchSnapshot[]
+  decisions LaunchDecision[]
+
+  @@index([detectedAt])
+  @@index([status])
+}
+
+/// Timestamped launch observation (real data only; null = not available).
+model LaunchSnapshot {
+  id              String   @id @default(cuid())
+  candidateId     String
+  takenAt         DateTime
+  priceUsd        Decimal? @db.Decimal(30, 18)
+  liquidityUsd    Decimal? @db.Decimal(18, 2)
+  volumeUsd       Decimal? @db.Decimal(18, 2)
+  buyCount        Int?
+  sellCount       Int?
+  buyVolumeUsd    Decimal? @db.Decimal(18, 2)
+  sellVolumeUsd   Decimal? @db.Decimal(18, 2)
+  uniqueBuyers    Int?
+  uniqueSellers   Int?
+  largestBuyerShare Decimal? @db.Decimal(6, 4)
+  marketCapUsd    Decimal? @db.Decimal(20, 2)
+  bondingProgress Decimal? @db.Decimal(6, 4)
+  dataQuality     Int?
+
+  candidate LaunchCandidate @relation(fields: [candidateId], references: [id], onDelete: Cascade)
+
+  @@index([candidateId, takenAt])
+}
+
+/// A user's NewLaunchStrategy decision for a candidate (stored when the decision changes).
+model LaunchDecision {
+  id                  String    @id @default(cuid())
+  userId              String
+  candidateId         String
+  mint                String
+  /// BUY | WATCH | REJECT
+  decision            String
+  status              String
+  score               Int?
+  launchMomentumScore Int?
+  exhaustionScore     Int?
+  liquidityScore      Int?
+  buyerQualityScore   Int?
+  buyPressureScore    Int?
+  securityScore       Int?
+  dataQuality         Int
+  riskScore           Decimal?  @db.Decimal(5, 2)
+  riskClassification  String?
+  reasons             Json
+  warnings            Json
+  features            Json?
+  signalId            String?
+  detectedAt          DateTime
+  securityCompletedAt DateTime?
+  decisionAt          DateTime  @default(now())
+  configVersion       String?
+  /// Quality gate evaluation (only for BUY decisions): mode in force, would it pass, failed conditions.
+  qualityGateMode     String?
+  qualityGateWouldPass Boolean?
+  qualityGateReasons  Json?
+  /// Social Intelligence summary at decision time (shadow; also for rejected candidates)
+  socialSummary       Json?
+
+  user      User            @relation(fields: [userId], references: [id], onDelete: Cascade)
+  candidate LaunchCandidate @relation(fields: [candidateId], references: [id], onDelete: Cascade)
+
+  @@index([userId, decisionAt])
+  @@index([userId, mint])
+  @@index([decision])
+}
+
+/// Real lifecycle events of a position (entry, break-even, trailing moves, warnings, exits) for the timeline/chart.
+model PositionEvent {
+  id         String   @id @default(cuid())
+  positionId String
+  userId     String
+  type       String
+  at         DateTime @default(now())
+  price      Decimal? @db.Decimal(30, 18)
+  details    Json?
+
+  position Position @relation(fields: [positionId], references: [id], onDelete: Cascade)
+
+  @@index([positionId, at])
+  @@index([userId])
+}
+
+/// Per-user AI token analysis settings. aiAnalysisEnabled switches the automatic entry decision source to AI.
+model AiConfig {
+  id                              String   @id @default(cuid())
+  userId                          String   @unique
+  aiAnalysisEnabled               Boolean  @default(false)
+  aiMinimumConfidence             Int      @default(75)
+  aiRecheckSeconds                Int      @default(30)
+  aiMaxAnalysesPerMinute          Int      @default(10)
+  aiAllowHighRisk                 Boolean  @default(true)
+  aiAllowVeryHighRisk             Boolean  @default(false)
+  aiDynamicExitSuggestionsEnabled Boolean  @default(false)
+  aiDecisionTtlSeconds            Int      @default(180)
+  /// Use the AI's SL/TP/trailing suggestions (validated) instead of the user's settings. Off by default.
+  aiUseExitParameters             Boolean  @default(false)
+  createdAt                       DateTime @default(now())
+  updatedAt                       DateTime @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+/// One AI token analysis (authoritative record; Redis only caches). Failed/invalid attempts are stored too.
+model AiAnalysis {
+  id                                 String    @id @default(cuid())
+  userId                             String
+  tokenId                            String
+  tokenAddress                       String
+  provider                           String
+  model                              String
+  promptVersion                      String
+  riskAssessmentId                   String?
+  /// COMPLETED | FAILED | INVALID
+  status                             String
+  rawDecision                        String?
+  /// BUY | WATCH | SKIP | NONE
+  effectiveDecision                  String
+  effectiveReason                    String?
+  confidence                         Decimal?  @db.Decimal(5, 2)
+  entryQuality                       Decimal?  @db.Decimal(5, 2)
+  marketStrength                     Decimal?  @db.Decimal(5, 2)
+  momentumQuality                    Decimal?  @db.Decimal(5, 2)
+  liquidityQuality                   Decimal?  @db.Decimal(5, 2)
+  timingQuality                      Decimal?  @db.Decimal(5, 2)
+  exhaustionRisk                     Decimal?  @db.Decimal(5, 2)
+  recommendedPositionMultiplier      Decimal?  @db.Decimal(5, 4)
+  suggestedStopLossPercent           Decimal?  @db.Decimal(7, 2)
+  suggestedTakeProfitPercent         Decimal?  @db.Decimal(7, 2)
+  suggestedTrailingActivationPercent Decimal?  @db.Decimal(7, 2)
+  suggestedTrailingDistancePercent   Decimal?  @db.Decimal(7, 2)
+  recheckSeconds                     Int?
+  reasons                            Json?
+  warnings                           Json?
+  errorMessage                       String?
+  inputHash                          String
+  marketStateHash                    String
+  /// Point-in-time structured input that was sent (public market/risk data only).
+  input                              Json?
+  latencyMs                          Int?
+  inputTokens                        Int?
+  outputTokens                       Int?
+  cached                             Boolean   @default(false)
+  createdAt                          DateTime  @default(now())
+  expiresAt                          DateTime
+
+  user  User  @relation(fields: [userId], references: [id], onDelete: Cascade)
+  token Token @relation(fields: [tokenId], references: [id])
+
+  @@index([userId, tokenId, createdAt])
+  @@index([userId, createdAt])
+}
+
+/// Per-user settings of the advanced short-term signal modules and the composite signal (PAPER experimentation).
+model AdvancedStrategyConfig {
+  id                              String   @id @default(cuid())
+  userId                          String   @unique
+  /// Composite signal may create BUY signals (off by default: analysis only).
+  compositeEnabled                Boolean  @default(false)
+  minimumConfirmations            Int      @default(3)
+  minimumCompositeScore           Int      @default(65)
+  /// Count enabled-but-unavailable modules as zero instead of leaving them out.
+  penalizeUnavailable             Boolean  @default(false)
+  exhaustionEnabled               Boolean  @default(true)
+  exhaustionWarningThreshold      Int      @default(40)
+  exhaustionStrongWarningThreshold Int     @default(70)
+  exhaustionBlockThreshold        Int      @default(85)
+  /// BLOCK: no automatic entry at/above the block threshold; WARN_ONLY: warnings and composite penalty only.
+  exhaustionPolicy                String   @default("BLOCK")
+  exhaustionPenaltyWeight         Decimal  @default(0.5) @db.Decimal(5, 3)
+  /// Close open PAPER positions whose pool liquidity collapsed (off by default).
+  liquidityOutflowExitEnabled     Boolean  @default(false)
+  liquidityOutflowExitPercent     Decimal  @default(50) @db.Decimal(5, 2)
+  /// Per-module settings: { [module]: { enabled, weight, minScore, ...params } } merged over code defaults.
+  modules                         Json?
+  createdAt                       DateTime @default(now())
+  updatedAt                       DateTime @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model StrategyConfig {
+  id          String   @id @default(cuid())
+  userId      String
+  strategyName String
+  isEnabled   Boolean  @default(false)
+  params      Json?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, strategyName])
+  @@index([userId])
+}
+
+model NotificationConfig {
+  id               String   @id @default(cuid())
+  userId           String   @unique
+  telegramEnabled  Boolean  @default(false)
+  telegramChatId  String?
+  emailAlerts     Boolean  @default(false)
+  pushAlerts      Boolean  @default(false)
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+model Wallet {
+  id             String     @id @default(cuid())
+  userId         String
+  type           WalletType @default(USER)
+  publicAddress  String
+  network        String     @default("mainnet-beta")
+  label          String?
+  provider       String?    @default("PHANTOM")
+  isActive       Boolean    @default(true)
+  lastBalance    Decimal?   @db.Decimal(18, 8)
+  lastBalanceAt  DateTime?
+  createdAt      DateTime   @default(now())
+  updatedAt      DateTime   @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, publicAddress])
+  @@index([userId, type, isActive])
+  @@index([userId])
+  @@index([publicAddress])
+}
+
+model Token {
+  id            String        @id @default(cuid())
+  address       String        @unique
+  symbol        String
+  name          String?
+  decimals      Int           @default(9)
+  isVerified    Boolean       @default(false)
+  priceUsd      Decimal?      @db.Decimal(30, 18)
+  marketCap     Decimal?      @db.Decimal(30, 8)
+  fdv           Decimal?      @db.Decimal(30, 8)
+  volume24h     Decimal?      @db.Decimal(24, 8)
+  /// Token logo source (https; DexScreener info.imageUrl or the metadata "image"). Served via the API image proxy.
+  imageUrl      String?
+  createdAt     DateTime      @default(now())
+  updatedAt     DateTime      @updatedAt
+  tokenMetrics  TokenMetric[]
+  signals       Signal[]
+  trades        Trade[]
+  positions     Position[]
+  transactions  Transaction[]
+  riskAssessments RiskAssessment[]
+  approvalRequests ApprovalRequest[]
+
+  @@index([symbol])
+  @@index([address])
+  @@index([isVerified])
+  aiAnalyses AiAnalysis[]
+}
+
+model TokenMetric {
+  id             String   @id @default(cuid())
+  tokenId        String
+  timestamp      DateTime
+  priceUsd       Decimal? @db.Decimal(30, 18)
+  priceNative    Decimal? @db.Decimal(30, 18)
+  volume24h      Decimal? @db.Decimal(30, 8)
+  marketCap      Decimal? @db.Decimal(30, 8)
+  fdv            Decimal? @db.Decimal(30, 8)
+  liquidityUsd   Decimal? @db.Decimal(24, 8)
+  holders        Int?
+  transactionCount Int?
+  buyVolume      Decimal? @db.Decimal(24, 8)
+  sellVolume     Decimal? @db.Decimal(24, 8)
+  buyCount24h    Int?
+  sellCount24h   Int?
+  tokenAgeSeconds Int?
+  poolAgeSeconds  Int?
+  liquidityChange24h Decimal? @db.Decimal(24, 8)
+  tradeActivity  Int?
+  holderData     Json?
+  priceChange1h  Decimal? @db.Decimal(10, 4)
+  priceChange24h Decimal? @db.Decimal(10, 4)
+  /// Provider rolling windows (null when not reported; never derived from 24h aggregates).
+  priceChange5m  Decimal? @db.Decimal(12, 4)
+  volume5m       Decimal? @db.Decimal(30, 8)
+  volume1h       Decimal? @db.Decimal(30, 8)
+  buyCount5m     Int?
+  sellCount5m    Int?
+  buyCount1h     Int?
+  sellCount1h    Int?
+  provider       String?
+  dataQuality    String?
+  dexId          String?
+  poolAddress    String?
+  quoteToken     Json?
+  createdAt      DateTime @default(now())
+
+  token Token @relation(fields: [tokenId], references: [id])
+
+  @@index([tokenId, timestamp])
+  @@index([timestamp])
+  @@index([poolAddress])
+}
+
+model RiskAssessment {
+  id               String       @id @default(cuid())
+  tokenId          String
+  userId           String?
+  riskScore        Decimal      @db.Decimal(5, 2)
+  decision         RiskDecision
+  classification   RiskClassification @default(MODERATE)
+  hardBlocked      Boolean      @default(false)
+  hardBlockReasons Json         @default("[]")
+  riskPolicy       RiskPolicy   @default(BALANCED)
+  positionMultiplier Decimal    @default(1.000) @db.Decimal(4, 3)
+  factors          Json
+  rejectionReasons Json
+  warnings         Json
+  source           String
+  createdAt        DateTime     @default(now())
+
+  token Token @relation(fields: [tokenId], references: [id])
+  user  User? @relation(fields: [userId], references: [id])
+
+  @@index([tokenId, createdAt])
+  @@index([decision])
+  @@index([userId])
+}
+
+model Signal {
+  id            String      @id @default(cuid())
+  tokenId       String
+  userId        String?
+  strategyId    String?
+  strategyName  String?
+  direction     SignalDirection?
+  score         Decimal     @db.Decimal(5, 2)
+  riskScore     Decimal     @db.Decimal(5, 2)
+  confidence    Decimal?    @db.Decimal(5, 2)
+  signalType    String?
+  reasons       Json?
+  entryConditions       Json?
+  invalidationConditions Json?
+  recommendedStop   Decimal? @db.Decimal(18, 8)
+  recommendedTarget Decimal? @db.Decimal(18, 8)
+  metadata      Json?
+  mode          TradingMode @default(SCANNER)
+  createdAt     DateTime    @default(now())
+  updatedAt     DateTime    @updatedAt
+
+  token    Token     @relation(fields: [tokenId], references: [id])
+  user     User?     @relation(fields: [userId], references: [id])
+  strategy Strategy? @relation(fields: [strategyId], references: [id])
+  trades   Trade[]
+  positions Position[]
+  approvalRequests ApprovalRequest[]
+
+  @@index([tokenId, createdAt])
+  @@index([mode])
+  @@index([score])
+  @@index([userId, strategyName, createdAt])
+}
+
+model Strategy {
+  id              String      @id @default(cuid())
+  name            String
+  description     String?
+  type            String      @default("rule-based")
+  mode            TradingMode @default(PAPER)
+  isEnabled       Boolean     @default(false)
+  config          Json?
+  createdAt       DateTime    @default(now())
+  updatedAt       DateTime    @updatedAt
+
+  signals   Signal[]
+  trades    Trade[]
+  positions Position[]
+
+  @@unique([name])
+  @@index([mode])
+  @@index([isEnabled])
+}
+
+model Position {
+  id               String      @id @default(cuid())
+  userId           String
+  tokenId          String
+  signalId         String?
+  strategyId       String?
+  side             TradeSide
+  quantity         Decimal     @db.Decimal(18, 8)
+  avgEntryPrice    Decimal     @db.Decimal(30, 18)
+  currentPrice     Decimal?    @db.Decimal(30, 18)
+  stopLossPrice    Decimal?    @db.Decimal(30, 18)
+  takeProfitPrice  Decimal?    @db.Decimal(30, 18)
+  trailingStopPercent Decimal?  @db.Decimal(5, 4)
+  /// Market (reference) price at entry; avgEntryPrice is the simulated fill including slippage.
+  entryMarketPrice Decimal?    @db.Decimal(30, 18)
+  /// Fraction above the entry fill at which trailing arms (0.15 = +15%); null = armed from entry (legacy positions).
+  trailingActivationPercent Decimal? @db.Decimal(7, 4)
+  trailingActive   Boolean     @default(false)
+  trailingActivatedAt DateTime?
+  /// Market price at which trailing armed.
+  trailingActivationPrice Decimal? @db.Decimal(30, 18)
+  /// Current trailing trigger; only ever moves up.
+  trailingTriggerPrice Decimal? @db.Decimal(30, 18)
+  /// Fraction above the entry fill at which the stop moves to break-even; null = disabled.
+  breakEvenActivationPercent Decimal? @db.Decimal(7, 4)
+  breakEvenAppliedAt DateTime?
+  /// Pool liquidity at entry, used by the optional liquidity-outflow exit.
+  entryLiquidityUsd Decimal?   @db.Decimal(24, 8)
+  /// Exit policy the position was opened with ('NEW_LAUNCH' = NewLaunch exit settings; null = global/strategy).
+  exitPolicy       String?
+  /// NewLaunch config version in force at entry (e.g. NL-v3).
+  configVersion    String?
+  /// Snapshotted liquidity-safety exit threshold (percent drop vs entry liquidity); null = use owner setting.
+  liquidityExitPercent Decimal? @db.Decimal(6, 2)
+  /// Optional time-based exit (NewLaunch max hold); null = no time limit.
+  maxHoldUntil     DateTime?
+  /// Break-even cost buffer snapshotted at entry (fraction above the entry fill); null = the two PAPER fees.
+  breakEvenCostBuffer Decimal? @db.Decimal(8, 6)
+  highestPrice     Decimal?    @db.Decimal(30, 18)
+  lowestPrice      Decimal?    @db.Decimal(30, 18)
+  unrealizedPnl    Decimal?    @db.Decimal(18, 8)
+  realizedPnl      Decimal?    @db.Decimal(18, 8)
+  exitReason       String?
+  status           TradeStatus @default(OPEN)
+  mode             TradingMode @default(PAPER)
+  openedAt         DateTime    @default(now())
+  updatedAt        DateTime    @updatedAt
+  closedAt         DateTime?
+
+  user     User      @relation(fields: [userId], references: [id])
+  token    Token     @relation(fields: [tokenId], references: [id])
+  signal   Signal?   @relation(fields: [signalId], references: [id])
+  strategy Strategy? @relation(fields: [strategyId], references: [id])
+  trades   Trade[]
+
+  @@index([userId, status])
+  @@index([tokenId])
+  @@index([signalId])
+  @@index([mode])
+  @@index([userId, configVersion])
+  @@index([userId, closedAt])
+  events PositionEvent[]
+  pathMetric PositionPathMetric?
+}
+
+model Trade {
+  id                  String         @id @default(cuid())
+  userId              String
+  tokenId             String
+  strategyId          String?
+  signalId            String?
+  positionId          String?
+  side                TradeSide
+  tokenAddress        String
+  symbol              String
+  strategyName        String?
+  signalScore         Decimal?       @db.Decimal(5, 2)
+  riskScore           Decimal?       @db.Decimal(5, 2)
+  riskClassification  RiskClassification?
+  riskPolicy          RiskPolicy?
+  aiConfirmed         Boolean        @default(false)
+  aiOpportunityScore  Decimal?       @db.Decimal(5, 2)
+  aiConfidence        Decimal?       @db.Decimal(5, 2)
+  entry               Decimal?       @db.Decimal(30, 18)
+  exit                Decimal?       @db.Decimal(30, 18)
+  size                Decimal?       @db.Decimal(18, 8)
+  quantity            Decimal?       @db.Decimal(18, 8)
+  fees                Decimal?       @db.Decimal(18, 8)
+  slippage            Decimal?       @db.Decimal(18, 8)
+  pnl                 Decimal?       @db.Decimal(18, 8)
+  netPnl              Decimal?       @db.Decimal(18, 8)
+  exitReason          String?
+  transactionSignature String?
+  paperDecision       Json?
+  executionDelayMs    Int?
+  priorityFee         Decimal?       @db.Decimal(18, 8)
+  partialFillRatio    Decimal?       @db.Decimal(5, 4)
+  stopLoss            Decimal?       @db.Decimal(30, 18)
+  takeProfit          Decimal?       @db.Decimal(30, 18)
+  trailingStop        Decimal?       @db.Decimal(5, 4)
+  /// Reference market prices; entry/exit are the simulated fills.
+  entryMarketPrice    Decimal?       @db.Decimal(30, 18)
+  exitMarketPrice     Decimal?       @db.Decimal(30, 18)
+  /// Exit slippage cost in USD; slippage holds the total (entry + exit) once closed.
+  exitSlippage        Decimal?       @db.Decimal(18, 8)
+  /// Settings in force when the position was opened (for later comparison).
+  configSnapshot      Json?
+  /// Why/how the position closed: trigger levels, peak, trailing state, fill assumptions.
+  exitDiagnostics     Json?
+  /// STRATEGY | AI | MANUAL_PAPER — which system made the entry decision.
+  decisionSource      String         @default("STRATEGY")
+  aiAnalysisId        String?
+  entryAt             DateTime?
+  exitAt              DateTime?
+  mode                TradingMode    @default(PAPER)
+  status              TradeStatus    @default(PENDING)
+  createdAt           DateTime       @default(now())
+  updatedAt           DateTime       @updatedAt
+
+  user      User      @relation(fields: [userId], references: [id])
+  token     Token     @relation(fields: [tokenId], references: [id])
+  strategy  Strategy? @relation(fields: [strategyId], references: [id])
+  signal    Signal?   @relation(fields: [signalId], references: [id])
+  position  Position? @relation(fields: [positionId], references: [id])
+  transaction Transaction?
+
+  @@index([userId, createdAt])
+  @@index([tokenId])
+  @@index([strategyId])
+  @@index([mode])
+  @@index([status])
+  @@index([transactionSignature])
+}
+
+model Transaction {
+  id                  String          @id @default(cuid())
+  tradeId             String          @unique
+  tokenId             String
+  hash                String?
+  signature           String?
+  status              String          @default("pending")
+  amount              Decimal?        @db.Decimal(18, 8)
+  fees               Decimal?        @db.Decimal(18, 8)
+  mode               ExecutionMode   @default(PAPER)
+  executedAt          DateTime?
+  createdAt           DateTime        @default(now())
+  updatedAt           DateTime        @updatedAt
+
+  trade Trade @relation(fields: [tradeId], references: [id])
+  token Token @relation(fields: [tokenId], references: [id])
+
+  @@index([tokenId])
+  @@index([status])
+  @@index([mode])
+}
+
+model RiskEvent {
+  id          String        @id @default(cuid())
+  type        RiskEventType
+  description String
+  severity    String        @default("medium")
+  metadata    Json?
+  createdAt   DateTime      @default(now())
+
+  @@index([type, createdAt])
+}
+
+model SystemEvent {
+  id          String   @id @default(cuid())
+  eventType   String
+  severity    String   @default("info")
+  message     String
+  metadata    Json?
+  createdAt   DateTime @default(now())
+
+  @@index([eventType])
+  @@index([createdAt])
+}
+
+model AuditLog {
+  id          String   @id @default(cuid())
+  userId      String?
+  action      String
+  details     Json?
+  createdAt   DateTime @default(now())
+
+  user User? @relation(fields: [userId], references: [id])
+
+  @@index([userId, createdAt])
+  @@index([action])
+}
+
+model Notification {
+  id          String          @id @default(cuid())
+  title       String
+  message     String
+  type        NotificationType @default(INFO)
+  isRead      Boolean         @default(false)
+  createdAt   DateTime        @default(now())
+
+  @@index([type])
+  @@index([isRead])
+}
+
+model BacktestRun {
+  id             String   @id @default(cuid())
+  userId         String
+  name           String
+  strategyId     String?
+  strategyName   String?
+  startDate      DateTime
+  endDate        DateTime
+  startingBalance Decimal @db.Decimal(18, 8)
+  endingBalance  Decimal? @db.Decimal(18, 8)
+  returnPercent  Decimal? @db.Decimal(10, 4)
+  maxDrawdown    Decimal? @db.Decimal(18, 8)
+  winRate        Decimal? @db.Decimal(7, 4)
+  profitFactor   Decimal? @db.Decimal(18, 8)
+  expectancy     Decimal? @db.Decimal(18, 8)
+  tradeCount     Int      @default(0)
+  fees           Decimal? @db.Decimal(18, 8)
+  slippage       Decimal? @db.Decimal(18, 8)
+  configuration  Json?
+  summary        Json?
+  startedAt      DateTime @default(now())
+  finishedAt     DateTime?
+  createdAt      DateTime @default(now())
+
+  user           User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  trades         BacktestTrade[]
+
+  @@index([userId, createdAt])
+  @@index([strategyId])
+  @@index([createdAt])
+}
+
+model BacktestTrade {
+  id                  String   @id @default(cuid())
+  backtestRunId       String
+  token               String
+  symbol              String
+  signalScore         Decimal? @db.Decimal(5, 2)
+  riskScore           Decimal? @db.Decimal(5, 2)
+  entry               Decimal? @db.Decimal(30, 18)
+  exit                Decimal? @db.Decimal(30, 18)
+  quantity            Decimal? @db.Decimal(18, 8)
+  entryTime           DateTime?
+  exitTime            DateTime?
+  holdingTimeMs       Int?
+  fees                Decimal? @db.Decimal(18, 8)
+  slippage            Decimal? @db.Decimal(18, 8)
+  split               String?
+  pnl                 Decimal? @db.Decimal(18, 8)
+  netPnl              Decimal? @db.Decimal(18, 8)
+  exitReason          String?
+  createdAt           DateTime @default(now())
+
+  backtestRun         BacktestRun @relation(fields: [backtestRunId], references: [id], onDelete: Cascade)
+
+  @@index([backtestRunId])
+  @@index([token])
+}
+
+/// Timestamped Social Intelligence snapshot of a token (public social data; computed from events known at `at`).
+model SocialSnapshot {
+  id                   String   @id @default(cuid())
+  mint                 String
+  at                   DateTime
+  socialScore          Int?
+  momentumScore        Int?
+  qualityScore         Int?
+  spamScore            Int?
+  exhaustionScore      Int?
+  dataQuality          Int?
+  confirmation         String
+  shadowDecision       String
+  mentionTrend         String
+  tokenMatchConfidence Decimal? @db.Decimal(5, 3)
+  matchBasis           String
+  mentions5m           Int?
+  uniqueAuthors5m      Int?
+  freshness            String
+  /// Window metrics, per-source metrics, reasons / warnings, provider states
+  details              Json
+  createdAt            DateTime @default(now())
+
+  @@index([mint, at])
+}
+
+
+/// Telegram source registry (Telegram-first Social Intelligence). Only public chats / chats the configured account is
+/// legitimately allowed to read; private invite links are recorded as NO_ACCESS and never joined.
+model TelegramSource {
+  id                String    @id @default(cuid())
+  tokenId           String?
+  mint              String
+  telegramEntityId  String?
+  telegramUsername  String?
+  telegramUrl       String?
+  /// CHANNEL | GROUP | SUPERGROUP | UNKNOWN
+  sourceType        String    @default("UNKNOWN")
+  /// OFFICIAL | PROBABLE_OFFICIAL | COMMUNITY | UNKNOWN
+  officialStatus    String    @default("UNKNOWN")
+  discoveredAt      DateTime  @default(now())
+  lastVerifiedAt    DateTime?
+  /// MINT_ADDRESS | OFFICIAL_SOCIAL_LINK | VERIFIED_LINK | EXACT_PROJECT_NAME | TICKER
+  matchBasis        String
+  matchConfidence   Decimal   @db.Decimal(5, 3)
+  active            Boolean   @default(true)
+  /// ACCESSIBLE | NO_ACCESS | NOT_FOUND | RATE_LIMITED | UNKNOWN
+  accessStatus      String    @default("UNKNOWN")
+  createdAt         DateTime  @default(now())
+  updatedAt         DateTime  @updatedAt
+
+  @@unique([mint, telegramUsername])
+  @@index([mint])
+  @@index([telegramUsername])
+}
+
+/// IP addresses a user has confirmed with an e-mailed code. The IP itself is stored only as a keyed hash.
+model TrustedLoginIp {
+  id          String   @id @default(cuid())
+  userId      String
+  ipHash      String
+  /// Masked hint for display (e.g. 192.168.*.*); never the full address.
+  ipHint      String
+  firstSeenAt DateTime @default(now())
+  lastSeenAt  DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, ipHash])
+  @@index([userId])
+}
+
+/// One-time e-mail verification codes: login from a new IP, or confirmation of a sensitive admin action.
+model VerificationChallenge {
+  id          String    @id @default(cuid())
+  userId      String
+  /// LOGIN_NEW_IP | ADMIN_ACTION
+  purpose     String
+  /// e.g. admin_user_create, admin_role_change, admin_user_delete, live_enable
+  action      String
+  /// Keyed hash binding the code to the exact action parameters (a code cannot approve a different action).
+  actionHash  String
+  codeHash    String
+  ipHash      String?
+  attempts    Int       @default(0)
+  maxAttempts Int       @default(5)
+  expiresAt   DateTime
+  consumedAt  DateTime?
+  createdAt   DateTime  @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, purpose])
+  @@index([expiresAt])
+}
+
+/// ML (shadow only): immutable feature snapshot of a candidate at a defined prediction point. Written once, never
+/// updated with later information (outcomes live in MlCandidateOutcome).
+model MlFeatureSnapshot {
+  id               String   @id @default(cuid())
+  /// LaunchCandidate id (candidate = one launch / mint observed by the system)
+  candidateId      String
+  mint             String
+  source           String
+  /// Prediction point: AGE_15S | AGE_30S | AGE_60S | BUY_DECISION
+  kind             String
+  snapshotAt       DateTime
+  detectedAt       DateTime
+  featureVersion   String
+  features         Json
+  /// Observation time per feature group (leakage audit)
+  observedAt       Json
+  dataQuality      Int
+  validForTraining Boolean
+  invalidReasons   Json
+  /// SolTrader decision context at snapshot time (best across users: BUY > WATCH > REJECT) + per-user details
+  decision         String
+  decisionContext  Json
+  newLaunchConfigVersion String?
+  referencePriceUsd Decimal? @db.Decimal(30, 18)
+  /// Set when a PAPER position was opened for this candidate (link only, no duplicated data)
+  positionId       String?
+  createdAt        DateTime @default(now())
+
+  outcome     MlCandidateOutcome?
+  predictions MlPrediction[]
+
+  @@unique([candidateId, kind, featureVersion])
+  @@index([snapshotAt])
+  @@index([mint])
+  @@index([kind, featureVersion, snapshotAt])
+}
+
+/// Shadow outcome after a snapshot (real observed market data only; compact bucketed price path).
+model MlCandidateOutcome {
+  id            String   @id @default(cuid())
+  snapshotId    String   @unique
+  mint          String
+  labelVersion  String
+  /// TRACKING | COMPLETE | PARTIAL | INSUFFICIENT
+  status        String
+  entryPriceUsd Decimal  @db.Decimal(30, 18)
+  result        Json?
+  path          Json
+  validHorizons Json
+  endReason     String?
+  trackingEndedAt DateTime?
+  updatedAt     DateTime @updatedAt
+  createdAt     DateTime @default(now())
+
+  snapshot MlFeatureSnapshot @relation(fields: [snapshotId], references: [id], onDelete: Cascade)
+
+  @@index([status])
+}
+
+/// Immutable dataset version (rows file on disk, hash recorded).
+model MlDatasetVersion {
+  id             String   @id @default(cuid())
+  version        String   @unique
+  featureVersion String
+  labelVersion   String
+  target         String
+  config         Json
+  manifest       Json
+  rowCount       Int
+  filePath       String
+  fileHash       String
+  createdBy      String?
+  createdAt      DateTime @default(now())
+}
+
+/// Trained model (artifact JSON on disk, hash recorded). Status changes only by explicit admin action.
+model MlModelVersion {
+  id             String   @id @default(cuid())
+  version        String   @unique
+  algorithm      String
+  /// TRAINED | VALIDATED | SHADOW | PAPER_APPROVED | PAPER_ACTIVE | RETIRED (this release: up to SHADOW)
+  status         String   @default("TRAINED")
+  readiness      String
+  featureVersion String
+  labelVersion   String
+  target         String
+  datasetVersion String
+  config         Json
+  metrics        Json
+  artifactPath   String
+  artifactHash   String
+  statusHistory  Json
+  createdBy      String?
+  trainedAt      DateTime
+  createdAt      DateTime @default(now())
+}
+
+/// Shadow prediction (never used by trading).
+model MlPrediction {
+  id               String   @id @default(cuid())
+  snapshotId       String
+  modelVersion     String
+  mint             String
+  probability      Decimal  @db.Decimal(8, 6)
+  calibrated       Boolean
+  mlEntryScore     Int
+  predictedClass   String
+  dataQuality      Int
+  contributions    Json?
+  latencyMs        Decimal  @db.Decimal(10, 3)
+  predictedAt      DateTime @default(now())
+
+  snapshot MlFeatureSnapshot @relation(fields: [snapshotId], references: [id], onDelete: Cascade)
+
+  @@unique([snapshotId, modelVersion])
+  @@index([modelVersion, predictedAt])
+}

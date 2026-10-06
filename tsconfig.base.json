@@ -1,0 +1,32 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "allowJs": false,
+    "skipLibCheck": true,
+    "strict": true,
+    "noEmit": true,
+    "esModuleInterop": true,
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+    "forceConsistentCasingInFileNames": true,
+    "allowSyntheticDefaultImports": true,
+    "incremental": true,
+    "types": ["node"],
+    "baseUrl": ".",
+    "paths": {
+      "@soltrader/shared": ["packages/shared/src/index.ts"],
+      "@soltrader/config": ["packages/config/src/index.ts"],
+      "@soltrader/database": ["packages/database/src/index.ts"],
+      "@soltrader/trading-engine": ["packages/trading-engine/src/index.ts"],
+      "@soltrader/market-data": ["packages/market-data/src/index.ts"],
+      "@soltrader/strategy-engine": ["packages/strategy-engine/src/index.ts"],
+      "@soltrader/risk-engine": ["packages/risk-engine/src/index.ts"],
+      "@soltrader/execution-engine": ["packages/execution-engine/src/index.ts"],
+      "@soltrader/blockchain": ["packages/blockchain/src/index.ts"]
+      ,"@soltrader/monitoring": ["packages/monitoring/src/index.ts"]
+    }
+  }
+}
