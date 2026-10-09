@@ -41,6 +41,11 @@ export interface OutcomePathState {
   endReason: string | null;
   /** Creator sold tokens after the snapshot (trade stream), absolute time of the first such sell. */
   creatorSellAt: number | null;
+  /**
+   * Time of the last persisted copy of this path (absolute ms). Data up to this time is trustworthy apart from the
+   * recorded gaps; after a worker restart the unobserved interval starts here (not at the last trade).
+   */
+  persistedAt?: number;
 }
 
 export function bucketSizeMs(offsetMs: number) {

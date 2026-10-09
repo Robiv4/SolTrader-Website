@@ -16,7 +16,7 @@ import { HotPositionMonitor, type MarketEvent } from './exit/hot-position-monito
 import { NewLaunchService } from './launch/new-launch-service.js';
 import { MeteoraLaunchProvider, PumpFunLaunchProvider, RaydiumLaunchProvider } from './launch/providers.js';
 import { logger } from './logger.js';
-import { MlShadowService, type MlMode } from './ml/ml-shadow-service.js';
+import { MlShadowService, startMlHealthPublisher, type MlMode } from './ml/ml-shadow-service.js';
 import { PaperExecutionCoordinator } from './paper-execution.js';
 import { type MarketQuote, PositionManager } from './position-manager.js';
 import { createPrismaPositionStore } from './position-store.js';
@@ -442,10 +442,10 @@ async function main() {
   await loop.start();
   newLaunch.start();
   if (mlService.enabled) {
+    // ML observability first (counts / latencies only): health is published even while the resume below runs.
+    startMlHealthPublisher(mlService, (key, value, options) => eventPublisher.set(key, value, options), 10_000, (error) => logger.warn({ err: error instanceof Error ? error.message : String(error) }, 'ml:health publish failed'));
     await mlService.resume().catch((error: unknown) => logger.warn({ err: error instanceof Error ? error.message : String(error) }, 'ML outcome resume failed (trading unaffected)'));
     void mlService.refreshModel(Date.now(), true);
-    // ML observability (counts / latencies only).
-    globalThis.setInterval(() => void eventPublisher.set('ml:health', JSON.stringify(mlService.snapshot()), { EX: 60 }).catch(() => undefined), 10_000);
   }
   if (socialService) {
     socialService.start();

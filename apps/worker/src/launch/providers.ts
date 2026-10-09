@@ -56,6 +56,8 @@ export interface LaunchHandlers {
   onLaunch(event: LaunchEvent): void;
   onTrade?(event: LaunchTradeEvent): void;
   onComplete?(mint: string): void;
+  /** Trade-stream connection lost / re-subscribed (lets consumers record exact data gaps). */
+  onStreamStatus?(state: 'UP' | 'DOWN', at: number): void;
 }
 
 /** Discovery provider contract (event-driven where possible). */
@@ -173,6 +175,7 @@ export class ProgramLogsSubscription {
   detail: string | null = null;
   lastEventAt: number | null = null;
   events = 0;
+  private down = false;
 
   constructor(
     private readonly url: string,
@@ -180,7 +183,16 @@ export class ProgramLogsSubscription {
     private readonly onLogs: (value: { signature: string; err: unknown; logs: string[] }, context: { slot: number | null; receivedAt: number }) => void,
     private readonly logger: TradingLoopLogger,
     private readonly factory: WebSocketFactory = defaultWebSocketFactory,
+    private readonly onStatus?: (state: 'UP' | 'DOWN', at: number) => void,
   ) {}
+
+  private status(state: 'UP' | 'DOWN', at: number) {
+    try {
+      this.onStatus?.(state, at);
+    } catch {
+      // status listeners never break the subscription
+    }
+  }
 
   start() {
     this.stopped = false;
@@ -220,6 +232,10 @@ export class ProgramLogsSubscription {
           this.state = 'ACTIVE';
           this.detail = null;
           this.retries = 0;
+          if (this.down) {
+            this.down = false;
+            this.status('UP', receivedAt);
+          }
         }
         return;
       }
@@ -242,6 +258,10 @@ export class ProgramLogsSubscription {
 
   private fail(reason: string) {
     this.socket = null;
+    if (!this.down) {
+      this.down = true;
+      this.status('DOWN', Date.now());
+    }
     this.retries += 1;
     this.state = this.retries >= 5 ? 'UNAVAILABLE' : 'DEGRADED';
     this.detail = reason;
@@ -277,7 +297,7 @@ export class PumpFunLaunchProvider implements NewLaunchProvider {
           handlers.onComplete?.(event.mint);
         }
       }
-    }, this.logger, this.factory);
+    }, this.logger, this.factory, (state, at) => handlers.onStreamStatus?.(state, at));
     this.subscription.start();
   }
 

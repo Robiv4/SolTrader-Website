@@ -34,6 +34,12 @@ const TRACK_MS = 60 * 60_000;
 const STREAM_GAP_MS = 15_000;
 const REFERENCE_ORDER_USD = 20;
 const PERSIST_CHECKPOINTS_S = [130, 610, 1810, 3610];
+/** Failed final writes are retried with back-off; afterwards the periodic sweep finalises the row from the DB. */
+const FINAL_WRITE_MAX_ATTEMPTS = 10;
+/** TRACKING rows older than this that no in-memory path owns are finalised by the sweep (lost state / dropped write). */
+const ORPHAN_AFTER_MS = TRACK_MS + 10 * 60_000;
+const SWEEP_INTERVAL_MS = 10 * 60_000;
+const RESUME_BATCH = 200;
 
 export interface MlLaunchView {
   mint: string;
@@ -107,6 +113,10 @@ export class MlShadowService {
   private writing = 0;
   private lastStreamEventAt = 0;
   private gapStart: number | null = null;
+  /** Final outcome writes that failed and wait for a retry (snapshotId -> state). */
+  private readonly pendingFinal = new Map<string, { mint: string; path: OutcomePathState; finalNow: number; attempts: number; nextAt: number }>();
+  private lastSweepAt = 0;
+  private sweeping = false;
   private marketWindow = { start: 0, used: 0 };
   private model: { artifact: MlModelArtifact; version: string } | null = null;
   private modelCheckedAt = 0;
@@ -114,7 +124,8 @@ export class MlShadowService {
   private modelError: string | null = null;
   readonly metrics = {
     candidatesSeen: 0, candidatesEligible: 0, candidatesIneligible: 0, snapshotsCreated: 0, snapshotsMissedPoint: 0, leakageViolations: 0,
-    trackingStarted: 0, trackingDropped: 0, trackingCompleted: 0, outcomeUpdates: 0, streamGaps: 0,
+    trackingStarted: 0, trackingDropped: 0, trackingCompleted: 0, outcomeUpdates: 0, streamGaps: 0, streamDisconnects: 0,
+    resumedPaths: 0, finalizedOnResume: 0, resumeFailures: 0, finalWriteRetries: 0, finalWriteGiveUps: 0, orphansFinalized: 0, sweepFailures: 0,
     predictions: 0, predictionFailures: 0, writeFailures: 0, writesDropped: 0, additionalMarketDataRequests: 0, additionalRpcRequests: 0,
     inferenceLatency: new RollingPercentiles(), snapshotLatency: new RollingPercentiles(),
   };
@@ -148,6 +159,24 @@ export class MlShadowService {
       recordPathPoint(tracked.path, at, price, liquidity);
       if (!trade.isBuy && tracked.creator && trade.wallet === tracked.creator && tracked.path.creatorSellAt === null && at >= tracked.path.startAt) tracked.path.creatorSellAt = at;
     }
+  }
+
+  /**
+   * Trade-stream connection lost (WebSocket closed). Every reconnect is a data gap, also the short ones that the
+   * 15 s silence heuristic cannot see: trades during the outage are missing, so the price path is unknown there.
+   */
+  onStreamDown(at: number) {
+    if (!this.enabled) return;
+    this.metrics.streamDisconnects += 1;
+    if (this.gapStart === null) {
+      this.gapStart = this.lastStreamEventAt > 0 ? Math.min(this.lastStreamEventAt, at) : at;
+      this.metrics.streamGaps += 1;
+    }
+  }
+
+  /** Re-subscribed; the gap closes with the first trade actually received again (see noteStream). */
+  onStreamUp(_at: number) {
+    // Intentionally no state change: a subscription ACK without data does not prove the stream is complete again.
   }
 
   /** Bonding curve completed: the stream price ends here. */
@@ -282,6 +311,7 @@ export class MlShadowService {
       path.endedAt = at;
       path.endReason = 'MIGRATED_BEFORE_SNAPSHOT';
     }
+    path.persistedAt = at;
     const tracked: TrackedPath = { snapshotId, mint, path, stream: launch.hasStream, lastPersistS: 0, lastPollAt: 0, creator: launch.creator };
     const list = this.paths.get(mint) ?? [];
     list.push(tracked);
@@ -328,9 +358,7 @@ export class MlShadowService {
             tracked.path.endedAt = Math.min(now, tracked.path.startAt + TRACK_MS + 1);
             tracked.path.endReason = 'HORIZON_REACHED';
           }
-          const snapshotId = tracked.snapshotId;
-          const pathCopy = tracked.path;
-          this.enqueue(() => this.deps.prisma.mlCandidateOutcome.update({ where: { snapshotId }, data: this.outcomeData(snapshotId, mint, pathCopy, now, true) }));
+          this.persistFinal(tracked.snapshotId, mint, tracked.path, now);
           this.metrics.trackingCompleted += 1;
           this.deps.incrementDaily?.('outcomesCompleted');
           continue;
@@ -339,7 +367,7 @@ export class MlShadowService {
         if (checkpoint) {
           tracked.lastPersistS = checkpoint;
           const snapshotId = tracked.snapshotId;
-          const pathCopy = { ...tracked.path, buckets: tracked.path.buckets.map((bucket) => [...bucket] as typeof bucket), gaps: [...tracked.path.gaps] };
+          const pathCopy = this.persistableCopy(tracked, now);
           this.metrics.outcomeUpdates += 1;
           this.enqueue(() => this.deps.prisma.mlCandidateOutcome.update({ where: { snapshotId }, data: this.outcomeData(snapshotId, mint, pathCopy, now, false) }));
         }
@@ -347,6 +375,11 @@ export class MlShadowService {
       }
       if (remaining.length) this.paths.set(mint, remaining);
       else this.paths.delete(mint);
+    }
+    this.retryPendingFinals(now);
+    if (now - this.lastSweepAt >= SWEEP_INTERVAL_MS) {
+      this.lastSweepAt = now;
+      void this.sweepOrphans(now);
     }
     // Forget per-mint bookkeeping of candidates that left the tracker long ago.
     if (this.taken.size > 20_000) for (const mint of [...this.taken.keys()].slice(0, 5_000)) if (!this.paths.has(mint)) {
@@ -379,24 +412,126 @@ export class MlShadowService {
     }).catch(() => tracked.path.gaps.push([previous, now]));
   }
 
-  /** After a restart: resume outcomes that are still inside their 60 minutes (the downtime is a gap). */
+  /** Copy for a checkpoint write: an open stream gap is included, persistedAt = now. */
+  private persistableCopy(tracked: TrackedPath, now: number): OutcomePathState {
+    const gaps = [...tracked.path.gaps];
+    if (tracked.stream && this.gapStart !== null) gaps.push([this.gapStart, now]);
+    tracked.path.persistedAt = now;
+    return { ...tracked.path, buckets: tracked.path.buckets.map((bucket) => [...bucket] as typeof bucket), gaps, persistedAt: now };
+  }
+
+  /** Final outcome write; on failure it is retried with back-off instead of leaving the row TRACKING forever. */
+  private persistFinal(snapshotId: string, mint: string, path: OutcomePathState, finalNow: number, attempts = 0) {
+    this.enqueue(async () => {
+      try {
+        await this.deps.prisma.mlCandidateOutcome.update({ where: { snapshotId }, data: this.outcomeData(snapshotId, mint, path, finalNow, true) });
+        this.pendingFinal.delete(snapshotId);
+      } catch (error) {
+        if (attempts + 1 >= FINAL_WRITE_MAX_ATTEMPTS) {
+          // Left for the periodic orphan sweep (the row is still TRACKING in the DB).
+          this.pendingFinal.delete(snapshotId);
+          this.metrics.finalWriteGiveUps += 1;
+        } else {
+          this.pendingFinal.set(snapshotId, { mint, path, finalNow, attempts: attempts + 1, nextAt: this.now() + Math.min(300_000, 5_000 * 2 ** attempts) });
+        }
+        throw error;
+      }
+    });
+  }
+
+  private retryPendingFinals(now: number) {
+    for (const [snapshotId, pending] of this.pendingFinal) {
+      if (now < pending.nextAt) continue;
+      pending.nextAt = Number.POSITIVE_INFINITY;
+      this.metrics.finalWriteRetries += 1;
+      this.persistFinal(snapshotId, pending.mint, pending.path, pending.finalNow, pending.attempts);
+    }
+  }
+
+  /**
+   * A stored TRACKING path after a worker restart / lost state: the unobserved interval (last persisted copy -> now)
+   * becomes a gap. Returns true when the path is already past its 60 minutes (finalised here).
+   */
+  private reviveStoredPath(snapshotId: string, mint: string, stored: OutcomePathState, now: number, reason: string) {
+    const path = stored;
+    path.gaps = path.gaps ?? [];
+    path.buckets = path.buckets ?? [];
+    const lastBucketAt = path.startAt + (path.buckets.at(-1)?.[0] ?? 0);
+    // Trustworthy until the last persisted copy (older rows without persistedAt: until the last observed trade).
+    const unobservedFrom = Math.max(path.startAt, path.persistedAt ?? lastBucketAt);
+    if (now > unobservedFrom) path.gaps.push([unobservedFrom, now]);
+    if (now - path.startAt >= TRACK_MS) {
+      path.endedAt = path.endedAt ?? path.startAt + TRACK_MS + 1;
+      path.endReason = path.endReason ?? reason;
+      this.persistFinal(snapshotId, mint, path, now);
+      return true;
+    }
+    return false;
+  }
+
+  /** After a restart: resume outcomes still inside their 60 minutes; older ones are finalised (downtime = gap). */
   async resume() {
     if (!this.enabled) return;
     const now = this.now();
-    const rows = await this.deps.prisma.mlCandidateOutcome.findMany({ where: { status: 'TRACKING' }, select: { snapshotId: true, mint: true, path: true, snapshot: { select: { source: true } } }, take: 5_000 }).catch(() => []);
-    for (const row of rows) {
-      const path = row.path as unknown as OutcomePathState;
-      const lastSeen = path.startAt + (path.buckets.at(-1)?.[0] ?? 0);
-      path.gaps.push([Math.max(path.startAt, lastSeen), now]);
-      if (now - path.startAt >= TRACK_MS) {
-        path.endedAt = path.endedAt ?? path.startAt + TRACK_MS + 1;
-        path.endReason = path.endReason ?? 'WORKER_RESTART';
-        this.enqueue(() => this.deps.prisma.mlCandidateOutcome.update({ where: { snapshotId: row.snapshotId }, data: this.outcomeData(row.snapshotId, row.mint, path, now, true) }));
-        continue;
+    let cursor: string | undefined;
+    for (;;) {
+      let rows: Array<{ snapshotId: string; mint: string; path: unknown; snapshot: { source: string } }>;
+      try {
+        // Paged: path JSON can be large; one huge query must not silently drop every TRACKING row.
+        rows = await this.deps.prisma.mlCandidateOutcome.findMany({
+          where: { status: 'TRACKING' }, orderBy: { snapshotId: 'asc' }, take: RESUME_BATCH, ...(cursor ? { skip: 1, cursor: { snapshotId: cursor } } : {}),
+          select: { snapshotId: true, mint: true, path: true, snapshot: { select: { source: true } } },
+        });
+      } catch (error) {
+        this.metrics.resumeFailures += 1;
+        this.deps.logger.warn({ err: error instanceof Error ? error.message.slice(0, 200) : String(error) }, 'ML outcome resume failed (left for the orphan sweep; trading unaffected)');
+        return;
       }
-      const list = this.paths.get(row.mint) ?? [];
-      list.push({ snapshotId: row.snapshotId, mint: row.mint, path, stream: row.snapshot.source === 'PUMP_FUN', lastPersistS: 0, lastPollAt: 0, creator: null });
-      this.paths.set(row.mint, list);
+      for (const row of rows) {
+        if (this.inMemory(row.snapshotId)) continue;
+        if (this.reviveStoredPath(row.snapshotId, row.mint, row.path as OutcomePathState, now, 'WORKER_RESTART')) {
+          this.metrics.finalizedOnResume += 1;
+          continue;
+        }
+        const list = this.paths.get(row.mint) ?? [];
+        // Checkpoints already passed are not re-written; the next one continues from the current age.
+        const ageS = (now - (row.path as OutcomePathState).startAt) / 1000;
+        const lastPersistS = [...PERSIST_CHECKPOINTS_S].reverse().find((value) => value <= ageS) ?? 0;
+        list.push({ snapshotId: row.snapshotId, mint: row.mint, path: row.path as OutcomePathState, stream: row.snapshot.source === 'PUMP_FUN', lastPersistS, lastPollAt: 0, creator: null });
+        this.paths.set(row.mint, list);
+        this.metrics.resumedPaths += 1;
+      }
+      if (rows.length < RESUME_BATCH) break;
+      cursor = rows[rows.length - 1].snapshotId;
+    }
+    this.deps.logger.info({ resumed: this.metrics.resumedPaths, finalized: this.metrics.finalizedOnResume }, 'ML outcome tracking resumed');
+  }
+
+  private inMemory(snapshotId: string) {
+    if (this.pendingFinal.has(snapshotId)) return true;
+    for (const list of this.paths.values()) if (list.some((tracked) => tracked.snapshotId === snapshotId)) return true;
+    return false;
+  }
+
+  /** Periodic: TRACKING rows nobody owns any more (lost in-memory state, dropped or failed writes) are finalised. */
+  async sweepOrphans(now: number) {
+    if (this.sweeping) return;
+    this.sweeping = true;
+    try {
+      const rows = await this.deps.prisma.mlCandidateOutcome.findMany({
+        where: { status: 'TRACKING', createdAt: { lt: new Date(now - ORPHAN_AFTER_MS) } }, take: 500,
+        select: { snapshotId: true, mint: true, path: true },
+      });
+      for (const row of rows) {
+        if (this.inMemory(row.snapshotId)) continue;
+        this.reviveStoredPath(row.snapshotId, row.mint, row.path as unknown as OutcomePathState, now, 'ORPHANED_TRACKING');
+        this.metrics.orphansFinalized += 1;
+      }
+    } catch (error) {
+      this.metrics.sweepFailures += 1;
+      this.deps.logger.warn({ err: error instanceof Error ? error.message.slice(0, 200) : String(error) }, 'ML orphan sweep failed (trading unaffected)');
+    } finally {
+      this.sweeping = false;
     }
   }
 
@@ -496,10 +631,27 @@ export class MlShadowService {
       candidatesSeen: m.candidatesSeen, candidatesEligible: m.candidatesEligible, candidatesIneligible: m.candidatesIneligible,
       snapshotsCreated: m.snapshotsCreated, snapshotsMissedPoint: m.snapshotsMissedPoint, leakageViolations: m.leakageViolations,
       trackedPaths: this.trackedCount(), trackingStarted: m.trackingStarted, trackingDropped: m.trackingDropped, trackingCompleted: m.trackingCompleted,
-      outcomeUpdates: m.outcomeUpdates, streamGaps: m.streamGaps, streamGapOpen: this.gapStart !== null,
+      outcomeUpdates: m.outcomeUpdates, streamGaps: m.streamGaps, streamDisconnects: m.streamDisconnects, streamGapOpen: this.gapStart !== null,
+      lastStreamEventAt: this.lastStreamEventAt ? new Date(this.lastStreamEventAt).toISOString() : null,
+      resumedPaths: m.resumedPaths, finalizedOnResume: m.finalizedOnResume, resumeFailures: m.resumeFailures,
+      pendingFinalWrites: this.pendingFinal.size, finalWriteRetries: m.finalWriteRetries, finalWriteGiveUps: m.finalWriteGiveUps,
+      orphansFinalized: m.orphansFinalized, sweepFailures: m.sweepFailures,
       predictions: m.predictions, predictionFailures: m.predictionFailures, inferenceLatencyMs: m.inferenceLatency.summary(), snapshotLatencyMs: m.snapshotLatency.summary(),
       writeQueueDepth: this.writeQueue.length, writeFailures: m.writeFailures, writesDropped: m.writesDropped,
       additionalRpcRequests: m.additionalRpcRequests, additionalMarketDataRequests: m.additionalMarketDataRequests,
     };
   }
+}
+
+/** ml:health publisher (Redis, TTL 60 s, every 10 s; first write immediately). Never throws into the timer. */
+export function startMlHealthPublisher(service: Pick<MlShadowService, 'snapshot'>, set: (key: string, value: string, options: { EX: number }) => Promise<unknown>, intervalMs = 10_000, onError?: (error: unknown) => void) {
+  const publish = () => {
+    try {
+      void set('ml:health', JSON.stringify(service.snapshot()), { EX: 60 }).catch((error: unknown) => onError?.(error));
+    } catch (error) {
+      onError?.(error);
+    }
+  };
+  publish();
+  return globalThis.setInterval(publish, intervalMs);
 }

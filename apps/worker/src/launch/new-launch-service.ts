@@ -44,7 +44,7 @@ export interface NewLaunchServiceDependencies {
    * Machine Learning SHADOW observer (learning pipeline). Receives copies of data only; every call is synchronous,
    * wrapped (failures isolated) and nothing is awaited: it cannot change or delay any trading decision.
    */
-  ml?: Pick<MlShadowService, 'attach' | 'onTrade' | 'onComplete' | 'onEvaluation' | 'onTick'>;
+  ml?: Pick<MlShadowService, 'attach' | 'onTrade' | 'onComplete' | 'onEvaluation' | 'onTick' | 'onStreamDown' | 'onStreamUp'>;
   tickMs?: number;
   now?: () => number;
 }
@@ -149,6 +149,7 @@ export class NewLaunchService {
             this.tracker.onComplete(mint);
             this.mlSafe(() => this.deps.ml?.onComplete(mint));
           },
+          onStreamStatus: (state, at) => this.mlSafe(() => (state === 'DOWN' ? this.deps.ml?.onStreamDown(at) : this.deps.ml?.onStreamUp(at))),
         });
       } catch (error) {
         this.deps.logger.warn({ err: error instanceof Error ? error.message : String(error), source: provider.source }, 'New launch provider failed to start');
