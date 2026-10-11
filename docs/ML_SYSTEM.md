@@ -82,9 +82,24 @@ with descriptions and transforms, is `ML_FEATURE_SCHEMA`, exported to `ml/schema
 ## Leakage prevention
 
 - Every input series is cut at `snapshotAt`.
-- Each feature group stores its `observedAt`. If `observedAt > snapshotAt`, the snapshot gets
-  `validForTraining=false` with a `FUTURE_DATA_<group>` reason. Future social data is dropped; security data read
-  later is nulled.
+- Each feature group stores its real `observedAt` (never back-dated).
+- Critical groups (MARKET, SECURITY, RISK, AGE): `observedAt > snapshotAt` -> `validForTraining=false` with a
+  `FUTURE_DATA_<group>` reason; late security / risk values are nulled. An ML PAPER decision on such a snapshot is
+  `ML_ERROR` (`FEATURE_LEAKAGE: ...`).
+- Optional group SOCIAL: a social assessment dated after `snapshotAt` is **excluded** - every social feature is null,
+  exactly the "social not available" input - and listed in `lateDataExcluded` (stored on `MlFeatureSnapshot` and
+  `MlPaperDecision` together with `observedAt`). This is not leakage and does not invalidate the snapshot. A late group
+  that still carried a value would be `LATE_DATA_NOT_EXCLUDED_<feature>` (invalid; defence in depth).
+- Root cause of the former `FUTURE_DATA_SOCIAL` flood: the social assessment used its own, later clock inside the New
+  Launch tick. `SocialService.assess(mint, onchain, at)` now assesses as of the tick moment (only events received and
+  created by then; a cache built later is never reused), so on-time social data is used instead of dropped.
+- SHADOW and ML PAPER build snapshots with one function (`apps/worker/src/ml/launch-snapshot.ts`): identical inputs
+  at the same moment give identical features (tested).
+- ML-FEATURES-v1 compatibility: the schema and the meaning ("observed at or before snapshotAt, otherwise null") are
+  unchanged, and a late-social snapshot is the same model input as "no social" (same vector / probability, tested for
+  the logistic and LightGBM artifacts), so no new feature version is needed. Older snapshots stored as invalid
+  (`FUTURE_DATA_SOCIAL`) are kept unchanged and stay excluded from datasets; new snapshots are valid. Retraining on the
+  larger valid sample is recommended once enough labelled rows exist, through the normal approval flow.
 - Outcome data never enters feature columns (tested).
 - One training row per candidate (the earliest snapshot of the configured kind), so near-identical rows of one launch
   cannot sit on both sides of a split.

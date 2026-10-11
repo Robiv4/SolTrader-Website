@@ -1366,6 +1366,8 @@ model MlFeatureSnapshot {
   dataQuality      Int
   validForTraining Boolean
   invalidReasons   Json
+  /// Optional feature groups whose data arrived after snapshotAt and was excluded (features null; not leakage). Null = older rows.
+  lateDataExcluded Json?
   /// SolTrader decision context at snapshot time (best across users: BUY > WATCH > REJECT) + per-user details
   decision         String
   decisionContext  Json
@@ -1484,6 +1486,9 @@ model MlPaperDecision {
   detectedAt       DateTime
   features         Json
   featureHash      String
+  /// Real observation time per feature group (never back-dated) and the optional groups excluded as late
+  observedAt       Json?
+  lateDataExcluded Json?
   dataQuality      Int
   probability      Decimal?  @db.Decimal(8, 6)
   threshold        Decimal   @db.Decimal(4, 3)

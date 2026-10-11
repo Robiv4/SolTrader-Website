@@ -160,8 +160,8 @@ describe('Only approved, intact models (tests 2 / 6)', () => {
     expect(missing.decisions[0]).toMatchObject({ mlDecision: 'ML_ERROR', errorReason: 'MISSING_FEATURE' });
 
     const leak = setup({ M: approvedModel('M', constantArtifact('M', 0.9)) });
-    await leak.engine.step(input(T + 30_000, config('M'), { buildFeatures: () => ({ ...snapshotAt(T + 30_000), invalidReasons: ['FUTURE_DATA_SOCIAL'] }) }));
-    expect(leak.decisions[0]).toMatchObject({ mlDecision: 'ML_ERROR', errorReason: 'FEATURE_LEAKAGE' });
+    await leak.engine.step(input(T + 30_000, config('M'), { buildFeatures: () => ({ ...snapshotAt(T + 30_000), validForTraining: false, invalidReasons: ['FUTURE_DATA_SECURITY'] }) }));
+    expect(leak.decisions[0]).toMatchObject({ mlDecision: 'ML_ERROR', errorReason: 'FEATURE_LEAKAGE: FUTURE_DATA_SECURITY' });
 
     const crash = setup({ M: approvedModel('M', constantArtifact('M', 0.9)) });
     await crash.engine.step(input(T + 30_000, config('M'), { buildFeatures: () => { throw new Error('boom'); } }));

@@ -132,15 +132,21 @@ export class SocialService {
   }
 
   /** Synchronous: freshest snapshot recomputed with the caller's on-chain context (events already collected). */
-  assess(mint: string, onchain: OnchainContext | null): SocialSnapshotResult | null {
+  /**
+   * Social assessment as of `at` (the caller's decision / snapshot moment; default: now). Only events received and
+   * created at or before `at` are used, and the result is never dated after `at`, so a feature snapshot taken at `at`
+   * can use it (no late data, nothing back-dated: a cached window from an earlier moment keeps its own, earlier time).
+   */
+  assess(mint: string, onchain: OnchainContext | null, at?: number): SocialSnapshotResult | null {
     const token = this.tokens.get(mint);
     if (!token) return null;
     const started = globalThis.performance.now();
     const sources = this.sourceStatuses(token);
     let cache = token.windowCache;
-    const now = this.now();
+    const now = at ?? this.now();
     // Window metrics only change with new events or time; within 1 s they are reused (per-user on-chain parts are cheap).
-    if (!cache || cache.eventCount !== token.events.length || now - cache.base.at >= 1_000) {
+    // A cache computed after `now` (another caller, later clock) is never reused for an earlier moment.
+    if (!cache || cache.eventCount !== token.events.length || now - cache.base.at >= 1_000 || cache.base.at > now) {
       cache = { base: computeSocialWindows(token.events, now, sources), eventCount: token.events.length };
       token.windowCache = cache;
     }

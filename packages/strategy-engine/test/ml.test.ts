@@ -31,12 +31,15 @@ describe('ML feature snapshot: no look-ahead', () => {
     expect(withFuture.validForTraining).toBe(true);
   });
 
-  it('a future Telegram snapshot is excluded and the snapshot is marked INVALID_FOR_TRAINING', () => {
+  it('a future Telegram snapshot is excluded (social features null) without invalidating the snapshot', () => {
     const social = { at: T + 2_000, dataQuality: 80, perSource: { TELEGRAM: { momentum: 90, messages: {}, uniqueActiveUsers: {} } } } as unknown as SocialSnapshotResult;
     const snapshot = buildMlFeatureSnapshot({ ...base, state: state([obs(-10, 1), obs(0, 1.1)]), social });
     expect(snapshot.features.telegramMomentum).toBeNull();
-    expect(snapshot.validForTraining).toBe(false);
-    expect(snapshot.invalidReasons).toEqual(expect.arrayContaining(['FUTURE_DATA_SOCIAL']));
+    expect(snapshot.validForTraining).toBe(true);
+    expect(snapshot.invalidReasons).toEqual([]);
+    expect(snapshot.lateDataExcluded).toEqual(['SOCIAL']);
+    // The real (late) observation time is kept for audit, never back-dated.
+    expect(snapshot.observedAt.SOCIAL).toBe(T + 2_000);
   });
 
   it('security read after the snapshot -> invalid and the security values are not used', () => {

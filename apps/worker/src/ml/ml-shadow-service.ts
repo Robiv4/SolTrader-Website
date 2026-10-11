@@ -17,10 +17,14 @@ import path from 'node:path';
 
 import { Prisma, type PrismaClient } from '@prisma/client';
 import {
-  buildMlFeatureSnapshot, computeCandidateOutcome, ML_FEATURE_VERSION, ML_LABEL_VERSION, newOutcomePath, predictMl, recordPathPoint, validateArtifact,
+  computeCandidateOutcome, ML_FEATURE_VERSION, ML_LABEL_VERSION, newOutcomePath, predictMl, recordPathPoint, validateArtifact,
   type LaunchSecurity, type LaunchState, type MlModelArtifact, type OutcomePathState, type SocialSnapshotResult,
 } from '@soltrader/strategy-engine';
 import { RollingPercentiles } from '@soltrader/trading-engine';
+
+import { buildLaunchMlSnapshot, ML_REFERENCE_ORDER_USD } from './launch-snapshot.js';
+
+export { ML_REFERENCE_ORDER_USD };
 
 export type MlMode = 'OFF' | 'SHADOW' | 'ENFORCE_PAPER';
 export const ML_SNAPSHOT_POINTS: Array<{ kind: string; ageMs: number }> = [
@@ -32,8 +36,6 @@ export const ML_SNAPSHOT_POINTS: Array<{ kind: string; ageMs: number }> = [
 const POINT_TOLERANCE_MS = 10_000;
 const TRACK_MS = 60 * 60_000;
 const STREAM_GAP_MS = 15_000;
-/** Reference order for impact / state features (shared with the ML PAPER engine: identical features). */
-export const ML_REFERENCE_ORDER_USD = 20;
 const REFERENCE_ORDER_USD = ML_REFERENCE_ORDER_USD;
 const PERSIST_CHECKPOINTS_S = [130, 610, 1810, 3610];
 /** Failed final writes are retried with back-off; afterwards the periodic sweep finalises the row from the DB. */
@@ -128,7 +130,7 @@ export class MlShadowService {
     candidatesSeen: 0, candidatesEligible: 0, candidatesIneligible: 0, snapshotsCreated: 0, snapshotsMissedPoint: 0, leakageViolations: 0,
     trackingStarted: 0, trackingDropped: 0, trackingCompleted: 0, outcomeUpdates: 0, streamGaps: 0, streamDisconnects: 0,
     resumedPaths: 0, finalizedOnResume: 0, resumeFailures: 0, finalWriteRetries: 0, finalWriteGiveUps: 0, orphansFinalized: 0, sweepFailures: 0,
-    predictions: 0, predictionFailures: 0, writeFailures: 0, writesDropped: 0, additionalMarketDataRequests: 0, additionalRpcRequests: 0,
+    predictions: 0, predictionFailures: 0, lateDataExcluded: 0, writeFailures: 0, writesDropped: 0, additionalMarketDataRequests: 0, additionalRpcRequests: 0,
     inferenceLatency: new RollingPercentiles(), snapshotLatency: new RollingPercentiles(),
   };
 
@@ -250,20 +252,17 @@ export class MlShadowService {
     const state = this.accessor.state(mint, REFERENCE_ORDER_USD);
     const security = this.accessor.security(mint);
     const { best, records } = this.bestDecision(mint);
-    const snapshot = buildMlFeatureSnapshot({
-      snapshotAt: at, source: launch.source, detectedAt: launch.detectedAt, createdAt: launch.createdAt, firstTradeAt: launch.firstTradeAt,
-      state, security: security?.security ?? null, securityObservedAt: security?.completedAt ?? null,
-      riskScore: best?.riskScore ?? null, riskObservedAt: best?.at ?? null, social: best?.social ?? null,
-      referenceImpactPct: this.accessor.impact(mint, REFERENCE_ORDER_USD),
+    // Same builder as the ML PAPER decision (identical features for identical inputs at the same moment).
+    const { snapshot, eligible } = buildLaunchMlSnapshot({
+      at, launch, state, security, riskScore: best?.riskScore ?? null, riskObservedAt: best ? best.at : null, social: best?.social ?? null,
     });
-    // ML eligibility (separate from trading eligibility): a real price and at least two trades.
-    const trades = (state?.observations.at(-1)?.buyCount ?? 0) + (state?.observations.at(-1)?.sellCount ?? 0);
-    if (snapshot.referencePriceUsd === null || trades < 2) {
+    if (!eligible) {
       if (kind === 'AGE_15S') this.metrics.candidatesIneligible += 1;
       return;
     }
     if (kind === 'AGE_15S') this.metrics.candidatesEligible += 1;
     if (!snapshot.validForTraining && snapshot.invalidReasons.some((reason) => reason.startsWith('FUTURE_DATA'))) this.metrics.leakageViolations += 1;
+    if (snapshot.lateDataExcluded.length) this.metrics.lateDataExcluded += 1;
     this.metrics.snapshotLatency.add(globalThis.performance.now() - started);
     const decisionContext = {
       users: records.map((record) => ({ user: createHash('sha256').update(record.userId).digest('hex').slice(0, 12), decision: record.decision, status: record.status, reasons: record.reasons, score: record.score, riskScore: record.riskScore, configVersion: record.configVersion, at: new Date(record.at).toISOString() })),
@@ -277,7 +276,7 @@ export class MlShadowService {
         data: {
           candidateId, mint, source: launch.source, kind, snapshotAt: new Date(at), detectedAt: new Date(launch.detectedAt), featureVersion: ML_FEATURE_VERSION,
           features: snapshot.features as Prisma.InputJsonValue, observedAt: snapshot.observedAt as Prisma.InputJsonValue, dataQuality: snapshot.dataQuality,
-          validForTraining: snapshot.validForTraining, invalidReasons: snapshot.invalidReasons as Prisma.InputJsonValue, decision,
+          validForTraining: snapshot.validForTraining, invalidReasons: snapshot.invalidReasons as Prisma.InputJsonValue, lateDataExcluded: snapshot.lateDataExcluded as Prisma.InputJsonValue, decision,
           decisionContext: decisionContext as Prisma.InputJsonValue, newLaunchConfigVersion: best?.configVersion ?? null,
           referencePriceUsd: new Prisma.Decimal(snapshot.referencePriceUsd!),
         },
@@ -631,7 +630,7 @@ export class MlShadowService {
       labelVersion: ML_LABEL_VERSION,
       model: { status: this.modelStatus, version: this.model?.version ?? null, algorithm: this.model?.artifact.algorithm ?? null, error: this.modelError },
       candidatesSeen: m.candidatesSeen, candidatesEligible: m.candidatesEligible, candidatesIneligible: m.candidatesIneligible,
-      snapshotsCreated: m.snapshotsCreated, snapshotsMissedPoint: m.snapshotsMissedPoint, leakageViolations: m.leakageViolations,
+      snapshotsCreated: m.snapshotsCreated, snapshotsMissedPoint: m.snapshotsMissedPoint, leakageViolations: m.leakageViolations, lateDataExcluded: m.lateDataExcluded,
       trackedPaths: this.trackedCount(), trackingStarted: m.trackingStarted, trackingDropped: m.trackingDropped, trackingCompleted: m.trackingCompleted,
       outcomeUpdates: m.outcomeUpdates, streamGaps: m.streamGaps, streamDisconnects: m.streamDisconnects, streamGapOpen: this.gapStart !== null,
       lastStreamEventAt: this.lastStreamEventAt ? new Date(this.lastStreamEventAt).toISOString() : null,

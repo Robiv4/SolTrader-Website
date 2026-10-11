@@ -1,11 +1,12 @@
 import { Prisma, type PrismaClient } from '@prisma/client';
 import type { TokenDataProvider } from '@soltrader/market-data';
 import { assessRisk, type RiskFactorInput } from '@soltrader/risk-engine';
-import { buildMlFeatureSnapshot, buyerTrendFromObservations, evaluateNewLaunch, mlEntrySafetyBlockers, socialBlocksEntry, evaluateQualityGate, socialSummary, type LaunchSecurity, type LaunchState, type NewLaunchStrategyResult, type QualityGateResult, type SocialSnapshotResult } from '@soltrader/strategy-engine';
+import { buyerTrendFromObservations, evaluateNewLaunch, mlEntrySafetyBlockers, socialBlocksEntry, evaluateQualityGate, socialSummary, type LaunchSecurity, type LaunchState, type NewLaunchStrategyResult, type QualityGateResult, type SocialSnapshotResult } from '@soltrader/strategy-engine';
 import { toRiskEngineConfig } from '@soltrader/token-discovery';
 
 import { DEFAULT_ML_PAPER_CONFIG, type MlPaperEntryEngine, type MlPaperUserConfig, toMlPaperConfig } from '../ml/ml-paper-engine.js';
-import { ML_REFERENCE_ORDER_USD, type MlShadowService } from '../ml/ml-shadow-service.js';
+import { buildLaunchMlSnapshot, ML_REFERENCE_ORDER_USD } from '../ml/launch-snapshot.js';
+import type { MlShadowService } from '../ml/ml-shadow-service.js';
 import { inRejectedSample, type SocialService } from '../social/social-service.js';
 import type { TradingLoopLogger } from '../trading-loop.js';
 import { loadActiveUserRiskSettings } from '../user-risk-settings.js';
@@ -495,7 +496,7 @@ export class NewLaunchService {
       launchScore: result.score, launchMomentumScore: result.launchMomentumScore, exhaustionScore: result.exhaustionScore,
       buySellRatio: f.buySellRatio, uniqueBuyers: f.uniqueBuyers, buyerTrend: buyerTrendFromObservations(launch.observations, now),
       liquidityChangePercent: f.liquidityChange, priceVelocity: f.priceVelocity, priceExtensionPercent: f.priceChangeSinceDetection,
-    });
+    }, now);
   }
 
   private qualityGateFor(result: NewLaunchStrategyResult, state: LaunchState, user: UserContext): QualityGateResult {
@@ -522,22 +523,15 @@ export class NewLaunchService {
     const engine = this.deps.mlPaper;
     const { launch, user, result, risk, security, state, social, now } = context;
     if (!engine) return;
-    const mlState = () => this.tracker.state(launch.mint, ML_REFERENCE_ORDER_USD);
+    // Same builder and inputs as the SHADOW collection at this moment (the risk score and social assessment of this
+    // evaluation, both computed at `now`): identical features in both pipelines.
+    let built: ReturnType<typeof buildLaunchMlSnapshot> | null = null;
+    const build = () => (built ??= buildLaunchMlSnapshot({ at: now, launch, state: this.tracker.state(launch.mint, ML_REFERENCE_ORDER_USD), security, riskScore: risk.riskScore, riskObservedAt: now, social }));
     const step = await engine.step({
       userId: user.userId, mint: launch.mint, detectedAt: launch.detectedAt, now, config: user.strategy,
       candidateId: context.getCandidateId,
-      buildFeatures: () => {
-        const reference = mlState();
-        return buildMlFeatureSnapshot({
-          snapshotAt: now, source: launch.source, detectedAt: launch.detectedAt, createdAt: launch.createdAt, firstTradeAt: launch.firstTradeAt,
-          state: reference, security: security.security, securityObservedAt: security.completedAt, riskScore: risk.riskScore, riskObservedAt: risk.riskScore === null ? null : now,
-          social, referenceImpactPct: reference?.priceImpactPercent ?? null,
-        });
-      },
-      eligible: (snapshot) => {
-        const last = mlState()?.observations.at(-1);
-        return snapshot.referencePriceUsd !== null && (last?.buyCount ?? 0) + (last?.sellCount ?? 0) >= 2;
-      },
+      buildFeatures: () => build().snapshot,
+      eligible: () => build().eligible,
       safetyBlockers: () => {
         const blockers = mlEntrySafetyBlockers({ result, security: security.security, riskScore: risk.riskScore, riskHardBlockReasons: risk.hardBlockReasons, settings: user.settings, detectedAt: launch.detectedAt, now });
         if (risk.classification === null) blockers.push('RISK_NOT_CLASSIFIED');

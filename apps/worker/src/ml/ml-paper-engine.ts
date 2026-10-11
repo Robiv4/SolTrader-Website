@@ -300,7 +300,11 @@ export class MlPaperEntryEngine {
       try {
         snapshot = input.buildFeatures();
         if (!snapshot || !input.eligible(snapshot)) failure = { decision: 'ML_SKIP', reason: 'ML_INELIGIBLE' };
-        else if (snapshot.invalidReasons.some((reason) => reason.startsWith('FUTURE_DATA'))) failure = { decision: 'ML_ERROR', reason: 'FEATURE_LEAKAGE' };
+        // Critical groups (market / security / risk) observed after the snapshot, or a late optional group that still
+        // carries a value: real leakage -> refused. Late SOCIAL data alone is excluded (null) by the builder, not leakage.
+        else if (snapshot.invalidReasons.some((reason) => reason.startsWith('FUTURE_DATA') || reason.startsWith('LATE_DATA_NOT_EXCLUDED'))) {
+          failure = { decision: 'ML_ERROR', reason: `FEATURE_LEAKAGE: ${snapshot.invalidReasons.filter((reason) => reason.startsWith('FUTURE_DATA') || reason.startsWith('LATE_DATA_NOT_EXCLUDED')).join(',')}`.slice(0, 300) };
+        }
         else if (model.artifact.columns.some((column) => !(column.feature in snapshot!.features))) failure = { decision: 'ML_ERROR', reason: 'MISSING_FEATURE' };
         else if (snapshot.dataQuality < model.minDataQuality) failure = { decision: 'ML_SKIP', reason: 'LOW_DATA_QUALITY' };
         else {
@@ -319,6 +323,7 @@ export class MlPaperEntryEngine {
       const features = (snapshot?.features ?? {}) as Prisma.InputJsonValue;
       row = {
         ...common, features, featureHash: snapshot ? createHash('sha256').update(JSON.stringify(snapshot.features)).digest('hex') : '', dataQuality: snapshot?.dataQuality ?? 0,
+        observedAt: snapshot ? snapshot.observedAt as Prisma.InputJsonValue : Prisma.JsonNull, lateDataExcluded: snapshot ? snapshot.lateDataExcluded as Prisma.InputJsonValue : Prisma.JsonNull,
         snapshotAt: new Date(snapshot?.snapshotAt ?? input.now), probability: probability !== null ? new Prisma.Decimal(probability.toFixed(6)) : null,
         mlDecision, errorReason: failure?.reason ?? null, outcome: mlDecision === 'ML_BUY' ? 'PENDING' : mlDecision === 'ML_SKIP' ? 'SKIPPED' : 'ERROR',
         resolvedAt: mlDecision === 'ML_BUY' ? null : new Date(input.now),

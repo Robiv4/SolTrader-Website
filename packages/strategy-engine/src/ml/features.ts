@@ -7,8 +7,12 @@
  *
  * Leakage rules:
  *  - every input series is cut at `snapshotAt` (observations with takenAt > snapshotAt are ignored);
- *  - every feature group records the time its data was observed; observedAt > snapshotAt marks the snapshot
- *    INVALID_FOR_TRAINING (never silently fixed);
+ *  - every feature group records the time its data was observed (the real time, never back-dated);
+ *  - CRITICAL groups (MARKET, SECURITY, RISK, AGE): observedAt > snapshotAt marks the snapshot INVALID_FOR_TRAINING
+ *    (FUTURE_DATA_<group>; never silently fixed, and an ML PAPER decision refuses it);
+ *  - OPTIONAL groups (SOCIAL): data that arrives after snapshotAt is EXCLUDED - all of its features are null, exactly as
+ *    when it is not available - and listed in `lateDataExcluded`. That is not leakage: nothing of it is used. The
+ *    ML-FEATURES-v1 meaning ("observed at or before snapshotAt, otherwise null") is unchanged;
  *  - outcome data never enters this module.
  *
  * Missing data stays null (never 0, never 50). Booleans are true / false / null (null = unknown).
@@ -20,6 +24,8 @@ import {
 import type { SocialSnapshotResult } from '../social/index.js';
 
 export const ML_FEATURE_VERSION = 'ML-FEATURES-v1';
+/** Feature groups whose late data is excluded (null) instead of invalidating the snapshot. Critical groups are never here. */
+export const ML_OPTIONAL_LATE_GROUPS: ReadonlyArray<string> = ['SOCIAL'];
 
 export type MlFeatureType = 'number' | 'boolean' | 'category';
 export type MlFeatureGroup = 'AGE' | 'MARKET' | 'STRUCTURE' | 'SECURITY' | 'RISK' | 'LAUNCH' | 'SOCIAL' | 'SOURCE';
@@ -123,6 +129,8 @@ export interface MlFeatureSnapshotResult {
   observedAt: Partial<Record<MlFeatureGroup, number | null>>;
   /** Share (0-100) of non-null features. */
   dataQuality: number;
+  /** Optional groups whose data arrived after snapshotAt and was excluded (features null; real time kept in observedAt). */
+  lateDataExcluded: MlFeatureGroup[];
   validForTraining: boolean;
   invalidReasons: string[];
   /** Last price at snapshot time (outcome reference; not a feature). */
@@ -220,10 +228,16 @@ export function buildMlFeatureSnapshot(input: MlSnapshotInput): MlFeatureSnapsho
     SOCIAL: input.social?.at ?? null,
     AGE: at,
   };
-  for (const [group, time] of Object.entries(observedAt)) {
-    if (time !== null && time !== undefined && time > at) invalid.push(`FUTURE_DATA_${group}`);
+  const lateDataExcluded: MlFeatureGroup[] = [];
+  for (const [group, time] of Object.entries(observedAt) as Array<[MlFeatureGroup, number | null | undefined]>) {
+    if (time === null || time === undefined || time <= at) continue;
+    if (ML_OPTIONAL_LATE_GROUPS.includes(group)) lateDataExcluded.push(group);
+    else invalid.push(`FUTURE_DATA_${group}`);
   }
-  if (input.social && input.social.at > at) invalid.push('FUTURE_DATA_SOCIAL_EXCLUDED');
+  // Defence in depth: an excluded optional group must not contribute a single value.
+  for (const group of lateDataExcluded) {
+    for (const spec of ML_FEATURE_SCHEMA) if (spec.group === group && features[spec.name] !== null) invalid.push(`LATE_DATA_NOT_EXCLUDED_${spec.name}`);
+  }
   if (input.securityObservedAt !== null && input.securityObservedAt > at) {
     // Security read after the snapshot: the values above must not be used either.
     for (const name of ['mintAuthorityRevoked', 'freezeAuthorityRevoked', 'tokenProgram2022', 'restrictedExtension']) features[name] = null;
@@ -239,6 +253,7 @@ export function buildMlFeatureSnapshot(input: MlSnapshotInput): MlFeatureSnapsho
     features,
     observedAt,
     dataQuality: Math.round(100 * present / numeric.length),
+    lateDataExcluded,
     validForTraining: invalid.length === 0,
     invalidReasons: invalid,
     referencePriceUsd: finite(lastObservation?.priceUsd ?? null),
