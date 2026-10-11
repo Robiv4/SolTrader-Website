@@ -4,8 +4,8 @@ import { assessRisk, type RiskFactorInput } from '@soltrader/risk-engine';
 import { buyerTrendFromObservations, evaluateNewLaunch, mlEntrySafetyBlockers, socialBlocksEntry, evaluateQualityGate, socialSummary, type LaunchSecurity, type LaunchState, type NewLaunchStrategyResult, type QualityGateResult, type SocialSnapshotResult } from '@soltrader/strategy-engine';
 import { toRiskEngineConfig } from '@soltrader/token-discovery';
 
-import { DEFAULT_ML_PAPER_CONFIG, type MlPaperEntryEngine, type MlPaperUserConfig, toMlPaperConfig } from '../ml/ml-paper-engine.js';
 import { buildLaunchMlSnapshot, ML_REFERENCE_ORDER_USD } from '../ml/launch-snapshot.js';
+import { DEFAULT_ML_PAPER_CONFIG, type MlPaperEntryEngine, type MlPaperUserConfig, toMlPaperConfig } from '../ml/ml-paper-engine.js';
 import type { MlShadowService } from '../ml/ml-shadow-service.js';
 import { inRejectedSample, type SocialService } from '../social/social-service.js';
 import type { TradingLoopLogger } from '../trading-loop.js';
@@ -14,6 +14,7 @@ import { loadActiveUserRiskSettings } from '../user-risk-settings.js';
 import { LaunchTracker, type LaunchQuote, type TrackedLaunch } from './launch-tracker.js';
 import { type LaunchEvent, type LaunchProviderStatus, type NewLaunchProvider, WSOL_MINT } from './providers.js';
 import { resolveNewLaunchSettings, type ResolvedNewLaunchSettings } from './settings.js';
+import type { TradeCandleAggregator } from './trade-candles.js';
 
 export { resolveNewLaunchSettings };
 
@@ -52,6 +53,8 @@ export interface NewLaunchServiceDependencies {
    * rule stays mandatory. Fail-closed: any ML failure means no entry for that candidate (no fallback buy).
    */
   mlPaper?: Pick<MlPaperEntryEngine, 'step' | 'markSignaled' | 'resolved'>;
+  /** Real-trade OHLCV for the charts (display only; synchronous, isolated, never affects trading). */
+  candles?: Pick<TradeCandleAggregator, 'record'>;
   tickMs?: number;
   now?: () => number;
 }
@@ -153,6 +156,11 @@ export class NewLaunchService {
           onTrade: (trade) => {
             this.tracker.onTrade(trade);
             this.mlSafe(() => this.deps.ml?.onTrade(trade, this.tracker.solPriceUsd));
+            try {
+              this.deps.candles?.record(trade, this.tracker.solPriceUsd);
+            } catch {
+              // chart data never affects trading
+            }
           },
           onComplete: (mint) => {
             this.tracker.onComplete(mint);

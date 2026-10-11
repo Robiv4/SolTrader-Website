@@ -6,40 +6,43 @@
 :root {
   color-scheme: light;
 
-  /* Surfaces (light, AI Broker style: soft grey canvas, white cards) */
-  --bg: #f4f6fb;
+  /* Surfaces (light theme: cool grey canvas, white panels) */
+  --bg: #f3f5f9;
   --surface: #ffffff;
-  --surface-2: #f8fafc;
-  --surface-3: #eef2f8;
+  --surface-2: #f7f8fb;
+  --surface-3: #eceff5;
   --input: #ffffff;
-  --border: #e4e9f1;
-  --border-strong: #cbd5e1;
+  --border: #e2e6ee;
+  --border-strong: #c9d0dc;
   --border-soft: rgba(15, 23, 42, 0.06);
-  --glass: rgba(255, 255, 255, 0.94);
+  --glass: rgba(255, 255, 255, 0.92);
 
   /* Text */
-  --text: #0f172a;
-  --text-2: #334155;
-  --muted: #64748b;
-  --faint: #94a3b8;
+  --text: #0d1321;
+  --text-2: #353f52;
+  --muted: #5f6b80;
+  --faint: #929cb0;
 
-  /* Brand & semantic colours (text-safe on white: >= 4.5:1) */
-  --brand: #2563eb;
-  --brand-2: #3b82f6;
-  --brand-soft: rgba(37, 99, 235, 0.09);
-  --brand-gradient: linear-gradient(135deg, #2563eb 0%, #3b82f6 100%);
-  --positive: #047857;
+  /* SolTrader brand: violet-indigo (distinct from the green / red market colours) */
+  --brand: #5b4ff0;
+  --brand-2: #7468ff;
+  --brand-soft: rgba(91, 79, 240, 0.1);
+  --brand-gradient: linear-gradient(135deg, #5b4ff0 0%, #8a63ff 100%);
+  --positive: #0b8a5c;
   --positive-soft: rgba(16, 185, 129, 0.12);
-  --negative: #dc2626;
+  --negative: #d92d43;
   --negative-soft: rgba(239, 68, 68, 0.1);
-  --warning: #b45309;
+  --warning: #a75c05;
   --warning-soft: rgba(245, 158, 11, 0.14);
-  --info: #2563eb;
-  --info-soft: rgba(37, 99, 235, 0.09);
-  --accent-text: #1d4ed8;
-  --negative-text: #b91c1c;
-  --warning-text: #92400e;
-  --trailing: #ea580c;
+  --info: #2d6fe0;
+  --info-soft: rgba(45, 111, 224, 0.1);
+  --accent-text: #4335d6;
+  --negative-text: #b4192e;
+  --warning-text: #8a4a04;
+  --trailing: #e2620d;
+  /* Market colours used by the chart (candles, volume, markers) */
+  --up: #0f9f6e;
+  --down: #e5384f;
 
   /* Legacy aliases used by inline styles/components */
   --success: var(--positive);
@@ -48,11 +51,12 @@
   --panel-alt: var(--surface-2);
 
   /* Shape & motion */
-  --radius-lg: 16px;
-  --radius: 12px;
-  --radius-sm: 8px;
-  --shadow: 0 1px 2px rgba(15, 23, 42, 0.04), 0 6px 20px rgba(15, 23, 42, 0.05);
-  --ease: 180ms cubic-bezier(0.2, 0.8, 0.2, 1);
+  --radius-lg: 14px;
+  --radius: 10px;
+  --radius-sm: 7px;
+  --shadow: 0 1px 2px rgba(15, 23, 42, 0.04), 0 4px 16px rgba(15, 23, 42, 0.05);
+  --shadow-pop: 0 12px 40px rgba(15, 23, 42, 0.16);
+  --ease: 160ms cubic-bezier(0.2, 0.8, 0.2, 1);
 
   /* Type */
   --font-body: var(--font-display), 'Plus Jakarta Sans', system-ui, -apple-system, 'Segoe UI', sans-serif;
@@ -60,41 +64,44 @@
   --font-code: var(--font-mono), 'JetBrains Mono', Consolas, monospace;
 }
 
-/* Dark theme: same structure, desaturated navy surfaces, lighter tonal accents (text >= 4.5:1). */
+/* Dark theme (primary): deep ink surfaces, low-glare borders, brighter tonal accents (text >= 4.5:1). */
 :root[data-theme='dark'] {
   color-scheme: dark;
-  --bg: #0b1120;
-  --surface: #111a2e;
-  --surface-2: #16213a;
-  --surface-3: #1d2a47;
-  --input: #0e1627;
-  --border: #22304d;
-  --border-strong: #334467;
-  --border-soft: rgba(148, 163, 199, 0.1);
-  --glass: rgba(17, 26, 46, 0.94);
-  --text: #eef2fa;
-  --text-2: #c3cbdc;
-  --muted: #94a0b8;
-  --faint: #66728c;
-  --brand: #5b8cff;
-  --brand-2: #7aa2ff;
-  --brand-soft: rgba(91, 140, 255, 0.15);
-  --brand-gradient: linear-gradient(135deg, #3b6cf6 0%, #5b8cff 100%);
-  --positive: #34d399;
-  --positive-soft: rgba(52, 211, 153, 0.13);
-  --negative: #fb7185;
-  --negative-soft: rgba(251, 113, 133, 0.13);
-  --warning: #fbbf24;
-  --warning-soft: rgba(251, 191, 36, 0.13);
-  --info: #7aa2ff;
-  --info-soft: rgba(91, 140, 255, 0.14);
-  --accent-text: #a9c1ff;
-  --negative-text: #fecdd3;
-  --warning-text: #fde68a;
-  --trailing: #fb923c;
-  --shadow: 0 1px 0 rgba(255, 255, 255, 0.03) inset, 0 10px 28px rgba(0, 0, 0, 0.35);
+  --bg: #090c12;
+  --surface: #0f131b;
+  --surface-2: #141924;
+  --surface-3: #1a202d;
+  --input: #0c1017;
+  --border: #1f2633;
+  --border-strong: #2d3647;
+  --border-soft: rgba(148, 163, 199, 0.08);
+  --glass: rgba(15, 19, 27, 0.92);
+  --text: #edf0f6;
+  --text-2: #c2c8d4;
+  --muted: #8b94a6;
+  --faint: #5d6678;
+  --brand: #8b80ff;
+  --brand-2: #a59cff;
+  --brand-soft: rgba(139, 128, 255, 0.14);
+  --brand-gradient: linear-gradient(135deg, #6c5ff5 0%, #9b7bff 100%);
+  --positive: #2fd492;
+  --positive-soft: rgba(47, 212, 146, 0.12);
+  --negative: #ff5c72;
+  --negative-soft: rgba(255, 92, 114, 0.12);
+  --warning: #f5b84a;
+  --warning-soft: rgba(245, 184, 74, 0.12);
+  --info: #6ea8ff;
+  --info-soft: rgba(110, 168, 255, 0.13);
+  --accent-text: #c3bdff;
+  --negative-text: #ffc2cb;
+  --warning-text: #fde2a8;
+  --trailing: #ff9a4d;
+  --up: #2fd492;
+  --down: #ff5c72;
+  --shadow: 0 1px 0 rgba(255, 255, 255, 0.02) inset, 0 8px 24px rgba(0, 0, 0, 0.32);
+  --shadow-pop: 0 18px 48px rgba(0, 0, 0, 0.55);
 }
-:root[data-theme='dark'] body::before { background: radial-gradient(1100px 420px at 60% -12%, rgba(91, 140, 255, 0.09), transparent 65%); }
+:root[data-theme='dark'] body::before { background: radial-gradient(1000px 380px at 70% -14%, rgba(139, 128, 255, 0.07), transparent 65%); }
 
 /* ---------- Base ---------- */
 *, *::before, *::after { box-sizing: border-box; }
@@ -114,7 +121,7 @@ body {
 }
 body::before {
   content: ''; position: fixed; inset: 0; z-index: -1; pointer-events: none;
-  background: radial-gradient(1100px 420px at 60% -12%, rgba(37, 99, 235, 0.06), transparent 65%);
+  background: radial-gradient(1100px 420px at 60% -12%, rgba(91, 79, 240, 0.05), transparent 65%);
 }
 h1, h2, h3, h4 { font-family: var(--font-head); color: var(--text); letter-spacing: -0.015em; }
 a { color: inherit; text-decoration: none; }
@@ -122,7 +129,7 @@ button, input, select, textarea { font: inherit; color: inherit; }
 button { cursor: pointer; }
 button:disabled { opacity: 0.5; cursor: not-allowed; }
 code, .mono { font-family: var(--font-code); }
-::selection { background: rgba(37, 99, 235, 0.28); }
+::selection { background: rgba(124, 108, 255, 0.3); }
 :focus-visible { outline: 2px solid var(--brand-2); outline-offset: 2px; }
 * { scrollbar-width: thin; scrollbar-color: var(--border-strong) transparent; }
 .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }

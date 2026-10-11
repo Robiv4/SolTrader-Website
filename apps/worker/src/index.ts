@@ -13,6 +13,7 @@ import { HotPositionMonitor, type MarketEvent } from './exit/hot-position-monito
 import { cycleMonitoredPositionsWhere, ThrottledWarning } from './exit/position-scope.js';
 import { NewLaunchService } from './launch/new-launch-service.js';
 import { MeteoraLaunchProvider, PumpFunLaunchProvider, RaydiumLaunchProvider } from './launch/providers.js';
+import { TradeCandleAggregator } from './launch/trade-candles.js';
 import { logger } from './logger.js';
 import { MlPaperEntryEngine, MlPaperModelRegistry } from './ml/ml-paper-engine.js';
 import { MlShadowService, startMlHealthPublisher, type MlMode } from './ml/ml-shadow-service.js';
@@ -141,8 +142,12 @@ const mlService = new MlShadowService({
 const mlPaperRegistry = new MlPaperModelRegistry({ prisma, repoRoot: mlRepoRoot, logger });
 const mlPaperEngine = new MlPaperEntryEngine({ prisma, registry: mlPaperRegistry, logger });
 
+// Real-trade OHLCV (5 s) for the charts: Redis only, short TTL; no DB writes, no extra requests.
+const tradeCandles = new TradeCandleAggregator({ store: { hSet: (key, values) => redisClient.hSet(key, values), expire: (key, seconds) => redisClient.expire(key, seconds) } });
+
 const newLaunch = new NewLaunchService({
   mlPaper: mlPaperEngine,
+  candles: tradeCandles,
   social: socialService ?? undefined,
   ml: mlService.enabled ? mlService : undefined,
   prisma,
@@ -366,6 +371,7 @@ async function main() {
   await eventPublisher.connect();
   await loop.start();
   newLaunch.start();
+  globalThis.setInterval(() => void tradeCandles.flush().catch(() => undefined), 5_000);
   // ML PAPER health (model load / approval / last prediction; no secrets) + bookkeeping of finished candidates.
   globalThis.setInterval(() => {
     void eventPublisher.set('ml:paper:health', JSON.stringify({ at: new Date().toISOString(), models: mlPaperRegistry.snapshot(), engine: mlPaperEngine.snapshot() }), { EX: 60 }).catch(() => undefined);

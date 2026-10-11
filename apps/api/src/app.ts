@@ -43,12 +43,13 @@ import { createMlPaperRouter } from './ml-paper.js';
 import { buildLaunchAnalytics, launchFunnel, loadLaunchTrades, parseScope, simulateFilter } from './new-launch-analytics.js';
 import { applyNewLaunchSettingsChange, loadNewLaunchSettings } from './new-launch-config.js';
 import { startOptimizationRun } from './new-launch-optimizer-job.js';
-import { buildPositionChart, buildPositionDetail, buildTokenChart, type ChartRange, persistedExitState, positionDecisionSource, priceLiquiditySeries } from './position-detail.js';
+import { buildPositionChart, buildPositionDetail, buildTokenChart, type ChartRange, persistedExitState, positionDecisionSource, latestPriceSampleAt, priceLiquiditySeries, priceSeries } from './position-detail.js';
 import { redactSensitiveFields } from './secret-redaction.js';
 import { buildSocialAnalytics } from './social-analytics.js';
 import { SseEventHub } from './sse.js';
 import { buildTelegramAnalytics } from './telegram-analytics.js';
 import { TelegramBotService } from './telegram-bot.js';
+import { aggregateCandles, availableTimeframes, type Candle, findGaps, GeckoTerminalOhlcv, geckoTimeframe, parseStoredCandles, TIMEFRAMES } from './token-candles.js';
 import { aiDecisionFunnel, type AnalyticsTrade, computeTradeAnalytics, groupBy as groupTrades } from './trade-analytics.js';
 import {
   newLaunchSettingsSchema,
@@ -63,6 +64,7 @@ import {
   walletConnectSchema,
   walletDisconnectSchema,
 } from './validation.js';
+import { jsonRpc, WalletPortfolioService } from './wallet-portfolio.js';
 import { decodeSignature, decodeSolanaPublicKey, fetchSolBalance, rpcUrlForNetwork, verifyEd25519Signature, WalletChallengeStore } from './wallet-verification.js';
 
 declare global {
@@ -733,9 +735,10 @@ async function ensureUserSettings(userId: string) {
 
 async function getUserSettingsView(userId: string) {
   const { botConfig, riskConfig, notificationConfig } = await ensureUserSettings(userId);
-  const [wallets, newLaunch] = await Promise.all([
+  const [wallets, newLaunch, paperStrategy] = await Promise.all([
     prisma.wallet.findMany({ where: { userId }, orderBy: { createdAt: 'desc' } }),
     prisma.newLaunchConfig.findUnique({ where: { userId }, select: { enabled: true, configVersion: true } }),
+    prisma.mlPaperSettings.findUnique({ where: { userId }, select: { strategyMode: true, modelVersion: true } }),
   ]);
 
   return {
@@ -755,6 +758,8 @@ async function getUserSettingsView(userId: string) {
     skipUnbuyableForMinutes: botConfig.skipUnbuyableForMinutes,
     /** Read-only summary; New Launch settings are edited through /api/settings/new-launch. */
     newLaunch: { enabled: newLaunch?.enabled ?? false, configVersion: newLaunch?.configVersion ?? 'NL-v1' },
+    /** Active New Launch PAPER entry strategy (read-only summary; changed through /api/settings/ml-paper). */
+    paperStrategy: { mode: paperStrategy?.strategyMode === 'ML' ? 'ML' : 'DEFAULT', modelVersion: paperStrategy?.strategyMode === 'ML' ? paperStrategy.modelVersion : null },
     risk: {
       riskPolicy: riskConfig.riskPolicy,
       lowRiskMax: riskConfig.lowRiskMax,
@@ -1187,6 +1192,26 @@ app.get('/api/settings/wallet', async (req, res) => {
 
 const walletChallenges = new WalletChallengeStore();
 
+/** Host of the web app this request comes from (allowed CORS origin), else the API host: binds wallet challenges to a domain. */
+function walletChallengeDomain(req: Request) {
+  const origin = req.get('origin');
+  if (origin && allowedOrigins.has(origin)) {
+    try {
+      return new URL(origin).host;
+    } catch {
+      // fall through
+    }
+  }
+  // Without a (trusted) Origin: the host name of the request (the port is not part of the binding).
+  const host = req.get('host');
+  if (!host) return 'soltrader';
+  try {
+    return new URL(`http://${host}`).hostname;
+  } catch {
+    return 'soltrader';
+  }
+}
+
 function walletRpcUrl(network: string) {
   return rpcUrlForNetwork(network, env.SOLANA_PRIMARY_RPC_URL || env.SOLANA_RPC_URL || undefined);
 }
@@ -1202,6 +1227,67 @@ async function refreshWalletBalance(walletId: string, userId: string) {
   });
 }
 
+// ---------- Read-only on-chain portfolio of the linked user wallet (SOL + SPL / Token-2022) ----------
+const priceCache = new Map<string, { at: number; value: { priceUsd: number; source: string } | null }>();
+const priceWindow = { start: 0, used: 0 };
+/** Fresh USD price from the local market tables or the market-data provider (budgeted, cached); null if not reliable. */
+async function reliableTokenPrice(mint: string) {
+  const cached = priceCache.get(mint);
+  if (cached && Date.now() - cached.at < 120_000) return cached.value;
+  let value: { priceUsd: number; source: string } | null = null;
+  const local = await prisma.tokenMetric.findFirst({ where: { token: { address: mint }, timestamp: { gte: new Date(Date.now() - 10 * 60_000) } }, orderBy: { timestamp: 'desc' }, select: { priceUsd: true } }).catch(() => null);
+  const localPrice = toNumber(local?.priceUsd);
+  if (localPrice && localPrice > 0) value = { priceUsd: localPrice, source: 'SOLTRADER_MARKET_DATA' };
+  if (!value) {
+    if (Date.now() - priceWindow.start > 60_000) Object.assign(priceWindow, { start: Date.now(), used: 0 });
+    if (priceWindow.used < 30) {
+      priceWindow.used += 1;
+      const quote = await apiMarketDataProvider.getTokenMetrics(mint).catch(() => null);
+      const fresh = quote?.timestamp && Date.now() - quote.timestamp.getTime() <= env.MARKET_DATA_STALE_AFTER_MS;
+      const price = toNumber(quote?.priceUsd);
+      if (fresh && price && price > 0) value = { priceUsd: price, source: quote?.provider ?? 'MARKET_DATA' };
+    }
+  }
+  priceCache.set(mint, { at: Date.now(), value });
+  return value;
+}
+
+const walletPortfolio = new WalletPortfolioService({
+  rpcFor: (network) => jsonRpc(walletRpcUrl(network), env.SOLANA_RPC_TIMEOUT_MS),
+  priceOf: reliableTokenPrice,
+  metadataOf: async (mints) => {
+    const [tokens, launches] = await Promise.all([
+      prisma.token.findMany({ where: { address: { in: mints } }, select: { address: true, symbol: true, name: true } }),
+      prisma.launchCandidate.findMany({ where: { mint: { in: mints } }, select: { mint: true, symbol: true, name: true } }),
+    ]);
+    const map = new Map<string, { symbol: string | null; name: string | null }>();
+    for (const launch of launches) map.set(launch.mint, { symbol: launch.symbol, name: launch.name });
+    for (const token of tokens) map.set(token.address, { symbol: token.symbol, name: token.name });
+    return map;
+  },
+});
+
+app.get('/api/wallet/overview', async (req, res) => {
+  try {
+    const userId = req.user!.id;
+    const wallet = await prisma.wallet.findFirst({ where: { userId, type: 'USER', isActive: true }, orderBy: { updatedAt: 'desc' } });
+    if (!wallet) return res.json({ ok: true, data: { connected: false } });
+    const force = req.query.refresh === '1' && walletPortfolio.canForce(userId);
+    try {
+      const portfolio = await walletPortfolio.load(wallet.publicAddress, wallet.network, force);
+      // The stored balance is only ever the on-chain value of this verified address.
+      await prisma.wallet.update({ where: { id: wallet.id, userId }, data: { lastBalance: new Prisma.Decimal(portfolio.sol.balance.toFixed(9)), lastBalanceAt: new Date(portfolio.fetchedAt) } }).catch(() => undefined);
+      return res.json({ ok: true, data: { connected: true, wallet: serializeWallet(wallet), portfolio, refreshThrottled: req.query.refresh === '1' && !force } });
+    } catch (error) {
+      logger.warn({ err: error instanceof Error ? error.message : String(error), walletId: wallet.id }, 'Wallet portfolio lookup failed');
+      return res.json({ ok: true, data: { connected: true, wallet: serializeWallet(wallet), portfolio: null, error: 'RPC_UNAVAILABLE' } });
+    }
+  } catch (error) {
+    logger.error({ err: error }, 'Wallet overview failed');
+    return errorResponse(res, 500, 'Unable to load wallet overview');
+  }
+});
+
 app.post('/api/settings/wallet/challenge', async (req, res) => {
   try {
     const parsed = walletChallengeSchema.safeParse(req.body ?? {});
@@ -1211,7 +1297,7 @@ app.post('/api/settings/wallet/challenge', async (req, res) => {
     if (!decodeSolanaPublicKey(parsed.data.publicAddress)) {
       return errorResponse(res, 400, 'Not a valid Solana public key');
     }
-    const challenge = walletChallenges.issue(req.user!.id, req.user!.email, parsed.data.publicAddress, parsed.data.network);
+    const challenge = walletChallenges.issue(req.user!.id, req.user!.email, parsed.data.publicAddress, parsed.data.network, walletChallengeDomain(req));
     return res.json({ ok: true, data: challenge });
   } catch (error) {
     logger.error({ err: error }, 'Failed to issue wallet challenge');
@@ -1243,7 +1329,7 @@ app.post('/api/settings/wallet/connect', async (req, res) => {
       if (!parsed.data.nonce || !parsed.data.signature) {
         return errorResponse(res, 400, 'Wallet ownership proof is required: request a challenge and sign it with the wallet');
       }
-      const challenge = walletChallenges.consume(userId, publicAddress, parsed.data.nonce);
+      const challenge = walletChallenges.consume(userId, publicAddress, parsed.data.nonce, walletChallengeDomain(req));
       if (!challenge) return errorResponse(res, 400, 'The wallet verification challenge expired or is unknown. Please try again.');
       const signature = decodeSignature(parsed.data.signature);
       if (!signature || !verifyEd25519Signature(publicKey, Buffer.from(challenge.message, 'utf8'), signature)) {
@@ -2283,6 +2369,154 @@ app.get('/api/tokens/:address/chart', async (req, res) => {
     if (error instanceof z.ZodError) return errorResponse(res, 400, 'Invalid chart window', error.issues);
     logger.error({ err: error }, 'Failed to load token chart');
     return errorResponse(res, 500, 'Unable to load chart');
+  }
+});
+
+// ---------- Trading chart: real OHLCV (trade stream / GeckoTerminal) or the stored price line ----------
+const geckoOhlcv = new GeckoTerminalOhlcv(async (url) => {
+  const response = await globalThis.fetch(url, { headers: { accept: 'application/json' }, signal: globalThis.AbortSignal.timeout(6_000) });
+  if (!response.ok) throw new Error(`HTTP ${response.status}`);
+  return response.json();
+});
+const candleQuerySchema = z.object({ tf: z.enum(['5s', '15s', '1m', '5m', '15m', '1h']).optional(), from: z.coerce.number().int().positive().optional(), to: z.coerce.number().int().positive().optional() });
+
+/** The user's own PAPER trades / ML decisions / open-position levels for this token (every marker is a stored fact). */
+async function chartOverlays(userId: string, address: string) {
+  const [trades, decisions, position] = await Promise.all([
+    prisma.trade.findMany({ where: { userId, tokenAddress: address, mode: 'PAPER' }, orderBy: { entryAt: 'asc' }, take: 50, select: { id: true, entryAt: true, entry: true, exitAt: true, exit: true, exitReason: true, entryStrategy: true, status: true } }),
+    prisma.mlPaperDecision.findMany({ where: { userId, mint: address, mlDecision: 'ML_BUY' }, select: { decidedAt: true, probability: true, modelVersion: true, outcome: true } }),
+    prisma.position.findFirst({ where: { userId, token: { address }, status: 'OPEN', mode: 'PAPER' }, orderBy: { openedAt: 'desc' } }),
+  ]);
+  const markers: Array<{ t: number; kind: 'PAPER_BUY' | 'PAPER_SELL' | 'ML_BUY'; price: number | null; label: string }> = [];
+  for (const trade of trades) {
+    if (trade.entryAt) markers.push({ t: trade.entryAt.getTime(), kind: 'PAPER_BUY', price: toNumber(trade.entry), label: `PAPER vétel${trade.entryStrategy === 'ML' ? ' (ML)' : ''}` });
+    if (trade.exitAt) markers.push({ t: trade.exitAt.getTime(), kind: 'PAPER_SELL', price: toNumber(trade.exit), label: `PAPER eladás${trade.exitReason ? ` · ${trade.exitReason}` : ''}` });
+  }
+  for (const decision of decisions) markers.push({ t: decision.decidedAt.getTime(), kind: 'ML_BUY', price: null, label: `ML BUY ${decision.probability !== null ? Number(decision.probability).toFixed(2) : ''} · ${decision.modelVersion}` });
+  let levels: { entry: number | null; stopLoss: number | null; takeProfit: number | null; trailingStop: number | null } | null = null;
+  if (position) {
+    const described = describeExitLevels(persistedExitState(position), toNumber(position.currentPrice));
+    levels = { entry: described.entryPrice, stopLoss: described.stopLoss?.price ?? null, takeProfit: described.takeProfit?.price ?? null, trailingStop: described.trailing.status === 'ACTIVE' ? described.trailing.triggerPrice : null };
+  }
+  return { markers: markers.sort((a, b) => a.t - b.t), levels, positionId: position?.id ?? null, simulated: true };
+}
+
+/** Per-user trading context of a token for the token page: ML decisions, PAPER history and the open position. */
+app.get('/api/tokens/:address/trading', async (req, res) => {
+  try {
+    const userId = req.user!.id;
+    const address = req.params.address;
+    const [paperDecision, shadow, trades, position] = await Promise.all([
+      prisma.mlPaperDecision.findUnique({ where: { userId_mint: { userId, mint: address } }, select: { modelVersion: true, mlDecision: true, probability: true, threshold: true, decidedAt: true, snapshotKind: true, outcome: true, errorReason: true, executionReason: true, baseDecision: true, lateDataExcluded: true } }).catch(() => null),
+      prisma.mlPrediction.findFirst({ where: { mint: address, snapshot: { kind: 'AGE_30S' } }, orderBy: { predictedAt: 'desc' }, select: { modelVersion: true, probability: true, predictedClass: true, mlEntryScore: true, predictedAt: true } }).catch(() => null),
+      prisma.trade.findMany({ where: { userId, tokenAddress: address, mode: 'PAPER' }, orderBy: { entryAt: 'desc' }, take: 25, select: { id: true, entryAt: true, exitAt: true, entry: true, exit: true, size: true, netPnl: true, fees: true, slippage: true, exitReason: true, status: true, entryStrategy: true, mlModelVersion: true, positionId: true } }),
+      prisma.position.findFirst({ where: { userId, token: { address }, status: 'OPEN', mode: 'PAPER' }, orderBy: { openedAt: 'desc' }, select: { id: true, avgEntryPrice: true, currentPrice: true, quantity: true, unrealizedPnl: true, openedAt: true, entryStrategy: true } }),
+    ]);
+    const entry = toNumber(position?.avgEntryPrice);
+    const current = toNumber(position?.currentPrice);
+    return res.json({ ok: true, data: {
+      ml: {
+        paperDecision: paperDecision ? { ...paperDecision, probability: toNumber(paperDecision.probability), threshold: toNumber(paperDecision.threshold) } : null,
+        shadowPrediction: shadow ? { ...shadow, probability: toNumber(shadow.probability) } : null,
+      },
+      paperTrades: trades.map((trade) => ({ ...trade, entry: toNumber(trade.entry), exit: toNumber(trade.exit), size: toNumber(trade.size), netPnl: toNumber(trade.netPnl), fees: toNumber(trade.fees), slippage: toNumber(trade.slippage) })),
+      openPosition: position ? { id: position.id, entry, current, quantity: toNumber(position.quantity), unrealizedPnl: toNumber(position.unrealizedPnl), pnlPercent: entry && current ? (current / entry - 1) * 100 : null, openedAt: position.openedAt, entryStrategy: position.entryStrategy } : null,
+    } });
+  } catch (error) {
+    logger.error({ err: error }, 'Failed to load token trading context');
+    return errorResponse(res, 500, 'Unable to load token trading context');
+  }
+});
+
+app.get('/api/tokens/:address/candles', async (req, res) => {
+  try {
+    const query = candleQuerySchema.parse(req.query);
+    const address = req.params.address;
+    const to = query.to ?? Date.now();
+    const from = query.from ?? to - 3_600_000;
+    if (to - from > 7 * 86_400_000 || from >= to) return errorResponse(res, 400, 'Invalid chart window');
+    const overlays = await chartOverlays(req.user!.id, address).catch(() => ({ markers: [], levels: null, positionId: null, simulated: true }));
+    // 1) Real trade-stream candles (pump.fun), aggregated from 5 s buckets.
+    const stored = await getRealtimeClient().then((client) => client.hGetAll(`candles:5s:${address}`)).catch(() => ({} as Record<string, string>));
+    const base = parseStoredCandles(stored ?? {});
+    const offered = availableTimeframes(base, TIMEFRAMES['5s'], from, to);
+    if (offered.length) {
+      const timeframe = query.tf && offered.includes(query.tf) ? query.tf : offered.includes('15s') ? '15s' : offered[0];
+      const candles = aggregateCandles(base.filter((candle) => candle.t >= from && candle.t <= to), TIMEFRAMES[timeframe]);
+      return res.json({ ok: true, data: {
+        chartType: 'candles', source: 'PUMP_FUN_TRADES', sourceLabel: 'Pump.fun kötések (valós tranzakciók)', timeframe, availableTimeframes: offered,
+        candles, gaps: findGaps(candles.map((candle) => candle.t), TIMEFRAMES[timeframe] * 6), lastTradeAt: base.at(-1)?.t ?? null, quote: 'USD', from, to, overlays,
+      } });
+    }
+    // 2) Real OHLCV from GeckoTerminal for pool tokens.
+    if (env.CHART_OHLCV_GECKOTERMINAL && env.NODE_ENV !== 'test') {
+      const timeframe = query.tf && geckoTimeframe(query.tf) ? query.tf : '1m';
+      const result = await geckoOhlcv.candles(address, timeframe).catch(() => null);
+      const inWindow = (result?.candles ?? []).filter((candle: Candle) => candle.t >= from - TIMEFRAMES[timeframe] && candle.t <= to);
+      if (result && inWindow.length >= 3) {
+        return res.json({ ok: true, data: {
+          chartType: 'candles', source: 'GECKOTERMINAL', sourceLabel: 'GeckoTerminal OHLCV (pool)', timeframe, availableTimeframes: ['1m', '5m', '15m', '1h'], pool: result.pool,
+          candles: inWindow, gaps: findGaps(inWindow.map((candle) => candle.t), TIMEFRAMES[timeframe] * 6), lastTradeAt: inWindow.at(-1)?.t ?? null, quote: 'USD', from, to, overlays,
+        } });
+      }
+    }
+    // 3) Line of the stored price samples (no candles are invented from samples).
+    const token = await prisma.token.findUnique({ where: { address }, select: { id: true } });
+    const points = await priceSeries(token?.id ?? '', address, new Date(from), new Date(to), 1_500);
+    const intervals = points.slice(1).map((point, index) => point.t - points[index].t).sort((a, b) => a - b);
+    const median = intervals.length ? intervals[Math.floor(intervals.length / 2)] : 15_000;
+    const latestDataAt = points.length ? points.at(-1)!.t : await latestPriceSampleAt(token?.id ?? '', address, new Date(to)).catch(() => null);
+    return res.json({ ok: true, data: {
+      chartType: 'line', source: 'PRICE_SAMPLES', sourceLabel: 'Tárolt árminták (nincs elegendő kötésadat gyertyához)', timeframe: null, availableTimeframes: [],
+      points, latestDataAt, gaps: findGaps(points.map((point) => point.t), Math.max(60_000, median * 4)), lastTradeAt: points.at(-1)?.t ?? null, quote: 'USD', from, to, overlays,
+    } });
+  } catch (error) {
+    if (error instanceof z.ZodError) return errorResponse(res, 400, 'Invalid chart query', error.issues);
+    logger.error({ err: error }, 'Failed to load token candles');
+    return errorResponse(res, 500, 'Unable to load chart');
+  }
+});
+
+/** Light dashboard status: worker / New Launch / ML health, today's ML PAPER decisions, data collection and the newest launches (Redis + cheap counts). */
+app.get('/api/dashboard/overview', async (req, res) => {
+  try {
+    const userId = req.user!.id;
+    const startOfDay = new Date(`${new Date().toISOString().slice(0, 10)}T00:00:00.000Z`);
+    const [heartbeat, mlHealth, live, providers, mlDecisions, snapshots24h] = await Promise.all([
+      readJsonKey<{ at?: string }>('worker:heartbeat'),
+      readJsonKey<Record<string, unknown>>('ml:health'),
+      readJsonKey<{ at: string; launches: Array<Record<string, unknown> & { mint: string }> }>('newlaunch:live'),
+      readJsonKey<Array<{ source: string; label: string; status: string }>>('newlaunch:providers'),
+      prisma.mlPaperDecision.groupBy({ by: ['mlDecision'], where: { userId, decidedAt: { gte: startOfDay } }, _count: { _all: true } }),
+      prisma.mlFeatureSnapshot.count({ where: { kind: 'AGE_30S', snapshotAt: { gte: new Date(Date.now() - 86_400_000) } } }),
+    ]);
+    const recent = (live?.launches ?? []).slice(0, 6);
+    const decisions = recent.length ? await prisma.launchDecision.findMany({ where: { userId, mint: { in: recent.map((launch) => launch.mint) } }, orderBy: { decisionAt: 'desc' }, select: { mint: true, decision: true, score: true } }) : [];
+    const decisionByMint = new Map<string, (typeof decisions)[number]>();
+    for (const decision of decisions) if (!decisionByMint.has(decision.mint)) decisionByMint.set(decision.mint, decision);
+    const heartbeatAt = heartbeat?.at ? Date.parse(heartbeat.at) : Number.NaN;
+    const mlAt = typeof mlHealth?.at === 'string' ? Date.parse(mlHealth.at) : Number.NaN;
+    const model = (mlHealth?.model ?? null) as { status?: string; version?: string | null } | null;
+    return res.json({ ok: true, data: {
+      worker: { alive: Number.isFinite(heartbeatAt) && Date.now() - heartbeatAt < 30_000, lastHeartbeatAt: Number.isFinite(heartbeatAt) ? new Date(heartbeatAt).toISOString() : null },
+      newLaunch: {
+        updatedAt: live?.at ?? null,
+        providers: (providers ?? []).map((provider) => ({ source: provider.source, label: provider.label, status: provider.status })),
+        recent: recent.map((launch) => ({ mint: launch.mint, symbol: launch.symbol ?? null, name: launch.name ?? null, source: launch.source ?? null, ageSeconds: launch.ageSeconds ?? null, priceUsd: launch.priceUsd ?? null, liquidityUsd: launch.liquidityUsd ?? null, decision: decisionByMint.get(launch.mint)?.decision ?? null, score: decisionByMint.get(launch.mint)?.score ?? null })),
+      },
+      ml: {
+        alive: Number.isFinite(mlAt) && Date.now() - mlAt < 60_000,
+        mode: typeof mlHealth?.mode === 'string' ? mlHealth.mode : null,
+        model: model ? { status: model.status ?? null, version: model.version ?? null } : null,
+        streamGapOpen: mlHealth?.streamGapOpen === true,
+        leakageViolations: typeof mlHealth?.leakageViolations === 'number' ? mlHealth.leakageViolations : null,
+        decisionsToday: Object.fromEntries(mlDecisions.map((item) => [item.mlDecision, item._count._all])),
+        snapshots24h,
+      },
+    } });
+  } catch (error) {
+    logger.error({ err: error }, 'Failed to load dashboard overview');
+    return errorResponse(res, 500, 'Unable to load dashboard overview');
   }
 });
 

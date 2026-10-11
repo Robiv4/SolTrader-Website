@@ -11,6 +11,8 @@ const booleanFromEnv = z.preprocess((value) => {
 
 const envSchema = z.object({
   NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),
+  /** Public GeckoTerminal OHLCV for pool tokens (charts only; cached, max 20 requests / minute). 'false' disables it. */
+  CHART_OHLCV_GECKOTERMINAL: z.string().optional().transform((value) => value !== 'false'),
   PORT: z.coerce.number().default(3001),
   HOST: z.string().default('0.0.0.0'),
   LOG_LEVEL: z.string().default('info'),

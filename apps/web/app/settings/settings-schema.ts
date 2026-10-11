@@ -227,7 +227,7 @@ export const CARDS: CardDef[] = [
   { id: 'rpc-status', group: 'sources', title: 'Solana RPC', description: 'A közös RPC-kezelő állapota (címkék, nem URL-ek vagy kulcsok).', custom: 'rpc-status', keywords: 'rpc solana helius primary fallback circuit breaker', apply: 'restart' },
   { id: 'social-status', group: 'sources', title: 'Közösségi szolgáltatók', description: 'Telegram / X gyűjtés állapota. A kapcsolók és hitelesítők szerveroldali környezeti változók.', custom: 'social-status', keywords: 'telegram x twitter mtproto közösségi social', apply: 'restart' },
   { id: 'telegram', group: 'sources', title: 'Telegram értesítések', custom: 'telegram', keywords: 'telegram értesítés bot chat összekapcsolás teszt', apply: 'immediate' },
-  { id: 'wallet', group: 'sources', title: 'Tárca', custom: 'wallet', keywords: 'tárca wallet phantom solflare cím egyenleg bot trading', apply: 'immediate' },
+  { id: 'wallet', group: 'sources', title: 'Tárca', description: 'A tárcakezelés elsődleges helye a Tárca oldal.', custom: 'wallet', keywords: 'tárca wallet phantom solflare backpack cím egyenleg bot trading' },
 
   // ---------------- F. Haladó ----------------
   { id: 'ml-status', group: 'advanced', title: 'Machine Learning (SHADOW)', description: 'Csak olvasható állapot. Az ML SHADOW módban fut: semmilyen módon nem befolyásolja a BUY / SELL döntéseket.', custom: 'ml-status', keywords: 'ml machine learning shadow modell snapshot outcome predikció adatkészlet', apply: 'restart' },

@@ -1,20 +1,12 @@
 'use client';
 
-import { Activity, BarChart3, BrainCircuit, Rocket, ChevronRight, LayoutDashboard, List, Menu, Settings2, ShieldCheck, Users, Wallet, X, type LucideIcon } from 'lucide-react';
-import Link from 'next/link';
 import { usePathname, useRouter } from 'next/navigation';
 import { Children, cloneElement, isValidElement, useCallback, useEffect, useLayoutEffect, useRef, useState, type ReactElement, type ReactNode } from 'react';
 
-import { hu, translateText } from './locales/hu';
-import { ProfileMenu, ThemeToggle } from './topbar';
-
-const navGroups: Array<{ label: string; items: Array<{ href: string; label: string; icon: LucideIcon; adminOnly?: boolean }> }> = [
-  { label: hu.nav.overview, items: [{ href: 'dashboard', label: hu.nav.dashboard, icon: LayoutDashboard }, { href: 'positions', label: hu.nav.positions, icon: List }, { href: 'trades', label: hu.nav.trades, icon: Activity }] },
-  { label: hu.nav.markets, items: [{ href: 'new-launch', label: hu.nav.newLaunch, icon: Rocket }, { href: 'signals', label: hu.nav.signals, icon: Activity }] },
-  { label: hu.nav.insights, items: [{ href: 'analytics', label: hu.nav.analytics, icon: BarChart3 }, { href: 'machine-learning', label: 'Machine Learning', icon: BrainCircuit }] },
-  { label: hu.nav.account, items: [{ href: 'wallet', label: hu.nav.wallet, icon: Wallet }, { href: 'settings', label: hu.nav.settings, icon: Settings2 }, { href: 'users', label: 'Felhasználók', icon: Users, adminOnly: true }] },
-  { label: hu.nav.system, items: [{ href: 'system', label: hu.nav.health, icon: ShieldCheck }, { href: 'logs', label: hu.nav.logs, icon: Activity }] },
-];
+import { translateText } from './locales/hu';
+import { MobileNav, type ShellStatus, Sidebar, Topbar } from './ui/shell';
+import { WalletProvider } from './ui/wallet/wallet-context';
+import { WalletModal } from './ui/wallet/wallet-modal';
 
 const apiBase = process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:3001';
 
@@ -156,38 +148,31 @@ export function AppShell({ children }: { children: ReactNode }) {
 function AuthenticatedShell({ children, pathname }: { children: ReactNode; pathname: string }) {
   const router = useRouter();
   const [menuOpen, setMenuOpen] = useState(false);
-  const { data: settings } = useApi<{ data?: { tradingMode?: string; isPaperModeDefault?: boolean } }>('/api/settings');
-  const title = navGroups.flatMap((group) => group.items).find((item) => pathname === `/${item.href}` || pathname.startsWith(`/${item.href}/`))?.label ?? 'Terminal';
-  const mode = settings?.data?.tradingMode;
+  const { data: settings } = useApi<{ data?: ShellStatus }>('/api/settings');
   const { data: me, refresh: refreshMe } = useApi<{ data: { id: string; email: string; name: string | null; role: string; avatarVersion: number | null } }>('/api/auth/me');
   // The profile picture panel announces changes so the top bar avatar updates at once.
   useEffect(() => {
     globalThis.addEventListener('soltrader:profile-updated', refreshMe);
     return () => globalThis.removeEventListener('soltrader:profile-updated', refreshMe);
   }, [refreshMe]);
+  useEffect(() => setMenuOpen(false), [pathname]);
   const signOut = async () => {
     await apiRequest('/api/auth/logout', { method: 'POST', body: '{}' }).catch(() => undefined);
     router.push('/login');
   };
-  const closeMenu = () => setMenuOpen(false);
-  return <div className="app-shell">
-    {menuOpen && <button className="drawer-backdrop" type="button" aria-label="Close navigation" onClick={closeMenu} />}
-    <aside className={`sidebar${menuOpen ? ' sidebar-open' : ''}`} aria-label="Main navigation">
-      <Link href="/dashboard" className="brand" onClick={closeMenu}><span className="brand-mark"><Activity size={19} strokeWidth={2.4} /></span><div><strong>Soltrader</strong><small>TRADING TERMINAL</small></div></Link>
-      <nav>{navGroups.map((group) => <div className="nav-group" key={group.label}><span className="nav-group-label">{group.label}</span>{group.items.filter((item) => !item.adminOnly || me?.data?.role === 'ADMIN').map(({ href, label, icon: Icon }) => {
-        const active = pathname === `/${href}` || pathname.startsWith(`/${href}/`);
-        return <Link key={href} href={`/${href}`} onClick={closeMenu} className={`nav-item${active ? ' active' : ''}`} aria-current={active ? 'page' : undefined}><Icon size={17} strokeWidth={1.8} /><span>{label}</span>{active && <ChevronRight className="nav-active-mark" size={14} />}</Link>;
-      })}</div>)}</nav>
-      <div className="sidebar-foot"><span className="mode-indicator"><i />{mode ? `${mode.replace('_', '-')} MÓD` : 'MÓD NEM ELÉRHETŐ'}</span></div>
-    </aside>
-    <div className="workspace">
-      <header className="mobile-header"><button className="icon-button menu-trigger" type="button" aria-label={menuOpen ? 'Close menu' : 'Open menu'} onClick={() => setMenuOpen(!menuOpen)}>{menuOpen ? <X size={20} /> : <Menu size={20} />}</button><div className="mobile-brand"><span className="brand-mark"><Activity size={16} /></span><strong>Soltrader</strong></div><span className="mobile-page-title">{title}</span><div className="mobile-header-actions"><ThemeToggle /><ProfileMenu me={me?.data ?? null} mode={mode} onSignOut={() => void signOut()} /></div></header>
-      <header className="topbar"><div className="topbar-title"><span>{title}</span></div><div className="topbar-actions"><ThemeToggle /><ProfileMenu me={me?.data ?? null} mode={mode} onSignOut={() => void signOut()} /></div></header>
-      <main className="content">{children}</main>
-      <StepUpDialog />
-      <nav className="mobile-bottom-nav" aria-label="Quick navigation">{[{ href: 'dashboard', label: 'Főoldal', icon: LayoutDashboard }, { href: 'positions', label: 'Pozíciók', icon: List }, { href: 'new-launch', label: 'Új tokenek', icon: Rocket }, { href: 'signals', label: 'Jelzések', icon: Activity }].map(({ href, label, icon: Icon }) => <Link href={`/${href}`} key={href} className={pathname.startsWith(`/${href}`) ? 'active' : ''}><Icon size={19} /><span>{label}</span></Link>)}<button type="button" onClick={() => setMenuOpen(true)}><Menu size={19} /><span>Menü</span></button></nav>
+  return <WalletProvider>
+    <div className="app-shell">
+      {menuOpen && <button className="drawer-backdrop" type="button" aria-label="Menü bezárása" onClick={() => setMenuOpen(false)} />}
+      <Sidebar pathname={pathname} isAdmin={me?.data?.role === 'ADMIN'} open={menuOpen} onNavigate={() => setMenuOpen(false)} />
+      <div className="workspace">
+        <Topbar pathname={pathname} status={settings?.data ?? null} me={me?.data ?? null} menuOpen={menuOpen} onMenu={() => setMenuOpen(!menuOpen)} onSignOut={() => void signOut()} />
+        <main className="content">{children}</main>
+        <StepUpDialog />
+        <WalletModal />
+        <MobileNav pathname={pathname} onMenu={() => setMenuOpen(true)} />
+      </div>
     </div>
-  </div>;
+  </WalletProvider>;
 }
 
 export function PageHeader({ eyebrow, title, subtitle, action, icon }: { eyebrow: string; title: string; subtitle?: string; action?: ReactNode; icon?: ReactNode }) {

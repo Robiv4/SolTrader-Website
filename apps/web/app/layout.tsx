@@ -1,4 +1,5 @@
 import './globals.css';
+import './terminal.css';
 
 import type { Metadata, Viewport } from 'next';
 import { JetBrains_Mono, Plus_Jakarta_Sans } from 'next/font/google';
@@ -16,12 +17,12 @@ export const metadata: Metadata = {
 };
 
 export const viewport: Viewport = {
-  themeColor: [{ media: '(prefers-color-scheme: light)', color: '#f4f6fb' }, { media: '(prefers-color-scheme: dark)', color: '#0b1120' }],
+  themeColor: [{ media: '(prefers-color-scheme: light)', color: '#f4f6fb' }, { media: '(prefers-color-scheme: dark)', color: '#090c12' }],
 };
 
 export default function RootLayout({ children }: { children: ReactNode }) {
   return (
-    <html lang="hu" data-theme="light" className={`${jakarta.variable} ${mono.variable}`} suppressHydrationWarning>
+    <html lang="hu" data-theme="dark" className={`${jakarta.variable} ${mono.variable}`} suppressHydrationWarning>
       {/* Applies the remembered light/dark choice before the first paint. */}
       <head><script dangerouslySetInnerHTML={{ __html: THEME_BOOT_SCRIPT }} /></head>
       <body><AppShell>{children}</AppShell></body>

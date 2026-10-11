@@ -323,6 +323,16 @@ export async function priceSeries(tokenId: string, address: string, from: Date, 
   return points;
 }
 
+/** Time of the newest stored price sample before `before` (used to point an empty chart window at real data). */
+export async function latestPriceSampleAt(tokenId: string, address: string, before: Date): Promise<number | null> {
+  const [metric, candidate] = await Promise.all([
+    tokenId ? prisma.tokenMetric.findFirst({ where: { tokenId, timestamp: { lte: before }, priceUsd: { gt: 0 } }, orderBy: { timestamp: 'desc' }, select: { timestamp: true } }) : null,
+    prisma.launchCandidate.findUnique({ where: { mint: address }, select: { snapshots: { where: { takenAt: { lte: before }, priceUsd: { gt: 0 } }, orderBy: { takenAt: 'desc' }, take: 1, select: { takenAt: true } } } }),
+  ]);
+  const times = [metric?.timestamp.getTime(), candidate?.snapshots[0]?.takenAt.getTime()].filter((value): value is number => typeof value === 'number');
+  return times.length ? Math.max(...times) : null;
+}
+
 /** Stored price + liquidity points (TokenMetric and launch snapshots), chronological; nothing interpolated. */
 export async function priceLiquiditySeries(tokenId: string, address: string, from: Date, to: Date) {
   const [metrics, candidate] = await Promise.all([

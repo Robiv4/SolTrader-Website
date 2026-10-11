@@ -13,7 +13,6 @@ import { newLaunchSaveBody, NewLaunchRecommendations, type NewLaunchSettings, Ne
 import { PaperAccountPanel } from '../paper-account-panel';
 import { ProfilePicturePanel } from '../profile-picture-panel';
 import { TelegramPanel } from '../telegram-panel';
-import { WalletSettingsPanel } from '../wallet-connect';
 
 import { PaperStrategyCard } from './paper-strategy-card';
 import { type Apply, APPLY_LABELS, type CardDef, cardMatches, CARDS, type FieldDef, fieldMatches, type GroupId, GROUPS, LEGACY_HASHES, normalize, type Source } from './settings-schema';
@@ -27,7 +26,7 @@ const BOT_KEYS = ['tradingMode', 'maxDailyLoss', 'minLiquidityUsd', 'minVolumeUs
 /** RiskConfig fields owned by this page (PATCH /api/settings/risk). */
 const RISK_KEYS = ['riskPolicy', 'lowRiskMax', 'moderateRiskMax', 'highRiskMax', 'veryHighRiskMax', 'lowPositionMultiplier', 'moderatePositionMultiplier', 'highPositionMultiplier', 'veryHighPositionMultiplier', 'maxTotalExposurePercent', 'maxConcurrentPositions', 'dailyLossLimitPercent', 'maxSlippagePercent'];
 /** Cards that render an existing self-framed panel. */
-const BARE_CARDS = new Set(['paper-account', 'live-safety', 'telegram', 'wallet', 'profile']);
+const BARE_CARDS = new Set(['paper-account', 'live-safety', 'telegram', 'profile']);
 const RISK_CLASSES = [
   { label: 'LOW', tone: 'positive', max: 'lowRiskMax', multiplier: 'lowPositionMultiplier' },
   { label: 'MODERATE', tone: 'info', max: 'moderateRiskMax', multiplier: 'moderatePositionMultiplier' },
@@ -333,7 +332,7 @@ export default function SettingsPage() {
       case 'rpc-status': return <RpcStatusCard />;
       case 'social-status': return <SocialProviderStatus />;
       case 'telegram': return <TelegramPanel tradingMode={general.tradingMode} />;
-      case 'wallet': return <WalletSettingsPanel />;
+      case 'wallet': return <p className="sfield-help">A tárca csatlakoztatása, egyenlegei és a bot kereskedő tárca a <Link className="table-link" href="/wallet">Tárca</Link> oldalon kezelhetők. A csatlakoztatott tárca csak olvasásra szól, és nem kap kereskedési jogosultságot.</p>;
       case 'ml-status': return <MlStatusCard />;
       case 'nl-optimizer': return <NewLaunchRecommendations onChanged={() => void load()} setMessage={(text) => setMessage({ text, tone: 'info' })} />;
       case 'nl-versions': return <NewLaunchVersions settings={drafts.nl} />;

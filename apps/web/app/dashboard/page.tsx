@@ -1,6 +1,6 @@
 'use client';
 /* eslint-disable @typescript-eslint/no-explicit-any */
-import { ArrowRight, CalendarClock, Layers, Target, Wallet } from 'lucide-react';
+import { ArrowRight, Brain, CalendarClock, Layers, Target, Wallet } from 'lucide-react';
 import Link from 'next/link';
 import { useRouter } from 'next/navigation';
 import { useEffect, useState, type ReactNode } from 'react';
@@ -12,6 +12,7 @@ import { useBotStatus } from '../hooks/useBotStatus';
 import { useRealtimeEvents } from '../hooks/useRealtimeEvents';
 import { exitReasonLabel } from '../locales/hu';
 import { LiveLogViewer } from '../realtime-view';
+import { formatAge, formatCompactUsd, formatTokenPrice, shortAddress, StatusBadge, type Tone } from '../ui/primitives';
 import { DashCard, Kpi } from '../ui-cards';
 
 function numeric(value: unknown) {
@@ -33,6 +34,18 @@ function shortTime(value: unknown) {
   return sameDay ? at.toLocaleTimeString('hu-HU', { hour: '2-digit', minute: '2-digit' }) : at.toLocaleString('hu-HU', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' });
 }
 
+interface DashboardOverview {
+  worker: { alive: boolean; lastHeartbeatAt: string | null };
+  newLaunch: { updatedAt: string | null; providers: Array<{ source: string; label: string; status: string }>; recent: Array<{ mint: string; symbol: string | null; name: string | null; source: string | null; ageSeconds: number | null; priceUsd: number | null; liquidityUsd: number | null; decision: 'BUY' | 'WATCH' | 'REJECT' | null; score: number | null }> };
+  ml: { alive: boolean; mode: string | null; model: { status: string | null; version: string | null } | null; streamGapOpen: boolean; leakageViolations: number | null; decisionsToday: Partial<Record<'ML_BUY' | 'ML_SKIP' | 'ML_ERROR', number>>; snapshots24h: number };
+}
+
+const LAUNCH_DECISION: Record<string, { text: string; tone: Tone }> = { BUY: { text: 'VÉTEL', tone: 'positive' }, WATCH: { text: 'FIGYELÉS', tone: 'warning' }, REJECT: { text: 'ELUTASÍTVA', tone: 'negative' } };
+
+function StatusRow({ label, tone: rowTone, text, detail }: { label: string; tone: Tone; text: string; detail?: ReactNode }) {
+  return <div className="sys-row"><span className="sys-label">{label}</span><StatusBadge tone={rowTone} dot>{text}</StatusBadge>{detail ? <small className="muted">{detail}</small> : null}</div>;
+}
+
 function tone(value: unknown) {
   const number = numeric(value);
   if (number === null || number === 0) return '';
@@ -51,6 +64,7 @@ export default function DashboardPage() {
   const trades = useApi<{ data: any[] }>('/api/trades');
   const signals = useApi<{ data: any[] }>('/api/signals');
   const approvals = useApi<{ data: any[] }>('/api/approvals');
+  const overview = useApi<{ data: DashboardOverview }>('/api/dashboard/overview');
   const { lastEvent } = useRealtimeEvents(['position_update', 'trade_update', 'pnl_update']);
   const [approvalMessage, setApprovalMessage] = useState('');
   useEffect(() => {
@@ -61,9 +75,16 @@ export default function DashboardPage() {
     positions.refresh();
     trades.refresh();
     approvals.refresh();
-  }, [lastEvent, account.refresh, portfolio.refresh, analytics.refresh, positions.refresh, trades.refresh, approvals.refresh]);
+    overview.refresh();
+  }, [lastEvent, overview.refresh, account.refresh, portfolio.refresh, analytics.refresh, positions.refresh, trades.refresh, approvals.refresh]);
 
-  const header = (action?: ReactNode) => <PageHeader eyebrow="Kereskedési terminál" title="Irányítópult" subtitle="A paper számla, a bot és a piac egy helyen" action={action} />;
+  // Status card refresh (cheap Redis reads) while the tab is visible.
+  useEffect(() => {
+    const timer = globalThis.setInterval(() => { if (globalThis.document.visibilityState === 'visible') overview.refresh(); }, 15_000);
+    return () => globalThis.clearInterval(timer);
+  }, [overview.refresh]);
+
+  const header = (action?: ReactNode) => <PageHeader eyebrow="Áttekintés" title="Dashboard" subtitle="PAPER számla, bot, New Launch és ML egy helyen" action={action} />;
   const loading = !account.data || !portfolio.data || !settings.data || !positions.data || !trades.data;
   const error = account.error ?? portfolio.error ?? settings.error ?? positions.error ?? trades.error;
   if (error && loading) return <>{header()}<ErrorState message={error} /></>;
@@ -98,6 +119,20 @@ export default function DashboardPage() {
   };
 
   const winRate = numeric(analyticsData?.winRate);
+  const status = overview.data?.data ?? null;
+  const strategy = settings.data?.data?.paperStrategy as { mode: 'DEFAULT' | 'ML'; modelVersion: string | null } | undefined;
+  const mlCounts = status?.ml.decisionsToday ?? {};
+  const providerIssues = (status?.newLaunch.providers ?? []).filter((provider) => provider.status !== 'ACTIVE');
+  const warnings = [
+    settings.data?.data?.isEmergencyStop ? 'Vészleállítás aktív – a bot nem nyit új pozíciót.' : null,
+    snapshot.dailyLossLimitReached ? 'Napi veszteségkorlát elérve.' : null,
+    status && !status.worker.alive ? 'A worker nem küld életjelet (30 mp) – a figyelés és a pozíciókezelés állhat.' : null,
+    status && status.worker.alive && !status.ml.alive ? 'Az ML SHADOW szolgáltatás nem jelentett állapotot az utolsó percben.' : null,
+    status?.ml.streamGapOpen ? 'Nyitott adatfolyam-kiesés az ML adatgyűjtésben.' : null,
+    status?.ml.leakageViolations ? `ML szivárgás-ellenőrzés: ${status.ml.leakageViolations} sértés a worker indulása óta.` : null,
+    strategy?.mode === 'ML' && (mlCounts.ML_ERROR ?? 0) > 0 ? `${mlCounts.ML_ERROR} ML hibás döntés ma – ellenőrizd a modellt.` : null,
+    status?.worker.alive && providerIssues.length ? `Forrás nem aktív: ${providerIssues.map((provider) => provider.label).join(', ')}.` : null,
+  ].filter((item): item is string => Boolean(item));
   const rangeLabel = range === 'all' ? 'teljes időszak' : range === '30d' ? 'utolsó 30 nap' : 'utolsó 7 nap';
 
   return <>
@@ -113,6 +148,7 @@ export default function DashboardPage() {
         sub={<span className={`${tone(totalResult)}-value`}>{signed(totalResult, ' USDC')}{totalResultPercent !== null ? ` (${signed(totalResultPercent, '%')})` : ''}</span>} note={`kezdőtőke: ${fmt(initial)} USDC`} />
       <Kpi icon={<CalendarClock size={20} />} label="Mai P&L" value={<span className={`${tone(snapshot.dailyPnl)}-value`}>{signed(snapshot.dailyPnl)} <small>USDC</small></span>} note={`realizált összesen: ${signed(snapshot.realizedPnl)} USDC`} />
       <Kpi icon={<Layers size={20} />} label="Nyitott pozíciók" value={<>{positionRows.length} <small>db</small></>} note={`érték: ${fmt(snapshot.openPositionValue)} USDC · nem realizált: ${signed(snapshot.unrealizedPnl)}`} />
+      <Kpi icon={<Brain size={20} />} label="Aktív PAPER stratégia" value={strategy?.mode === 'ML' ? 'ML-modell' : 'Alapstratégia'} note={strategy?.mode === 'ML' ? `modell: ${strategy.modelVersion ?? '—'}` : <Link className="table-link" href="/settings#bot">módosítás a Beállításokban</Link>} />
       <Kpi icon={<Target size={20} />} label="Nyerési arány" value={winRate === null ? '—' : <>{fmt(winRate, 0)}<small>%</small></>} note={rangeLabel} />
     </section>
 
@@ -121,16 +157,17 @@ export default function DashboardPage() {
         <div className="equity-headline"><span className={`${tone(analyticsData?.totalPnl)}-value`}>{signed(analyticsData?.totalPnl, ' USDC')}</span><small>{analyticsData ? `${fmt(analyticsData.totalTrades, 0)} lezárt kereskedés` : ''}</small></div>
         <EquityCurve points={analyticsData?.equityCurve ?? []} />
       </DashCard>
-      <DashCard title="Bot összefoglaló" description="A kereskedő bot jelenlegi állapota">
-        <dl className="dash-stat-list">
-          <div><dt>Állapot</dt><dd><BotStatusBadge status={bot.botState?.status} /></dd></div>
-          <div><dt>New Launch figyelés</dt><dd>{newLaunch?.enabled ? `Bekapcsolva · ${newLaunch.configVersion}` : <Link className="table-link" href="/settings#new-launch">Kikapcsolva – bekapcsolás</Link>}</dd></div>
-          <div><dt>Szabad egyenleg</dt><dd>{fmt(snapshot.cash ?? paper.cashBalance)} USDC</dd></div>
-          <div><dt>Kitettség</dt><dd>{fmt(snapshot.exposure)}%</dd></div>
-          <div><dt>Visszaesés</dt><dd>{fmt(snapshot.drawdown)}%</dd></div>
-          <div><dt>Mai jelzések</dt><dd>{signalsToday}</dd></div>
-          <div><dt>Befizetett díjak</dt><dd>{fmt(snapshot.fees)} USDC</dd></div>
-        </dl>
+      <DashCard title="Rendszerállapot" description="Bot, worker, New Launch és ML SHADOW" action={<Link className="card-link" href="/system">Részletek <ArrowRight size={15} aria-hidden="true" /></Link>}>
+        <div className="sys-list">
+          <div className="sys-row"><span className="sys-label">Bot</span><BotStatusBadge status={bot.botState?.status} /></div>
+          <StatusRow label="Worker" tone={!status ? 'neutral' : status.worker.alive ? 'positive' : 'negative'} text={!status ? 'Ismeretlen' : status.worker.alive ? 'Fut' : 'Nem válaszol'} detail={status?.worker.lastHeartbeatAt ? `életjel ${new Date(status.worker.lastHeartbeatAt).toLocaleTimeString('hu-HU')}` : undefined} />
+          <StatusRow label="New Launch" tone={newLaunch?.enabled ? (status?.worker.alive ? 'positive' : 'warning') : 'neutral'} text={newLaunch?.enabled ? 'Bekapcsolva' : 'Kikapcsolva'} detail={newLaunch?.enabled ? newLaunch.configVersion : <Link className="table-link" href="/settings#new-launch">bekapcsolás</Link>} />
+          <StatusRow label="ML" tone={status?.ml.alive ? 'info' : 'neutral'} text={status?.ml.alive ? (status.ml.mode ?? 'SHADOW') : 'Nincs jelentés'} detail={status?.ml.model?.version ? `modell ${status.ml.model.version}` : undefined} />
+          <div className="sys-row"><span className="sys-label">Szabad egyenleg</span><strong>{fmt(snapshot.cash ?? paper.cashBalance)} USDC</strong></div>
+          <div className="sys-row"><span className="sys-label">Kitettség · visszaesés</span><strong>{fmt(snapshot.exposure)}% · {fmt(snapshot.drawdown)}%</strong></div>
+          <div className="sys-row"><span className="sys-label">Mai jelzések · díjak</span><strong>{signalsToday} · {fmt(snapshot.fees)} USDC</strong></div>
+        </div>
+        {warnings.length ? <ul className="sys-warnings" aria-label="Kockázati figyelmeztetések">{warnings.map((warning) => <li key={warning}>{warning}</li>)}</ul> : <p className="sys-ok">Nincs aktív figyelmeztetés.</p>}
       </DashCard>
     </section>
 
@@ -171,6 +208,30 @@ export default function DashboardPage() {
             <td className={`${tone(row.netPnl)}-value`}>{row.netPnl == null ? '—' : signed(row.netPnl)}</td>
             <td><Stacked top={exitReasonLabel(row.exitReason)} bottom={shortTime(row.exitAt ?? row.entryAt ?? row.createdAt)} /></td>
           </tr>)}</DataTable>}
+      </DashCard>
+    </section>
+
+    <section className="dash-grid-2">
+      <DashCard title="Legutóbbi launchok" description="A New Launch figyelés legfrissebb tokenjei" action={<Link className="card-link" href="/new-launch">Összes <ArrowRight size={15} aria-hidden="true" /></Link>}>
+        {!status?.newLaunch.recent.length
+          ? <EmptyState message={status?.worker.alive ? 'Jelenleg nincs megfigyelt launch.' : 'A launch-lista a worker futásakor frissül.'} />
+          : <div className="dash-launches">{status.newLaunch.recent.map((launch) => <Link key={launch.mint} className="dash-launch" href={`/tokens/${launch.mint}`}>
+            <TokenLabel address={launch.mint} symbol={launch.symbol ?? shortAddress(launch.mint)} />
+            <span className="muted">{formatAge(launch.ageSeconds)}</span>
+            <span className="mono">{formatTokenPrice(launch.priceUsd)}</span>
+            <span>{formatCompactUsd(launch.liquidityUsd)}</span>
+            {launch.decision ? <StatusBadge tone={LAUNCH_DECISION[launch.decision].tone}>{LAUNCH_DECISION[launch.decision].text}</StatusBadge> : <StatusBadge>ÚJ</StatusBadge>}
+          </Link>)}</div>}
+      </DashCard>
+      <DashCard title="ML és adatgyűjtés" description="Mai ML PAPER döntések és a SHADOW tanítóadat-gyűjtés" action={<Link className="card-link" href="/machine-learning">ML oldal <ArrowRight size={15} aria-hidden="true" /></Link>}>
+        <div className="ml-counts">
+          <div><span>ML BUY</span><strong className="up">{mlCounts.ML_BUY ?? 0}</strong></div>
+          <div><span>ML SKIP</span><strong>{mlCounts.ML_SKIP ?? 0}</strong></div>
+          <div><span>ML ERROR</span><strong className={(mlCounts.ML_ERROR ?? 0) > 0 ? 'down' : ''}>{mlCounts.ML_ERROR ?? 0}</strong></div>
+          <div><span>Snapshot (24 ó)</span><strong>{status ? fmt(status.ml.snapshots24h, 0) : '—'}</strong></div>
+        </div>
+        <p className="muted dash-note">{strategy?.mode === 'ML' ? 'Az ML-modell dönt a PAPER belépésekről; minden döntés szimulált.' : 'Az alapstratégia aktív: ML PAPER döntés csak ML stratégia mellett születik, a SHADOW adatgyűjtés ettől függetlenül fut.'}</p>
+        <div className="diag-links"><Link href="/system">Rendszerállapot</Link><Link href="/logs">Naplók</Link><Link href="/machine-learning">ML diagnosztika</Link><Link href="/analytics">Analitika</Link></div>
       </DashCard>
     </section>
 

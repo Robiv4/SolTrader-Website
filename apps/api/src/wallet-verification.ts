@@ -84,6 +84,7 @@ export function decodeSignature(value: string): Uint8Array | null {
 interface PendingChallenge {
   message: string;
   network: string;
+  domain: string;
   expiresAt: number;
 }
 
@@ -96,7 +97,8 @@ export class WalletChallengeStore {
 
   constructor(private readonly ttlMs = 5 * 60 * 1000) {}
 
-  issue(userId: string, userEmail: string, publicAddress: string, network: string) {
+  /** `domain`: the web origin host the verification is for; the signed message names it and consume() requires it. */
+  issue(userId: string, userEmail: string, publicAddress: string, network: string, domain = 'soltrader') {
     this.prune();
     const nonce = crypto.randomBytes(16).toString('hex');
     const issuedAt = new Date();
@@ -106,22 +108,23 @@ export class WalletChallengeStore {
       '',
       'Sign this message to prove you own this wallet. It does not authorize any transaction or cost any fee.',
       '',
+      `Domain: ${domain}`,
       `Account: ${userEmail}`,
       `Wallet: ${publicAddress}`,
       `Network: ${network}`,
       `Nonce: ${nonce}`,
       `Issued at: ${issuedAt.toISOString()}`,
     ].join('\n');
-    this.pending.set(this.key(userId, publicAddress, nonce), { message, network, expiresAt });
+    this.pending.set(this.key(userId, publicAddress, nonce), { message, network, domain, expiresAt });
     return { nonce, message, expiresAt: new Date(expiresAt).toISOString() };
   }
 
   /** Returns the exact message (and network) that was issued, or null when unknown/expired. Always single-use. */
-  consume(userId: string, publicAddress: string, nonce: string): { message: string; network: string } | null {
+  consume(userId: string, publicAddress: string, nonce: string, domain = 'soltrader'): { message: string; network: string } | null {
     const key = this.key(userId, publicAddress, nonce);
     const challenge = this.pending.get(key);
     this.pending.delete(key);
-    if (!challenge || challenge.expiresAt < Date.now()) return null;
+    if (!challenge || challenge.expiresAt < Date.now() || challenge.domain !== domain) return null;
     return { message: challenge.message, network: challenge.network };
   }
 
