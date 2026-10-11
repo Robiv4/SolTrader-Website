@@ -1,5 +1,5 @@
-import type { Prisma, PrismaClient } from '@prisma/client';
-import { BotCommandPublisher, type BotCommandPayload } from '@soltrader/shared';
+import type { PrismaClient } from '@prisma/client';
+import { BotCommandPublisher } from '@soltrader/shared';
 import type { Request, Response } from 'express';
 
 import { redactSensitiveFields } from './secret-redaction.js';
@@ -70,7 +70,6 @@ export function createBotController(dependencies: BotControllerDependencies) {
           tradingMode: 'PAPER',
           isLiveEnabled: false,
           liveApprovalCompleted: false,
-          isScannerEnabled: true,
           isPaperModeDefault: true,
         },
       });
@@ -114,40 +113,5 @@ export function createBotController(dependencies: BotControllerDependencies) {
     }
   };
 
-  const toggleStrategy = async (req: Request, res: Response) => {
-    try {
-      const requestedBy = req.user?.id;
-      if (!requestedBy) return res.status(401).json({ ok: false, error: 'Authentication required' });
-      const isEnabled = req.body?.isEnabled;
-      if (typeof isEnabled !== 'boolean') return res.status(400).json({ ok: false, error: 'isEnabled must be boolean' });
-      const strategyNameParam = req.params.name;
-      const strategyName = Array.isArray(strategyNameParam) ? strategyNameParam[0] : strategyNameParam;
-      if (!strategyName) return res.status(400).json({ ok: false, error: 'Strategy name is required' });
-      const current = await dependencies.prisma.botStrategyConfig.findUnique({ where: { strategyName } });
-      const configJson = current?.configJson && typeof current.configJson === 'object' && !Array.isArray(current.configJson)
-        ? redactSensitiveFields(current.configJson) as Record<string, unknown>
-        : {};
-      const state = await dependencies.prisma.botStrategyConfig.upsert({
-        where: { strategyName },
-        update: { isEnabled, configJson: configJson as Prisma.InputJsonValue, updatedAt: new Date() },
-        create: { strategyName, isEnabled, configJson: configJson as Prisma.InputJsonValue },
-      });
-      const payload: BotCommandPayload<'UPDATE_STRATEGY_CONFIG'> = {
-        requestedBy,
-        strategyName,
-        isEnabled,
-        configJson,
-        maxExposure: state.maxExposure?.toNumber(),
-        maxPositions: state.maxPositions ?? undefined,
-      };
-      await publish(dependencies, { command: 'UPDATE_STRATEGY_CONFIG', payload });
-      await dependencies.logAuditEvent('bot_strategy_toggle', requestedBy, { strategyName, isEnabled });
-      return res.json({ ok: true, data: { strategy: { ...state, configJson: redactSensitiveFields(state.configJson) } } });
-    } catch (error) {
-      dependencies.logger.error({ err: error, strategy: req.params.name }, 'Bot strategy toggle failed');
-      return failure(res, 'Unable to toggle strategy');
-    }
-  };
-
-  return { status, start: transition('START', 'RUNNING', 'bot_start'), pause: transition('PAUSE', 'PAUSED', 'bot_pause'), stop: transition('STOP', 'STOPPED', 'bot_stop'), emergencyStop, toggleStrategy };
+  return { status, start: transition('START', 'RUNNING', 'bot_start'), pause: transition('PAUSE', 'PAUSED', 'bot_pause'), stop: transition('STOP', 'STOPPED', 'bot_stop'), emergencyStop };
 }

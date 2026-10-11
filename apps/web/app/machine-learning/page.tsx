@@ -6,7 +6,9 @@ import { useState } from 'react';
 import { TokenLabel } from '../avatars';
 import { apiRequest, DataTable, EmptyState, ErrorState, fmt, LoadingState, Metric, PageHeader, Panel, Status, useApi } from '../components';
 
-const TABS = [['overview', 'Áttekintés'], ['dataset', 'Dataset'], ['models', 'Modellek'], ['predictions', 'Shadow predikciók'], ['analysis', 'Elemzés'], ['drift', 'Drift'], ['system', 'Rendszer']] as const;
+import { PaperTab } from './paper-tab';
+
+const TABS = [['overview', 'Áttekintés'], ['paper', 'PAPER stratégiák'], ['dataset', 'Dataset'], ['models', 'Modellek'], ['predictions', 'Shadow predikciók'], ['analysis', 'Elemzés'], ['drift', 'Drift'], ['system', 'Rendszer']] as const;
 type Tab = (typeof TABS)[number][0];
 
 const pct = (value: number | null | undefined, digits = 1) => (value == null ? '—' : `${(value * 100).toFixed(digits)}%`);
@@ -36,7 +38,7 @@ function Overview({ data }: { data: any }) {
   const worker = data.worker ?? {};
   const shadow = (data.models ?? []).find((model: any) => model.status === 'SHADOW');
   return <>
-    <Panel title="Machine Learning – SHADOW mód" description="Helyi, statisztikai ML (nem LLM / nem AI Trader). Előrejelez és rögzít, de a PAPER kereskedési döntésekre NINCS hatása. Biztonság, kockázat, eladhatóság és kilépési kapacitás mindig felülírja.">
+    <Panel title="Machine Learning – SHADOW mód" description="Helyi, statisztikai ML (nem LLM / nem AI Trader). A SHADOW előrejelzés csak rögzít, a kereskedésre NINCS hatása. ML PAPER belépés csak külön jóváhagyott modellel és kifejezetten kiválasztott ML stratégiával történhet (alapból kikapcsolt). Biztonság, kockázat, eladhatóság és kilépési kapacitás mindig felülírja.">
       <div className="metric-grid">
         <Metric label="ML mód" value={<Status tone="positive">{data.mode ?? 'SHADOW'}</Status>} note="ENFORCE_PAPER ebben a kiadásban nem elérhető" />
         <Metric label="Aktuális shadow modell" value={shadow?.version ?? 'nincs'} note={shadow ? (READINESS[shadow.readiness]?.text ?? shadow.readiness) : 'Modellt csak kifejezett admin művelet tesz SHADOW-ba'} />
@@ -105,10 +107,40 @@ function Models({ data, onChanged }: { data: any; onChanged: () => void }) {
       setMessage(error instanceof Error ? error.message : 'Nem sikerült');
     }
   };
+  /** Separate, revocable PAPER approval (admin + e-mail). The blockers are shown first; nothing is approved automatically. */
+  const approvePaper = async (version: string) => {
+    try {
+      const check = await apiRequest<{ data: { blockers: string[] } }>(`/api/ml/models/${version}/paper-approval`);
+      if (check.data.blockers.length) {
+        setMessage(`${version} nem hagyható jóvá PAPER kereskedésre: ${check.data.blockers.join(', ')}`);
+        return;
+      }
+      if (!globalThis.confirm(`${version} jóváhagyása ML PAPER belépésekre.
+
+Csak PAPER (LIVE soha). A jóváhagyás önmagában nem kapcsol be semmit: a felhasználónak külön, adminisztrátori megerősítéssel kell az ML stratégiát választania. Folytatod?`)) return;
+      await apiRequest(`/api/ml/models/${version}/paper-approval`, { method: 'POST', body: '{}' });
+      setMessage(`${version}: PAPER-jóváhagyva.`);
+      onChanged();
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : 'Nem sikerült');
+    }
+  };
+  const revokePaper = async (version: string) => {
+    if (!globalThis.confirm(`${version} PAPER-jóváhagyásának visszavonása?
+
+Az ezt a modellt használó ML stratégia azonnal leáll (nem nyit új pozíciót, és nem vált át automatikusan az alapstratégiára). A nyitott pozíciók kilépés-figyelése zavartalan.`)) return;
+    try {
+      await apiRequest(`/api/ml/models/${version}/paper-approval`, { method: 'DELETE' });
+      setMessage(`${version}: PAPER-jóváhagyás visszavonva.`);
+      onChanged();
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : 'Nem sikerült');
+    }
+  };
   if (!data.models?.length) return <EmptyState message="Még nincs tanított modell. Előbb dataset (pnpm ml:dataset), majd tanítás (pnpm ml:train)." />;
-  return <Panel title="Modellek" description="Állapotok: TRAINED → VALIDATED → SHADOW (csak admin, e-mailes kóddal). PAPER_APPROVED / PAPER_ACTIVE ebben a kiadásban nem elérhető. Nincs automatikus előléptetés.">
+  return <Panel title="Modellek" description="Állapotok: TRAINED → VALIDATED → SHADOW (csak admin, e-mailes kóddal). A PAPER-jóváhagyás külön, visszavonható lépés: csak SHADOW_READY, SHADOW-ban tesztelt modellre, admin + e-mailes megerősítéssel. Nincs automatikus előléptetés vagy modellcsere.">
     {message ? <p className="sfield-help" role="status">{message}</p> : null}
-    <DataTable wide headers={['Verzió', 'Algoritmus', 'Állapot', 'Készültség', 'Teszt ROC-AUC', 'Teszt PR-AUC', 'Overfitting', 'Művelet']}>
+    <DataTable wide headers={['Verzió', 'Algoritmus', 'Állapot', 'Készültség', 'Teszt ROC-AUC', 'Teszt PR-AUC', 'Overfitting', 'PAPER', 'Művelet']}>
       {data.models.map((model: any) => <tr key={model.version}>
         <td><button type="button" className="text-button" onClick={() => setOpen(open === model.version ? null : model.version)}><strong>{model.version}</strong></button><small className="sfield-help" style={{ display: 'block' }}>{model.datasetVersion} · {model.target}</small></td>
         <td>{model.algorithm === 'logistic_regression' ? 'Logisztikus regresszió (baseline)' : 'LightGBM'}</td>
@@ -117,7 +149,10 @@ function Models({ data, onChanged }: { data: any; onChanged: () => void }) {
         <td>{num(model.metrics?.metrics?.test?.rocAuc, 3)}</td>
         <td>{num(model.metrics?.metrics?.test?.prAuc, 3)}</td>
         <td>{model.metrics?.overfittingRisk ? <Status tone="danger">RISK</Status> : '—'}</td>
+        <td>{model.paperApproved ? <Status tone="positive">JÓVÁHAGYVA</Status> : <Status tone="neutral">NEM</Status>}</td>
         <td>
+          {!model.paperApproved && (model.status === 'SHADOW' || model.status === 'VALIDATED') ? <button type="button" className="secondary-button small" onClick={() => void approvePaper(model.version)}>PAPER jóváhagyás</button> : null}
+          {model.paperApproved ? <button type="button" className="secondary-button small" onClick={() => void revokePaper(model.version)}>PAPER visszavonás</button> : null}
           {model.status === 'TRAINED' ? <button type="button" className="secondary-button small" onClick={() => void change(model.version, 'VALIDATED')}>Validáltnak jelöl</button> : null}
           {model.status === 'VALIDATED' ? <button type="button" className="secondary-button small" onClick={() => void change(model.version, 'SHADOW')}>SHADOW-ba</button> : null}
           {model.status !== 'RETIRED' ? <button type="button" className="secondary-button small" onClick={() => void change(model.version, 'RETIRED')}>Visszavon</button> : null}
@@ -213,6 +248,7 @@ export default function MachineLearningPage() {
     <div className="segmented tab-bar" role="tablist" aria-label="Machine Learning nézetek">{TABS.map(([id, label]) => <button key={id} type="button" role="tab" aria-selected={tab === id} className={tab === id ? 'selected' : ''} onClick={() => setTab(id)}>{label}</button>)}</div>
     {loading && !data ? <LoadingState /> : error ? <ErrorState message={error} /> : <>
       {tab === 'overview' ? <Overview data={data?.data ?? {}} /> : null}
+      {tab === 'paper' ? <PaperTab /> : null}
       {tab === 'dataset' ? <Datasets data={data?.data ?? {}} /> : null}
       {tab === 'models' ? <Models data={data?.data ?? {}} onChanged={refresh} /> : null}
       {tab === 'predictions' ? <Predictions /> : null}

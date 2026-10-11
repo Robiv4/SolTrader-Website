@@ -10,8 +10,13 @@ import { ML_LABEL_VERSION, type CandidateOutcomeResult } from './outcomes.js';
 
 export interface MlTargetDefinition {
   id: string;
-  kind: 'classification';
-  /** Path label (first-hit ordering) evaluated within its horizon. */
+  /**
+   * classification: market-opportunity label from the SHADOW price path of EVERY eligible candidate.
+   * paper_trade: research target from REAL closed PAPER trades only (selection-biased: only bought candidates; never
+   * fabricated for skipped candidates). The trade result is the label, never a feature.
+   */
+  kind: 'classification' | 'paper_trade';
+  /** Path label (first-hit ordering) evaluated within its horizon (classification targets). */
   pathLabel: string;
   horizonS: number;
   description: string;
@@ -21,6 +26,7 @@ export const ML_TARGETS: Record<string, MlTargetDefinition> = {
   plus20BeforeMinus10_30m: { id: 'plus20BeforeMinus10_30m', kind: 'classification', pathLabel: 'plus20BeforeMinus10', horizonS: 1800, description: '+20 % reached before -10 % within 30 minutes' },
   plus10BeforeMinus10_30m: { id: 'plus10BeforeMinus10_30m', kind: 'classification', pathLabel: 'plus10BeforeMinus10', horizonS: 1800, description: '+10 % reached before -10 % within 30 minutes' },
   plus25BeforeMinus20_30m: { id: 'plus25BeforeMinus20_30m', kind: 'classification', pathLabel: 'plus25BeforeMinus20', horizonS: 1800, description: '+25 % reached before -20 % within 30 minutes' },
+  paperNetPositive: { id: 'paperNetPositive', kind: 'paper_trade', pathLabel: '', horizonS: 0, description: 'RESEARCH: the actual PAPER trade closed with a positive net P&L (fees + slippage); bought candidates only (selection-biased)' },
 };
 
 export interface MlDatasetSourceRow {
@@ -39,6 +45,10 @@ export interface MlDatasetSourceRow {
   outcome: CandidateOutcomeResult | null;
   /** Realised net P&L of the actual PAPER trade (fees + slippage included) when the candidate was bought; not a feature. */
   paperNetPnl?: number | null;
+  /** When that PAPER trade closed (the paper_trade label is only known from then on). */
+  paperExitAt?: number | null;
+  /** Which strategy opened that PAPER trade (DEFAULT | ML); provenance only, never a feature. */
+  paperEntryStrategy?: string | null;
 }
 
 export interface MlDatasetConfig {
@@ -127,6 +137,16 @@ export function buildMlDataset(input: MlDatasetSourceRow[], config: MlDatasetCon
       exclude('LOW_DATA_QUALITY');
       continue;
     }
+    if (target.kind === 'paper_trade') {
+      // Real trade results only: a skipped candidate has no PAPER P&L and gets none invented.
+      if (row.paperNetPnl === null || row.paperNetPnl === undefined || !row.paperExitAt) {
+        exclude('NO_CLOSED_PAPER_TRADE');
+        continue;
+      }
+      seenCandidates.add(row.candidateId);
+      kept.push({ row, label: row.paperNetPnl > 0 });
+      continue;
+    }
     if (!row.outcome || row.outcome.labelVersion !== config.labelVersion) {
       exclude('NO_OUTCOME');
       continue;
@@ -146,7 +166,8 @@ export function buildMlDataset(input: MlDatasetSourceRow[], config: MlDatasetCon
   const lines = [header.join(',')];
   for (const { row, label } of kept) {
     lines.push([
-      row.snapshotId, row.candidateId, row.mint, row.source, row.kind, row.snapshotAt, row.snapshotAt + target.horizonS * 1000, row.decision, label ? 1 : 0, row.paperNetPnl ?? null,
+      // label_end_ms: when the label became known (purged split); for paper_trade targets the trade exit time.
+      row.snapshotId, row.candidateId, row.mint, row.source, row.kind, row.snapshotAt, target.kind === 'paper_trade' ? row.paperExitAt : row.snapshotAt + target.horizonS * 1000, row.decision, label ? 1 : 0, row.paperNetPnl ?? null,
       ...featureNames.map((name) => row.features[name] ?? null),
     ].map(csvCell).join(','));
   }
@@ -170,6 +191,10 @@ export function buildMlDataset(input: MlDatasetSourceRow[], config: MlDatasetCon
     rows: kept.length,
     decisions: count(kept.map((item) => item.row.decision)),
     paperTrades: kept.filter((item) => item.row.paperNetPnl !== null && item.row.paperNetPnl !== undefined).length,
+    paperTradesByStrategy: count(kept.filter((item) => item.row.paperNetPnl !== null && item.row.paperNetPnl !== undefined).map((item) => item.row.paperEntryStrategy ?? 'DEFAULT')),
+    targetKind: target.kind,
+    /** paper_trade targets only cover candidates a strategy bought: not an unbiased market sample. */
+    selectionBiased: target.kind === 'paper_trade',
     sources: count(kept.map((item) => item.row.source)),
     outcomeQuality: count(kept.map((item) => item.row.outcome!.quality)),
     positives,

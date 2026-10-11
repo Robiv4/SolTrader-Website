@@ -53,7 +53,11 @@ describe('user settings API', () => {
     expect(response.body.ok).toBe(true);
     expect(response.body.data).toHaveProperty('tradingMode');
     expect(response.body.data).toHaveProperty('risk');
-    expect(response.body.data).toHaveProperty('strategies');
+    // Retired token scanner / strategy / AI trader settings are no longer part of the settings view.
+    expect(response.body.data).not.toHaveProperty('strategies');
+    expect(response.body.data).not.toHaveProperty('isScannerEnabled');
+    expect(response.body.data).not.toHaveProperty('maxMonitoredTokens');
+    expect(response.body.data.risk).not.toHaveProperty('aiAnalysisEnabled');
   });
 
   it('updates risk settings for the authenticated user only', async () => {
@@ -83,7 +87,6 @@ describe('user settings API', () => {
   it('persists general settings and returns them on the next read', async () => {
     const update = await agent.patch('/api/settings').send({
       tradingMode: 'SEMI_AUTO',
-      isScannerEnabled: true,
       maxPositionSize: 42,
       riskThreshold: 35,
     });
@@ -98,13 +101,7 @@ describe('user settings API', () => {
     expect(reread.body.data.maxPositionSize).toBe(42);
   });
 
-  it('updates a strategy toggle and wallet connection', async () => {
-    const patchStrategy = await agent.patch('/api/settings/strategies/Momentum').send({ isEnabled: true, params: { minimumMomentum: 65 } });
-    expect(patchStrategy.status).toBe(200);
-    expect(patchStrategy.body.ok).toBe(true);
-    expect(patchStrategy.body.data.params.minimumMomentum).toBe(65);
-    expect(patchStrategy.body.data.params.maximumRiskScore).toBe(66);
-
+  it('updates a wallet connection', async () => {
     const wallet = createTestWallet();
     const walletConnect = await linkWallet(agent, wallet);
 
@@ -114,13 +111,14 @@ describe('user settings API', () => {
     expect(walletConnect.body.data.network).toBe('devnet');
   });
 
-  it('rejects unknown strategies and unknown strategy parameters', async () => {
-    const unknown = await agent.patch('/api/settings/strategies/Grid').send({ isEnabled: true });
-    expect(unknown.status).toBe(404);
-    const badParam = await agent.patch('/api/settings/strategies/Momentum').send({ params: { lookback: 12 } });
-    expect(badParam.status).toBe(400);
-    const listed = await agent.get('/api/settings/strategies');
-    expect(Object.keys(listed.body.data).sort()).toEqual(['Breakout', 'Momentum', 'Pullback']);
+  it('legacy scanner fields in a general settings update are ignored, never stored', async () => {
+    const user = await prisma.user.findUniqueOrThrow({ where: { email: 'admin@soltrader.local' } });
+    const before = await prisma.botConfig.findUniqueOrThrow({ where: { userId: user.id } });
+    const update = await agent.patch('/api/settings').send({ isScannerEnabled: !before.isScannerEnabled, maxMonitoredTokens: 250 });
+    expect(update.status).toBe(200);
+    const after = await prisma.botConfig.findUniqueOrThrow({ where: { userId: user.id } });
+    expect(after.isScannerEnabled).toBe(before.isScannerEnabled);
+    expect(after.maxMonitoredTokens).toBe(before.maxMonitoredTokens);
   });
 
   it('refuses to link a user wallet without a valid ownership signature', async () => {
@@ -152,21 +150,15 @@ describe('user settings API', () => {
     expect(removed.status).toBe(200);
   });
 
-  it('does not allow switching on AI requirements while no AI analyst is configured', async () => {
-    const off = await agent.patch('/api/settings/risk').send({ aiAnalysisEnabled: false, aiRequiredForHighRisk: false, aiRequiredForVeryHighRisk: false });
-    expect(off.status).toBe(200);
-    expect(off.body.data.aiProviderConfigured).toBe(false);
-    const on = await agent.patch('/api/settings/risk').send({ aiAnalysisEnabled: true, aiRequiredForHighRisk: true });
-    expect(on.status).toBe(400);
-  });
-
-  it('rejects secret-like fields in strategy parameters', async () => {
-    const response = await agent.patch('/api/settings/strategies/Momentum').send({
-      params: { nested: { rpcApiKey: 'test-only-placeholder' } },
-    });
-
-    expect(response.status).toBe(400);
-    expect(response.body.error).toContain('Invalid strategy settings payload');
+  it('retired AI trader risk switches cannot be turned on through the risk settings', async () => {
+    const user = await prisma.user.findUniqueOrThrow({ where: { email: 'admin@soltrader.local' } });
+    const before = await prisma.riskConfig.findUniqueOrThrow({ where: { userId: user.id } });
+    const response = await agent.patch('/api/settings/risk').send({ aiAnalysisEnabled: true, aiRequiredForHighRisk: true, allowManualPaperWatchBuy: true });
+    expect(response.status).toBe(200);
+    expect(response.body.data).not.toHaveProperty('aiAnalysisEnabled');
+    const after = await prisma.riskConfig.findUniqueOrThrow({ where: { userId: user.id } });
+    expect(after.aiAnalysisEnabled).toBe(before.aiAnalysisEnabled);
+    expect(after.aiRequiredForHighRisk).toBe(before.aiRequiredForHighRisk);
   });
 
   it('redacts secret-like audit fields before database persistence', async () => {
@@ -180,7 +172,7 @@ describe('user settings API', () => {
     if (audit) await prisma.auditLog.delete({ where: { id: audit.id } });
   });
 
-  it('redacts legacy secret-like strategy fields from API responses', async () => {
+  it('never returns stored legacy strategy parameters (incl. secret-like fields)', async () => {
     const user = await prisma.user.findUnique({ where: { email: 'admin@soltrader.local' } });
     expect(user).not.toBeNull();
     const strategyName = `legacy-redaction-${Date.now()}`;
@@ -189,10 +181,10 @@ describe('user settings API', () => {
     });
 
     try {
-      // Rows for strategies the engine does not know are never returned, so their contents cannot leak.
-      const response = await agent.get('/api/settings/strategies');
+      // The legacy strategy settings endpoint is retired; the general settings view does not include strategy rows.
+      expect((await agent.get('/api/settings/strategies')).status).toBe(404);
+      const response = await agent.get('/api/settings');
       expect(response.status).toBe(200);
-      expect(response.body.data[strategyName]).toBeUndefined();
       expect(JSON.stringify(response.body)).not.toContain('test-only-placeholder');
     } finally {
       await prisma.strategyConfig.delete({ where: { userId_strategyName: { userId: user!.id, strategyName } } });

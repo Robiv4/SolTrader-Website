@@ -90,7 +90,7 @@ export function createMlRouter(deps: { prisma: PrismaClient; readJson: (key: str
         prisma.mlCandidateOutcome.groupBy({ by: ['status'], _count: { _all: true } }),
         prisma.mlFeatureSnapshot.groupBy({ by: ['validForTraining'], where: { kind: 'AGE_30S' }, _count: { _all: true }, _avg: { dataQuality: true } }),
         prisma.mlDatasetVersion.findMany({ orderBy: { createdAt: 'desc' }, take: 10, select: { version: true, target: true, rowCount: true, createdAt: true, manifest: true, createdBy: true } }),
-        prisma.mlModelVersion.findMany({ orderBy: { createdAt: 'desc' }, take: 20, select: { version: true, algorithm: true, status: true, readiness: true, target: true, datasetVersion: true, trainedAt: true, metrics: true, statusHistory: true } }),
+        prisma.mlModelVersion.findMany({ orderBy: { createdAt: 'desc' }, take: 20, select: { version: true, algorithm: true, status: true, readiness: true, target: true, datasetVersion: true, trainedAt: true, metrics: true, statusHistory: true, paperApproved: true, paperApprovedAt: true, paperApprovedBy: true } }),
         prisma.mlPrediction.count(),
         prisma.mlFeatureSnapshot.count({ where: { kind: 'AGE_30S', snapshotAt: { gte: new Date(Date.now() - 86_400_000) } } }),
       ]);
@@ -210,7 +210,7 @@ export function createMlRouter(deps: { prisma: PrismaClient; readJson: (key: str
     if (req.user?.role !== 'ADMIN') return fail(res, 403, 'Administrator authorization required');
     const parsed = z.object({ status: z.enum(['VALIDATED', 'SHADOW', 'RETIRED', 'PAPER_APPROVED', 'PAPER_ACTIVE']) }).safeParse(req.body ?? {});
     if (!parsed.success) return fail(res, 400, 'Invalid status');
-    if (parsed.data.status.startsWith('PAPER')) return fail(res, 400, 'PAPER_APPROVED / PAPER_ACTIVE nem érhető el ebben a kiadásban (csak SHADOW).');
+    if (parsed.data.status.startsWith('PAPER')) return fail(res, 400, 'A PAPER jóváhagyás külön, visszavonható folyamat: POST /api/ml/models/:version/paper-approval.');
     try {
       const model = await prisma.mlModelVersion.findUnique({ where: { version: String(req.params.version) } });
       if (!model) return fail(res, 404, 'Model not found');
@@ -220,7 +220,8 @@ export function createMlRouter(deps: { prisma: PrismaClient; readJson: (key: str
       await prisma.$transaction(async (tx) => {
         // Only one SHADOW model at a time: the previous one goes back to VALIDATED.
         if (parsed.data.status === 'SHADOW') await tx.mlModelVersion.updateMany({ where: { status: 'SHADOW', NOT: { version: model.version } }, data: { status: 'VALIDATED' } });
-        await tx.mlModelVersion.update({ where: { version: model.version }, data: { status: parsed.data.status, statusHistory: history as Prisma.InputJsonValue } });
+        // A retired model also loses its PAPER approval (ML entries with it stop at once).
+        await tx.mlModelVersion.update({ where: { version: model.version }, data: { status: parsed.data.status, statusHistory: history as Prisma.InputJsonValue, ...(parsed.data.status === 'RETIRED' && model.paperApproved ? { paperApproved: false, paperRevokedAt: new Date(), paperRevokedBy: req.user!.email } : {}) } });
       });
       await deps.logAuditEvent('ml_model_status_changed', req.user!.id, { modelVersion: model.version, from: model.status, to: parsed.data.status });
       return res.json({ ok: true, data: { version: model.version, status: parsed.data.status } });

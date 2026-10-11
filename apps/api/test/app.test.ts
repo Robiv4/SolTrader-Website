@@ -1,7 +1,6 @@
 import request from 'supertest';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
-import { serializeTokenListRow } from '../src/app.js';
 import { hashPassword } from '../src/auth.js';
 import { prisma } from '../src/database.js';
 
@@ -21,42 +20,6 @@ async function createPricedToken(priceUsd: number) {
 
 describe('API app', () => {
   const agent = request.agent(app);
-
-  it('serializes token rows with the latest market, risk, and signal data', () => {
-    const row = serializeTokenListRow({
-      id: 'token-1',
-      address: 'So11111111111111111111111111111111111111112',
-      symbol: 'SOL',
-      name: 'Solana',
-      decimals: 9,
-      isVerified: true,
-      priceUsd: '120.5',
-      volume24h: '2500000',
-      marketCap: '120000000',
-      updatedAt: new Date('2024-01-01T00:00:00Z'),
-      createdAt: new Date('2023-12-31T00:00:00Z'),
-      tokenMetrics: [{ priceUsd: '121.75', liquidityUsd: '1500000', volume24h: '2600000', marketCap: '130000000', timestamp: new Date('2024-01-02T00:00:00Z') }],
-      riskAssessments: [{ riskScore: '24.5', decision: 'WATCH' }],
-      signals: [{ direction: 'BUY', score: '82.25', strategyName: 'Momentum' }],
-    });
-
-    expect(row.priceUsd).toBe(121.75);
-    expect(row.liquidityUsd).toBe(1500000);
-    expect(row.volume24h).toBe(2600000);
-    expect(row.riskScore).toBe(24.5);
-    expect(row.riskDecision).toBe('WATCH');
-    expect(row.signalDirection).toBe('BUY');
-    expect(row.signalScore).toBe(82.25);
-    expect(row.signalStrategyName).toBe('Momentum');
-  });
-
-  beforeEach(async () => {
-    await agent.get('/health');
-  });
-
-  afterEach(async () => {
-    await agent.post('/api/auth/logout').send({});
-  });
 
   it('exposes health endpoint', async () => {
     const response = await request(app).get('/health');
@@ -106,22 +69,13 @@ describe('API app', () => {
     expect(response.body.ok).toBe(true);
   });
 
-  it('blocks manual Paper buys for a hard-blocked token before market execution', async () => {
+  it('the retired token monitor list and manual token-list buy endpoints are gone (no signal is created)', async () => {
     await agent.post('/api/auth/login').send({ email: 'admin@soltrader.local', password: 'AdminPass123!' });
-    const tokenAddress = '9xQ7QfL54wA7pM9JqimGJmP4XhQ5v1VJz2aS2b3s1Q4';
-    const user = await prisma.user.findUnique({ where: { email: 'admin@soltrader.local' } });
-    const token = await prisma.token.create({ data: { address: tokenAddress, symbol: 'BLOCKED' } });
-    try {
-      await prisma.botConfig.upsert({ where: { userId: user!.id }, update: { status: 'RUNNING', tradingMode: 'PAPER', isEmergencyStop: false }, create: { userId: user!.id, status: 'RUNNING', tradingMode: 'PAPER' } });
-      await prisma.riskAssessment.create({ data: { userId: user!.id, tokenId: token.id, riskScore: 100, decision: 'REJECT', classification: 'BLOCKED', hardBlocked: true, hardBlockReasons: ['SELL_BLOCKED'], factors: {}, rejectionReasons: ['SELL_BLOCKED'], warnings: [], source: 'manual-buy-test' } });
-      const response = await agent.post('/api/paper/orders/manual-buy').send({ tokenAddress, requestedAmount: 5, amountType: 'USDC' });
-      expect(response.status).toBe(409);
-      expect(response.body.error).toContain('blokkolva');
-      expect(await prisma.signal.count({ where: { tokenId: token.id, signalType: 'MANUAL_PAPER' } })).toBe(0);
-    } finally {
-      await prisma.riskAssessment.deleteMany({ where: { tokenId: token.id } });
-      await prisma.token.delete({ where: { id: token.id } });
-    }
+    const before = await prisma.signal.count({ where: { signalType: 'MANUAL_PAPER' } });
+    expect((await agent.get('/api/tokens')).status).toBe(404);
+    expect((await agent.post('/api/paper/orders/manual-buy').send({ tokenAddress: '9xQ7QfL54wA7pM9JqimGJmP4XhQ5v1VJz2aS2b3s1Q4', requestedAmount: 5, amountType: 'USDC' })).status).toBe(404);
+    expect((await agent.post('/api/bot/strategies/Momentum/toggle').send({ isEnabled: true })).status).toBe(404);
+    expect(await prisma.signal.count({ where: { signalType: 'MANUAL_PAPER' } })).toBe(before);
   });
 
   it('does not exhaust the sensitive-action limit on read-only settings requests', async () => {
@@ -230,31 +184,9 @@ describe('API app', () => {
       const byId = new Map(response.body.data.map((row: { id: string; outcome: unknown }) => [row.id, row.outcome]));
       expect(byId.get(rejected.id)).toEqual({ status: 'REJECTED', reasons: ['SLIPPAGE_LIMIT_EXCEEDED'] });
       expect(byId.get(pending.id)).toEqual({ status: 'PENDING', reasons: [] });
-
-      // A manual buy request is not a strategy signal, so the token row does not show it as a BUY signal.
-      const tokens = await agent.get('/api/tokens?limit=100');
-      const row = tokens.body.data.find((item: { address: string }) => item.address === token.address);
-      if (row) expect(row.signalDirection).toBeNull();
     } finally {
       await prisma.auditLog.deleteMany({ where: { userId: owner.id, action: 'TRADE_REJECTED', details: { path: ['signalId'], equals: rejected.id } } });
       await prisma.signal.deleteMany({ where: { id: { in: [rejected.id, pending.id] } } });
-    }
-  });
-
-  it('refuses a manual Paper buy above the configured position size instead of buying less', async () => {
-    expect((await agent.post('/api/auth/login').send({ email: 'admin@soltrader.local', password: 'AdminPass123!' })).status).toBe(200);
-    const owner = await prisma.user.findUniqueOrThrow({ where: { email: 'admin@soltrader.local' } });
-    const previous = await prisma.botConfig.findUnique({ where: { userId: owner.id } });
-    await prisma.botConfig.upsert({ where: { userId: owner.id }, update: { maxPositionSize: 10, status: 'RUNNING', tradingMode: 'PAPER', isEmergencyStop: false, isLiveEnabled: false }, create: { userId: owner.id, maxPositionSize: 10, status: 'RUNNING', tradingMode: 'PAPER' } });
-    const token = await createPricedToken(1);
-    await prisma.riskAssessment.create({ data: { userId: owner.id, tokenId: token.id, riskScore: 40, decision: 'WATCH', factors: {}, rejectionReasons: [], warnings: [], source: 'sizing-test' } });
-    try {
-      const response = await agent.post('/api/paper/orders/manual-buy').send({ tokenAddress: token.address, requestedAmount: 25, amountType: 'USDC' });
-      expect(response.status).toBe(409);
-      expect(response.body.error).toContain('maximális pozícióméret');
-    } finally {
-      await prisma.riskAssessment.deleteMany({ where: { tokenId: token.id } });
-      if (previous) await prisma.botConfig.update({ where: { userId: owner.id }, data: { maxPositionSize: previous.maxPositionSize, status: previous.status, tradingMode: previous.tradingMode } });
     }
   });
 

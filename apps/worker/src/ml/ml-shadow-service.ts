@@ -32,7 +32,9 @@ export const ML_SNAPSHOT_POINTS: Array<{ kind: string; ageMs: number }> = [
 const POINT_TOLERANCE_MS = 10_000;
 const TRACK_MS = 60 * 60_000;
 const STREAM_GAP_MS = 15_000;
-const REFERENCE_ORDER_USD = 20;
+/** Reference order for impact / state features (shared with the ML PAPER engine: identical features). */
+export const ML_REFERENCE_ORDER_USD = 20;
+const REFERENCE_ORDER_USD = ML_REFERENCE_ORDER_USD;
 const PERSIST_CHECKPOINTS_S = [130, 610, 1810, 3610];
 /** Failed final writes are retried with back-off; afterwards the periodic sweep finalises the row from the DB. */
 const FINAL_WRITE_MAX_ATTEMPTS = 10;

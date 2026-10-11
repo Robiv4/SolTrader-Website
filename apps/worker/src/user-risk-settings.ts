@@ -28,10 +28,14 @@ type BotConfigWithRisk = Awaited<ReturnType<PrismaClient['botConfig']['findMany'
   }> };
 };
 
-/** Loads active scanner configuration strictly from PostgreSQL, never from request/frontend input. */
-export async function loadActiveUserScanSettings(prisma: Pick<PrismaClient, 'botConfig'>): Promise<UserScanSettings[]> {
+/**
+ * Risk-engine settings of every user whose bot runs (RUNNING, PAPER / SEMI_AUTO, no emergency stop), loaded strictly
+ * from PostgreSQL. Used by New Launch for its risk assessment. Independent of the retired token scanner: the legacy
+ * BotConfig.isScannerEnabled column is no longer read anywhere.
+ */
+export async function loadActiveUserRiskSettings(prisma: Pick<PrismaClient, 'botConfig'>): Promise<UserScanSettings[]> {
   const configs = (await prisma.botConfig.findMany({
-    where: { isScannerEnabled: true, status: 'RUNNING', tradingMode: { in: ['PAPER', 'SEMI_AUTO'] }, isEmergencyStop: false },
+    where: { status: 'RUNNING', tradingMode: { in: ['PAPER', 'SEMI_AUTO'] }, isEmergencyStop: false },
     include: { user: { include: { riskConfigs: true } } },
   })) as unknown as BotConfigWithRisk[];
 
@@ -64,19 +68,4 @@ export async function loadActiveUserScanSettings(prisma: Pick<PrismaClient, 'bot
       source: 'worker-scanner',
     };
   });
-}
-
-/** Default and bounds of the per-user "monitored tokens" setting. */
-export const DEFAULT_MONITORED_TOKENS = 50;
-export const MIN_MONITORED_TOKENS = 10;
-export const MAX_MONITORED_TOKENS = 300;
-
-/** Size of the scanner's rotating pool: the largest setting among users whose scanner is running. */
-export async function loadMonitoringCapacity(prisma: Pick<PrismaClient, 'botConfig'>) {
-  const configs = await prisma.botConfig.findMany({
-    where: { isScannerEnabled: true, status: 'RUNNING', tradingMode: { in: ['PAPER', 'SEMI_AUTO'] }, isEmergencyStop: false },
-    select: { maxMonitoredTokens: true },
-  }).catch(() => []);
-  const largest = configs.reduce((max, config) => Math.max(max, config.maxMonitoredTokens ?? DEFAULT_MONITORED_TOKENS), 0);
-  return Math.min(MAX_MONITORED_TOKENS, Math.max(MIN_MONITORED_TOKENS, largest || DEFAULT_MONITORED_TOKENS));
 }

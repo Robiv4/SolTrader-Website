@@ -1,11 +1,9 @@
 import crypto from 'node:crypto';
 
 import { Prisma } from '@prisma/client';
-import { AI_PROMPT_VERSION, type AiProviderStatus, createAiProvider, DEFAULT_AI_USER_SETTINGS } from '@soltrader/ai-engine';
 import { createMarketDataProvider } from '@soltrader/market-data';
 import { checkHealth, MonitoringRegistry, TelegramNotifier, createCorrelationId } from '@soltrader/monitoring';
 import { BotCommandPublisher } from '@soltrader/shared';
-import { CONFIGURABLE_STRATEGY_NAMES, DEFAULT_ADVANCED_SETTINGS, isConfigurableStrategyName, REQUIRED_HISTORY_MINUTES, resolveAdvancedSettings, STRATEGY_PARAMETER_DEFAULTS } from '@soltrader/strategy-engine';
 import { closePaperPosition, debitPaperCash, DEFAULT_CAPACITY_CONFIG, describeExitLevels, effectiveDailyLossLimit, estimateExitSlippagePercent, estimatePriceImpactPercent, hashApprovalProposal, InsufficientPaperCashError, paperFee, protectionLevels, recomputePaperAccount, simulatedBuyFill } from '@soltrader/trading-engine';
 import cookieParser from 'cookie-parser';
 import cors from 'cors';
@@ -41,6 +39,7 @@ import { loadLaunchInfo } from './launch-info.js';
 import { evaluateLiveSafety, LiveSafetyController, type LiveSafetyState } from './live-safety.js';
 import { logger } from './logger.js';
 import { createMlRouter } from './ml-analytics.js';
+import { createMlPaperRouter } from './ml-paper.js';
 import { buildLaunchAnalytics, launchFunnel, loadLaunchTrades, parseScope, simulateFilter } from './new-launch-analytics.js';
 import { applyNewLaunchSettingsChange, loadNewLaunchSettings } from './new-launch-config.js';
 import { startOptimizationRun } from './new-launch-optimizer-job.js';
@@ -52,16 +51,12 @@ import { buildTelegramAnalytics } from './telegram-analytics.js';
 import { TelegramBotService } from './telegram-bot.js';
 import { aiDecisionFunnel, type AnalyticsTrade, computeTradeAnalytics, groupBy as groupTrades } from './trade-analytics.js';
 import {
-  advancedStrategySettingsSchema,
-  aiSettingsSchema,
   newLaunchSettingsSchema,
   closePositionSchema,
   liveEnableSchema,
-  manualPaperBuySchema,
   paginationSchema,
   settingsNotificationUpdateSchema,
   settingsRiskUpdateSchema,
-  settingsStrategyUpdateSchema,
   settingsUpdateSchema,
   signalQuerySchema,
   walletChallengeSchema,
@@ -502,6 +497,12 @@ app.post('/api/safety/live/enable', requireAuth, requireAdmin, async (req, res) 
     return errorResponse(res, 400, 'Explicit live-trading confirmation is required', parsed.error.issues);
   }
 
+  // ML PAPER is a PAPER-only experiment: while it is selected, LIVE can never be enabled for this account.
+  const mlStrategy = await prisma.mlPaperSettings.findUnique({ where: { userId: req.user!.id }, select: { strategyMode: true } });
+  if (mlStrategy?.strategyMode === 'ML') {
+    await logSafetyEvent('safety_gate_failed', req.user?.id ?? null, 'LIVE mode enable rejected: ML PAPER strategy active', { reason: 'ML_PAPER_ACTIVE' });
+    return errorResponse(res, 409, 'Az ML PAPER stratégia aktív: LIVE kereskedés nem engedélyezhető. Előbb válts vissza az alapstratégiára.');
+  }
   const { report } = await getLiveSafetyReport(req.user!.id, true, parsed.data.confirmLiveTrading);
   if (!report.canEnable) {
     await logSafetyEvent('safety_gate_failed', req.user?.id ?? null, 'LIVE mode enable rejected by safety gate', { failedChecks: report.failedChecks, blockingReasons: report.blockingReasons });
@@ -624,6 +625,7 @@ app.get('/api/users/:id/avatar', async (req, res) => {
 });
 
 // Machine Learning (shadow research; read for every signed-in user, model status: admin + e-mail code).
+app.use('/api', createMlPaperRouter({ prisma, readJson: (key) => readJsonKey<Record<string, unknown>>(key), logAuditEvent, stepUp, logger, serverTradingMode: () => env.TRADING_MODE }));
 app.use('/api/ml', createMlRouter({ prisma, readJson: (key) => readJsonKey<Record<string, unknown>>(key), logAuditEvent, stepUp, logger }));
 
 // Administrator user management (list / create / role / password / sessions / delete).
@@ -645,30 +647,6 @@ app.post('/api/bot/emergency-stop', requireAdmin, async (req, res) => {
   }
 });
 app.post('/api/bot/resume', requireAdmin, botController.start);
-app.post('/api/bot/strategies/:name/toggle', requireAdmin, botController.toggleStrategy);
-
-const settingsStrategyNames = [...CONFIGURABLE_STRATEGY_NAMES];
-
-/** No AI token analyst is wired into the worker yet; AI-dependent risk rules therefore cannot be satisfied. */
-const AI_PROVIDER_CONFIGURED = false;
-
-function storedStrategyParams(value: unknown): Record<string, unknown> {
-  return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {};
-}
-
-/** Strategy settings as the worker will actually run them: known strategies only, stored params merged over engine defaults. */
-function serializeStrategySettings(configs: Array<{ strategyName: string; isEnabled: boolean; params: unknown }>) {
-  return Object.fromEntries(CONFIGURABLE_STRATEGY_NAMES.map((name) => {
-    const row = configs.find((config) => config.strategyName === name);
-    const stored = storedStrategyParams(row?.params);
-    const defaults = STRATEGY_PARAMETER_DEFAULTS[name];
-    const params = Object.fromEntries(Object.entries(defaults).map(([key, fallback]) => {
-      const value = stored[key];
-      return [key, typeof value === 'number' && Number.isFinite(value) ? value : fallback];
-    }));
-    return [name, { isEnabled: row?.isEnabled ?? false, params, defaults }];
-  }));
-}
 
 function toNumber(value: Prisma.Decimal | number | string | null | undefined) {
   if (value === null || value === undefined) return null;
@@ -704,60 +682,8 @@ async function ensurePaperAccountExistsForRequest(req: Request) {
   return ensurePaperAccountForUser(req.user.id);
 }
 
-export function serializeTokenListRow(token: Prisma.TokenGetPayload<{ include: { tokenMetrics: true; riskAssessments: true; signals: true } }>) {
-  const latestMetric = Array.isArray(token.tokenMetrics) && token.tokenMetrics.length > 0 ? token.tokenMetrics[0] : null;
-  const latestRisk = Array.isArray(token.riskAssessments) && token.riskAssessments.length > 0 ? token.riskAssessments[0] : null;
-  const latestSignal = Array.isArray(token.signals)
-    ? token.signals.find((signal) => signal.signalType !== 'MANUAL_PAPER' && (signal.signalType === 'STRATEGY' || Boolean(signal.strategyName))) ?? null
-    : null;
-  const priceUsd = toNumber(latestMetric?.priceUsd ?? token.priceUsd);
-  const snapshotAgeMs = latestMetric?.timestamp ? Date.now() - latestMetric.timestamp.getTime() : Number.POSITIVE_INFINITY;
-  const dataQuality = priceUsd !== null && priceUsd > 0
-    ? snapshotAgeMs > 120_000 ? 'STALE' : latestMetric?.liquidityUsd == null ? 'PARTIAL' : 'VALID'
-    : 'INVALID';
-  const signalMetadata = latestSignal?.metadata && typeof latestSignal.metadata === 'object' && !Array.isArray(latestSignal.metadata)
-    ? latestSignal.metadata as Record<string, unknown>
-    : {};
-  const finalDecision = typeof signalMetadata.finalDecision === 'string'
-    ? signalMetadata.finalDecision
-    : latestRisk?.hardBlocked ? 'BLOCKED' : latestSignal ? 'WATCH' : latestRisk ? 'ANALYZING' : 'ANALYZING';
-
-  return {
-    id: token.id,
-    address: token.address,
-    symbol: token.symbol,
-    name: token.name,
-    decimals: token.decimals,
-    isVerified: token.isVerified,
-    priceUsd,
-    priceNative: toNumber(latestMetric?.priceNative),
-    dataQuality,
-    liquidityUsd: toNumber(latestMetric?.liquidityUsd),
-    volume24h: toNumber(latestMetric?.volume24h ?? token.volume24h),
-    marketCap: toNumber(latestMetric?.marketCap ?? token.marketCap),
-    fdv: toNumber(latestMetric?.fdv ?? token.fdv),
-    priceChange1h: toNumber(latestMetric?.priceChange1h),
-    priceChange24h: toNumber(latestMetric?.priceChange24h),
-    lastUpdatedAt: latestMetric?.timestamp ?? token.updatedAt,
-    riskScore: latestRisk ? toNumber(latestRisk.riskScore) : null,
-    riskDecision: latestRisk?.decision ?? null,
-    riskClassification: latestRisk?.classification ?? null,
-    riskHardBlocked: latestRisk?.hardBlocked ?? null,
-    riskPositionMultiplier: latestRisk ? toNumber(latestRisk.positionMultiplier) : null,
-    riskWarnings: latestRisk?.warnings ?? [],
-    hardBlockReasons: latestRisk?.hardBlockReasons ?? [],
-    riskStatus: latestRisk ? 'COMPLETED' : 'PENDING',
-    decision: finalDecision,
-    signalStatus: latestSignal ? 'COMPLETED' : latestRisk ? 'PENDING' : 'PENDING',
-    signalDirection: latestSignal?.direction ?? null,
-    signalScore: latestSignal ? toNumber(latestSignal.score) : null,
-    signalStrategyName: latestSignal?.strategyName ?? latestSignal?.signalType ?? null,
-    createdAt: token.createdAt,
-  };
-}
-
 async function ensureUserSettings(userId: string) {
-  const [botConfig, riskConfig, notificationConfig, strategyConfigs] = await Promise.all([
+  const [botConfig, riskConfig, notificationConfig] = await Promise.all([
     prisma.botConfig.upsert({
       where: { userId },
       update: {},
@@ -766,7 +692,6 @@ async function ensureUserSettings(userId: string) {
         botName: 'main-bot',
         tradingMode: 'PAPER',
         isLiveEnabled: false,
-        isScannerEnabled: true,
         isPaperModeDefault: true,
         preferredQuoteCurrency: 'USDC',
         maxTokenAgeHours: 168,
@@ -801,34 +726,23 @@ async function ensureUserSettings(userId: string) {
         pushAlerts: false,
       },
     }),
-    Promise.all(
-      settingsStrategyNames.map(async (strategyName) => prisma.strategyConfig.upsert({
-        where: { userId_strategyName: { userId, strategyName } },
-        update: {},
-        create: {
-          userId,
-          strategyName,
-          isEnabled: false,
-          params: {},
-        },
-      })),
-    ),
   ]);
 
-  return { botConfig, riskConfig, notificationConfig, strategyConfigs };
+  return { botConfig, riskConfig, notificationConfig };
 }
 
 async function getUserSettingsView(userId: string) {
-  const { botConfig, riskConfig, notificationConfig, strategyConfigs } = await ensureUserSettings(userId);
-  const wallets = await prisma.wallet.findMany({
-    where: { userId },
-    orderBy: { createdAt: 'desc' },
-  });
+  const { botConfig, riskConfig, notificationConfig } = await ensureUserSettings(userId);
+  const [wallets, newLaunch] = await Promise.all([
+    prisma.wallet.findMany({ where: { userId }, orderBy: { createdAt: 'desc' } }),
+    prisma.newLaunchConfig.findUnique({ where: { userId }, select: { enabled: true, configVersion: true } }),
+  ]);
 
   return {
     tradingMode: botConfig.tradingMode,
     isLiveEnabled: botConfig.isLiveEnabled,
-    isScannerEnabled: botConfig.isScannerEnabled,
+    isEmergencyStop: botConfig.isEmergencyStop,
+    botStatus: botConfig.status,
     isPaperModeDefault: botConfig.isPaperModeDefault,
     maxPositionSize: toNumber(botConfig.maxPositionSize),
     maxDailyLoss: toNumber(botConfig.maxDailyLoss),
@@ -839,7 +753,8 @@ async function getUserSettingsView(userId: string) {
     minVolumeUsd: toNumber(botConfig.minVolumeUsd),
     skipUnbuyableAfterMinutes: botConfig.skipUnbuyableAfterMinutes,
     skipUnbuyableForMinutes: botConfig.skipUnbuyableForMinutes,
-    maxMonitoredTokens: botConfig.maxMonitoredTokens,
+    /** Read-only summary; New Launch settings are edited through /api/settings/new-launch. */
+    newLaunch: { enabled: newLaunch?.enabled ?? false, configVersion: newLaunch?.configVersion ?? 'NL-v1' },
     risk: {
       riskPolicy: riskConfig.riskPolicy,
       lowRiskMax: riskConfig.lowRiskMax,
@@ -850,11 +765,6 @@ async function getUserSettingsView(userId: string) {
       moderatePositionMultiplier: toNumber(riskConfig.moderatePositionMultiplier),
       highPositionMultiplier: toNumber(riskConfig.highPositionMultiplier),
       veryHighPositionMultiplier: toNumber(riskConfig.veryHighPositionMultiplier),
-      aiAnalysisEnabled: riskConfig.aiAnalysisEnabled,
-      aiRequiredForHighRisk: riskConfig.aiRequiredForHighRisk,
-      aiRequiredForVeryHighRisk: riskConfig.aiRequiredForVeryHighRisk,
-      aiProviderConfigured: AI_PROVIDER_CONFIGURED,
-      allowManualPaperWatchBuy: riskConfig.allowManualPaperWatchBuy,
       maxPositionPercent: toNumber(riskConfig.maxPositionPercent),
       maxTotalExposurePercent: toNumber(riskConfig.maxTotalExposurePercent),
       maxConcurrentPositions: riskConfig.maxConcurrentPositions,
@@ -868,7 +778,6 @@ async function getUserSettingsView(userId: string) {
       trailingActivationPercent: toNumber(riskConfig.trailingActivationPercent),
       breakEvenActivationPercent: toNumber(riskConfig.breakEvenActivationPercent),
     },
-    strategies: serializeStrategySettings(strategyConfigs),
     wallet: wallets.map((wallet) => ({
       id: wallet.id,
       label: wallet.label ?? (wallet.type === 'BOT_TRADING' ? 'Bot trading wallet' : 'User wallet'),
@@ -947,7 +856,6 @@ app.put('/api/settings', async (req, res) => {
         liveApprovalCompleted: liveMutation.disableAuthorization ? false : undefined,
         isPaperModeDefault: liveMutation.disableAuthorization ? true : parsed.data.isPaperModeDefault ?? undefined,
         status: liveMutation.disableAuthorization ? 'PAUSED' : undefined,
-        isScannerEnabled: parsed.data.isScannerEnabled ?? undefined,
         maxPositionSize: parsed.data.maxPositionSize,
         maxDailyLoss: parsed.data.maxDailyLoss,
         riskThreshold: parsed.data.riskThreshold,
@@ -957,7 +865,6 @@ app.put('/api/settings', async (req, res) => {
         minVolumeUsd: parsed.data.minVolumeUsd,
         skipUnbuyableAfterMinutes: parsed.data.skipUnbuyableAfterMinutes ?? undefined,
         skipUnbuyableForMinutes: parsed.data.skipUnbuyableForMinutes ?? undefined,
-        maxMonitoredTokens: parsed.data.maxMonitoredTokens ?? undefined,
         updatedAt: new Date(),
       },
       create: {
@@ -965,14 +872,12 @@ app.put('/api/settings', async (req, res) => {
         botName: 'main-bot',
         tradingMode: parsed.data.tradingMode ?? 'PAPER',
         isLiveEnabled: parsed.data.isLiveEnabled ?? false,
-        isScannerEnabled: parsed.data.isScannerEnabled ?? true,
         isPaperModeDefault: parsed.data.isPaperModeDefault ?? true,
         maxPositionSize: parsed.data.maxPositionSize,
         maxDailyLoss: parsed.data.maxDailyLoss,
         riskThreshold: parsed.data.riskThreshold,
         preferredQuoteCurrency: parsed.data.preferredQuoteCurrency ?? 'USDC',
         maxTokenAgeHours: parsed.data.maxTokenAgeHours ?? 168,
-        maxMonitoredTokens: parsed.data.maxMonitoredTokens ?? 50,
         minLiquidityUsd: parsed.data.minLiquidityUsd,
         minVolumeUsd: parsed.data.minVolumeUsd,
       },
@@ -1005,7 +910,6 @@ app.patch('/api/settings', async (req, res) => {
         liveApprovalCompleted: liveMutation.disableAuthorization ? false : undefined,
         isPaperModeDefault: liveMutation.disableAuthorization ? true : parsed.data.isPaperModeDefault ?? undefined,
         status: liveMutation.disableAuthorization ? 'PAUSED' : undefined,
-        isScannerEnabled: parsed.data.isScannerEnabled ?? undefined,
         maxPositionSize: parsed.data.maxPositionSize,
         maxDailyLoss: parsed.data.maxDailyLoss,
         riskThreshold: parsed.data.riskThreshold,
@@ -1015,7 +919,6 @@ app.patch('/api/settings', async (req, res) => {
         minVolumeUsd: parsed.data.minVolumeUsd,
         skipUnbuyableAfterMinutes: parsed.data.skipUnbuyableAfterMinutes ?? undefined,
         skipUnbuyableForMinutes: parsed.data.skipUnbuyableForMinutes ?? undefined,
-        maxMonitoredTokens: parsed.data.maxMonitoredTokens ?? undefined,
         updatedAt: new Date(),
       },
       create: {
@@ -1023,14 +926,12 @@ app.patch('/api/settings', async (req, res) => {
         botName: 'main-bot',
         tradingMode: parsed.data.tradingMode ?? 'PAPER',
         isLiveEnabled: parsed.data.isLiveEnabled ?? false,
-        isScannerEnabled: parsed.data.isScannerEnabled ?? true,
         isPaperModeDefault: parsed.data.isPaperModeDefault ?? true,
         maxPositionSize: parsed.data.maxPositionSize,
         maxDailyLoss: parsed.data.maxDailyLoss,
         riskThreshold: parsed.data.riskThreshold,
         preferredQuoteCurrency: parsed.data.preferredQuoteCurrency ?? 'USDC',
         maxTokenAgeHours: parsed.data.maxTokenAgeHours ?? 168,
-        maxMonitoredTokens: parsed.data.maxMonitoredTokens ?? 50,
         minLiquidityUsd: parsed.data.minLiquidityUsd,
         minVolumeUsd: parsed.data.minVolumeUsd,
       },
@@ -1060,10 +961,6 @@ app.get('/api/settings/risk', async (req, res) => {
         moderatePositionMultiplier: toNumber(riskConfig.moderatePositionMultiplier),
         highPositionMultiplier: toNumber(riskConfig.highPositionMultiplier),
         veryHighPositionMultiplier: toNumber(riskConfig.veryHighPositionMultiplier),
-        aiAnalysisEnabled: riskConfig.aiAnalysisEnabled,
-        aiRequiredForHighRisk: riskConfig.aiRequiredForHighRisk,
-        aiRequiredForVeryHighRisk: riskConfig.aiRequiredForVeryHighRisk,
-      aiProviderConfigured: AI_PROVIDER_CONFIGURED,
         maxPositionPercent: toNumber(riskConfig.maxPositionPercent),
         maxTotalExposurePercent: toNumber(riskConfig.maxTotalExposurePercent),
         maxConcurrentPositions: riskConfig.maxConcurrentPositions,
@@ -1081,95 +978,6 @@ app.get('/api/settings/risk', async (req, res) => {
   } catch (error) {
     logger.error({ err: error }, 'Failed to fetch risk settings');
     return errorResponse(res, 500, 'Unable to fetch risk settings');
-  }
-});
-
-// ---------- AI Token Analyzer: provider status and per-user AI settings ----------
-// The provider is created from server-side env; only its name/model/status ever leave the server.
-const aiProviderHandle = createAiProvider(process.env);
-let aiHealthCache: { status: AiProviderStatus; at: number } | null = null;
-
-export async function getAiProviderStatus(force = false): Promise<AiProviderStatus> {
-  if (!aiProviderHandle.provider) return 'NOT_CONFIGURED';
-  if (!force && aiHealthCache && Date.now() - aiHealthCache.at < 60_000) return aiHealthCache.status;
-  const controller = new globalThis.AbortController();
-  const timer = globalThis.setTimeout(() => controller.abort(), 8_000);
-  const healthy = await aiProviderHandle.provider.healthCheck(controller.signal).catch(() => false).finally(() => globalThis.clearTimeout(timer));
-  aiHealthCache = { status: healthy ? 'CONNECTED' : 'UNAVAILABLE', at: Date.now() };
-  return aiHealthCache.status;
-}
-
-async function aiUsageToday(userId: string) {
-  const since = new Date();
-  since.setUTCHours(0, 0, 0, 0);
-  const [rows, cached] = await Promise.all([
-    prisma.aiAnalysis.groupBy({ by: ['status'], where: { userId, createdAt: { gte: since } }, _count: { _all: true }, _avg: { latencyMs: true }, _sum: { inputTokens: true, outputTokens: true } }).catch(() => []),
-    getRealtimeClient().then((client) => client.get(`ai:usage:${userId}:${since.toISOString().slice(0, 10)}:cached`)).catch(() => null),
-  ]);
-  const count = (status: string) => rows.find((row) => row.status === status)?._count._all ?? 0;
-  const completed = rows.find((row) => row.status === 'COMPLETED');
-  // Only attempts that actually reached a provider count as API calls (not 'provider not configured').
-  const apiCalls = await prisma.aiAnalysis.count({ where: { userId, createdAt: { gte: since }, provider: { not: 'none' }, NOT: { errorMessage: 'AI provider is not configured' } } }).catch(() => 0);
-  return {
-    analyses: count('COMPLETED'),
-    cacheHits: Number(cached ?? 0),
-    apiCalls,
-    failed: count('FAILED'),
-    invalid: count('INVALID'),
-    averageLatencyMs: completed?._avg.latencyMs ?? null,
-    inputTokens: rows.reduce((total, row) => total + (row._sum.inputTokens ?? 0), 0) || null,
-    outputTokens: rows.reduce((total, row) => total + (row._sum.outputTokens ?? 0), 0) || null,
-  };
-}
-
-async function serializeAiSettings(userId: string) {
-  const row = await prisma.aiConfig.findUnique({ where: { userId } });
-  const settings = row ? {
-    aiAnalysisEnabled: row.aiAnalysisEnabled, aiMinimumConfidence: row.aiMinimumConfidence, aiRecheckSeconds: row.aiRecheckSeconds,
-    aiMaxAnalysesPerMinute: row.aiMaxAnalysesPerMinute, aiAllowHighRisk: row.aiAllowHighRisk, aiAllowVeryHighRisk: row.aiAllowVeryHighRisk,
-    aiDynamicExitSuggestionsEnabled: row.aiDynamicExitSuggestionsEnabled, aiDecisionTtlSeconds: row.aiDecisionTtlSeconds, aiUseExitParameters: row.aiUseExitParameters,
-  } : { ...DEFAULT_AI_USER_SETTINGS };
-  return {
-    ...settings,
-    decisionMode: settings.aiAnalysisEnabled ? 'AI' : 'STRATEGY',
-    provider: { name: aiProviderHandle.info.provider, model: aiProviderHandle.info.model, status: await getAiProviderStatus(), promptVersion: AI_PROMPT_VERSION },
-    usageToday: await aiUsageToday(userId),
-  };
-}
-
-app.get('/api/settings/ai', async (req, res) => {
-  try {
-    return res.json({ ok: true, data: await serializeAiSettings(req.user!.id) });
-  } catch (error) {
-    logger.error({ err: error }, 'Failed to load AI settings');
-    return errorResponse(res, 500, 'Unable to load AI settings');
-  }
-});
-
-app.put('/api/settings/ai', async (req, res) => {
-  try {
-    const parsed = aiSettingsSchema.safeParse(req.body ?? {});
-    if (!parsed.success) return errorResponse(res, 400, 'Érvénytelen AI-beállítás', parsed.error.issues);
-    const userId = req.user!.id;
-    const current = await prisma.aiConfig.findUnique({ where: { userId } });
-    const enabling = parsed.data.aiAnalysisEnabled === true && !current?.aiAnalysisEnabled;
-    if (enabling) {
-      // AI mode is never switched on without a working, server-side configured provider.
-      const status = await getAiProviderStatus(true);
-      if (status === 'NOT_CONFIGURED') return errorResponse(res, 400, 'Az AI szolgáltató nincs konfigurálva. Állíts be érvényes szerveroldali AI API-kulcsot.');
-      if (status !== 'CONNECTED') return errorResponse(res, 409, 'Az AI szolgáltató nem elérhető, ezért az AI mód most nem kapcsolható be.');
-    }
-    await prisma.aiConfig.upsert({ where: { userId }, update: parsed.data, create: { userId, ...parsed.data } });
-    const modeChanged = parsed.data.aiAnalysisEnabled !== undefined && parsed.data.aiAnalysisEnabled !== (current?.aiAnalysisEnabled ?? false);
-    await logAuditEvent(modeChanged ? 'ai_mode_changed' : 'ai_settings_update', userId, {
-      fields: Object.keys(parsed.data),
-      ...(modeChanged ? { from: current?.aiAnalysisEnabled ? 'AI' : 'STRATEGY', to: parsed.data.aiAnalysisEnabled ? 'AI' : 'STRATEGY' } : {}),
-    });
-    if (modeChanged) await publishRealtime('bot:events', { type: 'decision_mode_changed', userId, decisionMode: parsed.data.aiAnalysisEnabled ? 'AI' : 'STRATEGY', at: new Date().toISOString() });
-    return res.json({ ok: true, data: await serializeAiSettings(userId) });
-  } catch (error) {
-    logger.error({ err: error }, 'Failed to save AI settings');
-    return errorResponse(res, 500, 'Unable to save AI settings');
   }
 });
 
@@ -1196,60 +1004,6 @@ async function latestAiAnalysis(userId: string, tokenId: string, tokenAddress: s
   };
 }
 
-function serializeAdvancedSettings(row: Parameters<typeof resolveAdvancedSettings>[0]) {
-  return { ...resolveAdvancedSettings(row), requiredHistoryMinutes: REQUIRED_HISTORY_MINUTES, defaults: DEFAULT_ADVANCED_SETTINGS, persisted: Boolean(row) };
-}
-
-app.get('/api/settings/advanced-strategies', async (req, res) => {
-  try {
-    const row = await prisma.advancedStrategyConfig.findUnique({ where: { userId: req.user!.id } });
-    return res.json({ ok: true, data: serializeAdvancedSettings(row as Parameters<typeof resolveAdvancedSettings>[0]) });
-  } catch (error) {
-    logger.error({ err: error }, 'Failed to load advanced strategy settings');
-    return errorResponse(res, 500, 'Unable to load advanced strategy settings');
-  }
-});
-
-app.put('/api/settings/advanced-strategies', async (req, res) => {
-  try {
-    const parsed = advancedStrategySettingsSchema.safeParse(req.body ?? {});
-    if (!parsed.success) return errorResponse(res, 400, 'Érvénytelen stratégia-beállítás', parsed.error.issues);
-    const userId = req.user!.id;
-    const current = await prisma.advancedStrategyConfig.findUnique({ where: { userId } });
-    // Module settings are merged per module, so a partial update never wipes other modules' values.
-    const currentModules = (current?.modules ?? {}) as Record<string, Record<string, unknown>>;
-    const modules = { ...currentModules };
-    for (const [name, value] of Object.entries(parsed.data.modules ?? {})) modules[name] = { ...(currentModules[name] ?? {}), ...value };
-    const scalars: Partial<typeof parsed.data> = { ...parsed.data };
-    delete scalars.modules;
-    const merged = resolveAdvancedSettings({ ...(current ?? {}), ...scalars, modules } as Parameters<typeof resolveAdvancedSettings>[0]);
-    if (merged.exhaustionWarningThreshold > merged.exhaustionStrongWarningThreshold || merged.exhaustionStrongWarningThreshold > merged.exhaustionBlockThreshold) {
-      return errorResponse(res, 400, 'A kifáradási küszöbök sorrendje: figyelmeztetés ≤ erős figyelmeztetés ≤ tiltás.');
-    }
-    const data = {
-      compositeEnabled: merged.compositeEnabled,
-      minimumConfirmations: merged.minimumConfirmations,
-      minimumCompositeScore: merged.minimumCompositeScore,
-      penalizeUnavailable: merged.penalizeUnavailable,
-      exhaustionEnabled: merged.exhaustionEnabled,
-      exhaustionWarningThreshold: merged.exhaustionWarningThreshold,
-      exhaustionStrongWarningThreshold: merged.exhaustionStrongWarningThreshold,
-      exhaustionBlockThreshold: merged.exhaustionBlockThreshold,
-      exhaustionPolicy: merged.exhaustionPolicy,
-      exhaustionPenaltyWeight: new Prisma.Decimal(merged.exhaustionPenaltyWeight),
-      liquidityOutflowExitEnabled: merged.liquidityOutflowExitEnabled,
-      liquidityOutflowExitPercent: new Prisma.Decimal(merged.liquidityOutflowExitPercent),
-      modules: merged.modules as unknown as Prisma.InputJsonValue,
-    };
-    const row = await prisma.advancedStrategyConfig.upsert({ where: { userId }, update: data, create: { userId, ...data } });
-    await logAuditEvent('advanced_strategy_settings_update', userId, { fields: Object.keys(parsed.data), modules: Object.keys(parsed.data.modules ?? {}) });
-    return res.json({ ok: true, data: serializeAdvancedSettings(row as Parameters<typeof resolveAdvancedSettings>[0]) });
-  } catch (error) {
-    logger.error({ err: error }, 'Failed to save advanced strategy settings');
-    return errorResponse(res, 500, 'Unable to save advanced strategy settings');
-  }
-});
-
 app.patch('/api/settings/risk', async (req, res) => {
   try {
     const parsed = settingsRiskUpdateSchema.safeParse(req.body ?? {});
@@ -1258,21 +1012,6 @@ app.patch('/api/settings/risk', async (req, res) => {
     }
 
     const currentRisk = await prisma.riskConfig.findUnique({ where: { userId: req.user!.id } });
-    const aiEnabled = parsed.data.aiAnalysisEnabled ?? currentRisk?.aiAnalysisEnabled ?? false;
-    const aiRequiredForHigh = parsed.data.aiRequiredForHighRisk ?? currentRisk?.aiRequiredForHighRisk ?? false;
-    const aiRequiredForVeryHigh = parsed.data.aiRequiredForVeryHighRisk ?? currentRisk?.aiRequiredForVeryHighRisk ?? false;
-    const aiRequired = aiRequiredForHigh || aiRequiredForVeryHigh;
-    // Without an AI analyst an "AI required" rule can never pass and silently rejects every HIGH/VERY_HIGH
-    // trade, so it cannot be switched on; switching it off is always allowed.
-    const enablingAi = (parsed.data.aiAnalysisEnabled === true && !currentRisk?.aiAnalysisEnabled)
-      || (parsed.data.aiRequiredForHighRisk === true && !currentRisk?.aiRequiredForHighRisk)
-      || (parsed.data.aiRequiredForVeryHighRisk === true && !currentRisk?.aiRequiredForVeryHighRisk);
-    if (!AI_PROVIDER_CONFIGURED && enablingAi) {
-      return errorResponse(res, 400, 'Nincs AI-elemző szolgáltató bekötve, ezért az AI-elemzés nem kapcsolható be.');
-    }
-    if (aiRequired && !aiEnabled) {
-      return errorResponse(res, 400, 'AI analysis must be enabled when it is required for a risk class');
-    }
     const thresholds = [
       parsed.data.lowRiskMax ?? currentRisk?.lowRiskMax ?? 30,
       parsed.data.moderateRiskMax ?? currentRisk?.moderateRiskMax ?? 50,
@@ -1295,10 +1034,6 @@ app.patch('/api/settings/risk', async (req, res) => {
         moderatePositionMultiplier: parsed.data.moderatePositionMultiplier ?? undefined,
         highPositionMultiplier: parsed.data.highPositionMultiplier ?? undefined,
         veryHighPositionMultiplier: parsed.data.veryHighPositionMultiplier ?? undefined,
-        aiAnalysisEnabled: parsed.data.aiAnalysisEnabled ?? undefined,
-        aiRequiredForHighRisk: parsed.data.aiRequiredForHighRisk ?? undefined,
-        aiRequiredForVeryHighRisk: parsed.data.aiRequiredForVeryHighRisk ?? undefined,
-        allowManualPaperWatchBuy: parsed.data.allowManualPaperWatchBuy ?? undefined,
         maxPositionPercent: parsed.data.maxPositionPercent,
         maxTotalExposurePercent: parsed.data.maxTotalExposurePercent,
         maxConcurrentPositions: parsed.data.maxConcurrentPositions ?? undefined,
@@ -1342,11 +1077,6 @@ app.patch('/api/settings/risk', async (req, res) => {
       moderatePositionMultiplier: toNumber(riskConfig.moderatePositionMultiplier),
       highPositionMultiplier: toNumber(riskConfig.highPositionMultiplier),
       veryHighPositionMultiplier: toNumber(riskConfig.veryHighPositionMultiplier),
-      aiAnalysisEnabled: riskConfig.aiAnalysisEnabled,
-      aiRequiredForHighRisk: riskConfig.aiRequiredForHighRisk,
-      aiRequiredForVeryHighRisk: riskConfig.aiRequiredForVeryHighRisk,
-      aiProviderConfigured: AI_PROVIDER_CONFIGURED,
-      allowManualPaperWatchBuy: riskConfig.allowManualPaperWatchBuy,
       maxPositionPercent: toNumber(riskConfig.maxPositionPercent),
       maxTotalExposurePercent: toNumber(riskConfig.maxTotalExposurePercent),
       maxConcurrentPositions: riskConfig.maxConcurrentPositions,
@@ -1363,67 +1093,6 @@ app.patch('/api/settings/risk', async (req, res) => {
   } catch (error) {
     logger.error({ err: error }, 'Failed to update risk settings');
     return errorResponse(res, 500, 'Unable to update risk settings');
-  }
-});
-
-app.get('/api/settings/strategies', async (req, res) => {
-  try {
-    const strategies = await prisma.strategyConfig.findMany({
-      where: { userId: req.user!.id },
-      orderBy: { strategyName: 'asc' },
-    });
-
-    return res.json({ ok: true, data: serializeStrategySettings(strategies) });
-  } catch (error) {
-    logger.error({ err: error }, 'Failed to fetch strategy settings');
-    return errorResponse(res, 500, 'Unable to fetch strategy settings');
-  }
-});
-
-app.patch('/api/settings/strategies/:name', async (req, res) => {
-  try {
-    const parsed = settingsStrategyUpdateSchema.safeParse(req.body ?? {});
-    if (!parsed.success) {
-      return errorResponse(res, 400, 'Invalid strategy settings payload', parsed.error.issues);
-    }
-
-    const strategyName = (req.params.name || '').trim();
-    if (!isConfigurableStrategyName(strategyName)) {
-      return errorResponse(res, 404, `Unknown strategy. Available strategies: ${CONFIGURABLE_STRATEGY_NAMES.join(', ')}`);
-    }
-
-    // Only the strategy's known numeric parameters are accepted; anything else is rejected, not silently stored.
-    const defaults = STRATEGY_PARAMETER_DEFAULTS[strategyName];
-    const incoming = parsed.data.params ?? {};
-    const invalidKeys = Object.entries(incoming)
-      .filter(([key, value]) => !(key in defaults) || typeof value !== 'number' || !Number.isFinite(value) || value < 0)
-      .map(([key]) => key);
-    if (invalidKeys.length > 0) {
-      return errorResponse(res, 400, `Invalid strategy parameters: ${invalidKeys.join(', ')}`);
-    }
-    const current = await prisma.strategyConfig.findUnique({ where: { userId_strategyName: { userId: req.user!.id, strategyName } } });
-    const mergedParams = { ...storedStrategyParams(current?.params), ...incoming } as Prisma.InputJsonValue;
-
-    const strategy = await prisma.strategyConfig.upsert({
-      where: { userId_strategyName: { userId: req.user!.id, strategyName } },
-      update: {
-        isEnabled: parsed.data.isEnabled ?? undefined,
-        params: parsed.data.params ? mergedParams : undefined,
-        updatedAt: new Date(),
-      },
-      create: {
-        userId: req.user!.id,
-        strategyName,
-        isEnabled: parsed.data.isEnabled ?? false,
-        params: mergedParams,
-      },
-    });
-
-    await logAuditEvent('strategy_settings_update', req.user!.id, { strategyName, fields: Object.keys(parsed.data), isEnabled: strategy.isEnabled });
-    return res.json({ ok: true, data: { name: strategy.strategyName, ...serializeStrategySettings([strategy])[strategyName] } });
-  } catch (error) {
-    logger.error({ err: error }, 'Failed to update strategy settings');
-    return errorResponse(res, 500, 'Unable to update strategy settings');
   }
 });
 
@@ -1618,7 +1287,6 @@ app.post('/api/settings/wallet/connect', async (req, res) => {
           botName: 'main-bot',
           tradingMode: 'PAPER',
           isLiveEnabled: false,
-          isScannerEnabled: true,
           isPaperModeDefault: true,
           preferredQuoteCurrency: 'USDC',
           maxTokenAgeHours: 168,
@@ -2259,164 +1927,6 @@ app.post('/api/approvals/:id/approve', async (req, res) => {
   } catch (error) {
     logger.error({ err: error }, 'Failed to approve SEMI_AUTO trade');
     return errorResponse(res, 500, 'Unable to approve trade');
-  }
-});
-
-const tokenListQuerySchema = z.object({
-  limit: z.coerce.number().int().min(1).max(300).optional(),
-  offset: z.coerce.number().int().min(0).default(0),
-});
-
-app.get('/api/tokens', async (req, res) => {
-  try {
-    const query = tokenListQuerySchema.parse(req.query);
-    // Without an explicit limit the list shows as many tokens as the user's "monitored tokens" setting.
-    const bot = query.limit ? null : await prisma.botConfig.findUnique({ where: { userId: req.user!.id }, select: { maxMonitoredTokens: true } });
-    const limit = query.limit ?? bot?.maxMonitoredTokens ?? 50;
-    const [tokens, activeStrategyCount] = await Promise.all([prisma.token.findMany({
-      take: limit,
-      skip: query.offset,
-      // Most recently scanned first (every fresh snapshot updates the token row).
-      orderBy: { updatedAt: 'desc' },
-      include: {
-        tokenMetrics: { orderBy: { timestamp: 'desc' }, take: 1 },
-        riskAssessments: { where: { OR: [{ userId: req.user!.id }, { userId: null }] }, orderBy: { createdAt: 'desc' }, take: 1 },
-        signals: { where: { OR: [{ userId: req.user!.id }, { userId: null }] }, orderBy: { createdAt: 'desc' }, take: 5 },
-      },
-    }).catch(() => []), prisma.strategyConfig.count({ where: { userId: req.user!.id, isEnabled: true } }).catch(() => 0)]);
-
-    const aiRows = tokens.length === 0 ? [] : await prisma.aiAnalysis.findMany({
-      where: { userId: req.user!.id, tokenId: { in: tokens.map((token) => token.id) }, createdAt: { gte: new Date(Date.now() - 30 * 60_000) } },
-      orderBy: { createdAt: 'desc' },
-      select: { tokenId: true, effectiveDecision: true, rawDecision: true, confidence: true, status: true, createdAt: true },
-    }).catch(() => []);
-    const aiByToken = new Map<string, (typeof aiRows)[number]>();
-    for (const row of aiRows) if (!aiByToken.has(row.tokenId)) aiByToken.set(row.tokenId, row);
-    // Tokens the worker currently skips for this user (stayed blocked/unbuyable too long).
-    const skipped = tokens.length === 0 ? [] : await (async () => (await getRealtimeClient()).mGet(tokens.map((token) => `unbuyable:skip:${req.user!.id}:${token.address}`)))()
-      .catch((error: unknown) => {
-        logger.warn({ err: error }, 'Skipped-token lookup failed');
-        return tokens.map(() => null);
-      });
-    return res.json({ ok: true, data: tokens.map((token, index) => {
-      const row = serializeTokenListRow(token);
-      const skip = skipped[index] ? JSON.parse(skipped[index]!) as { until: string; reason: string } : null;
-      const ai = aiByToken.get(token.id);
-      return { ...row, skipped: skip, ai: ai ? { decision: ai.effectiveDecision, rawDecision: ai.rawDecision, confidence: toNumber(ai.confidence), status: ai.status, at: ai.createdAt } : null, signalStatus: row.signalStatus === 'COMPLETED' ? 'COMPLETED' : activeStrategyCount === 0 ? 'NO_ACTIVE_STRATEGY' : 'PENDING' };
-    }) });
-  } catch (error) {
-    if (error instanceof z.ZodError) {
-      return errorResponse(res, 400, 'Invalid query parameters', error.issues);
-    }
-
-    logger.error({ err: error }, 'Failed to fetch tokens');
-    return errorResponse(res, 500, 'Unable to fetch tokens');
-  }
-});
-
-app.post('/api/paper/orders/manual-buy', async (req, res) => {
-  try {
-    const parsed = manualPaperBuySchema.safeParse(req.body ?? {});
-    if (!parsed.success) return errorResponse(res, 400, 'Invalid manual Paper buy payload', parsed.error.issues);
-    const userId = req.user!.id;
-    const [bot, riskConfig, account, token] = await Promise.all([
-      prisma.botConfig.findUnique({ where: { userId } }),
-      prisma.riskConfig.findUnique({ where: { userId } }),
-      ensurePaperAccountForUser(userId),
-      prisma.token.findUnique({ where: { address: parsed.data.tokenAddress }, include: { tokenMetrics: { orderBy: { timestamp: 'desc' }, take: 1 }, riskAssessments: { where: { OR: [{ userId }, { userId: null }] }, orderBy: { createdAt: 'desc' }, take: 1 }, signals: { where: { userId, signalType: 'STRATEGY' }, orderBy: { createdAt: 'desc' }, take: 1 } } }),
-    ]);
-    if (!bot || bot.tradingMode !== 'PAPER' || bot.isLiveEnabled || bot.status !== 'RUNNING' || bot.isEmergencyStop || env.TRADING_MODE !== 'PAPER') return errorResponse(res, 409, 'Paper kereskedés jelenleg nem engedélyezett');
-    if (!account) return errorResponse(res, 409, 'Nincs érvényes Paper számla');
-    if (riskConfig?.allowManualPaperWatchBuy === false) return errorResponse(res, 403, 'A manuális Paper vétel le van tiltva');
-    if (!token) return errorResponse(res, 404, 'Token nem található');
-    const risk = token.riskAssessments[0];
-    if (!risk) return errorResponse(res, 409, 'A token kockázati elemzése még nem készült el');
-    if (risk.hardBlocked || risk.decision === 'REJECT') return errorResponse(res, 409, 'A token kritikus biztonsági feltétel miatt blokkolva van');
-    const equity = toNumber(account.equity) ?? 0;
-    const requestedAmount = parsed.data.amountType === 'EQUITY_PERCENT' ? equity * parsed.data.requestedAmount / 100 : parsed.data.requestedAmount;
-    if (requestedAmount <= 0 || !Number.isFinite(requestedAmount)) return errorResponse(res, 400, 'Érvénytelen pozícióméret');
-    // A manual buy is executed with exactly this amount or not at all, so obvious conflicts are reported right away.
-    const configuredPositionSize = toNumber(bot.maxPositionSize);
-    if (configuredPositionSize !== null && configuredPositionSize > 0 && requestedAmount > configuredPositionSize) {
-      return errorResponse(res, 409, `A megadott összeg (${requestedAmount.toFixed(2)} USDC) nagyobb a Beállításokban megadott maximális pozícióméretnél (${configuredPositionSize.toFixed(2)} USDC).`);
-    }
-    const availableCash = toNumber(account.cashBalance) ?? 0;
-    if (requestedAmount + paperFee(requestedAmount) > availableCash) {
-      return errorResponse(res, 409, `Nincs elég szabad paper egyenleg: ${requestedAmount.toFixed(2)} USDC + díj kellene, ${availableCash.toFixed(2)} USDC áll rendelkezésre.`);
-    }
-    const market = await apiMarketDataProvider.getTokenMetrics(token.address).catch(() => null);
-    const price = toNumber(market?.priceUsd);
-    const fresh = Boolean(market?.timestamp && Date.now() - market.timestamp.getTime() <= env.MARKET_DATA_STALE_AFTER_MS);
-    const liquidity = toNumber(market?.liquidityUsd);
-    if (!market || price === null || price <= 0 || !fresh) return errorResponse(res, 409, fresh ? 'Nincs érvényes ár' : 'Az árfolyamadat elavult');
-    if (!market.poolAddress || liquidity === null || liquidity <= 0) return errorResponse(res, 409, 'Nincs elegendő megbízható likviditási adat');
-    const openPosition = await prisma.position.findFirst({ where: { userId, tokenId: token.id, status: 'OPEN', mode: 'PAPER' } });
-    if (openPosition) return errorResponse(res, 409, 'Ehhez a tokenhez már van nyitott pozíció');
-    const pendingManual = await prisma.signal.findFirst({ where: { userId, tokenId: token.id, signalType: 'MANUAL_PAPER', createdAt: { gte: new Date(Date.now() - 60_000) } } });
-    if (pendingManual) return errorResponse(res, 409, 'A manuális Paper vétel már feldolgozás alatt áll');
-    const latestSignal = token.signals[0];
-    const signalScore = latestSignal ? toNumber(latestSignal.score) ?? 0 : 0;
-    const signal = await prisma.signal.create({
-      data: {
-        tokenId: token.id,
-        userId,
-        direction: 'BUY',
-        score: new Prisma.Decimal(signalScore),
-        riskScore: risk.riskScore,
-        signalType: 'MANUAL_PAPER',
-        strategyName: 'MANUAL_PAPER',
-        mode: 'SCANNER',
-        reasons: ['MANUAL_PAPER_BUY'],
-        metadata: { executionSource: 'MANUAL_PAPER', signalThresholdOverridden: true, requestedAmount, requestedAmountType: parsed.data.amountType, priceAtRequest: price, riskClassification: risk.classification, hardBlocked: false } as unknown as Prisma.InputJsonValue,
-      },
-    });
-    await logAuditEvent('MANUAL_PAPER_BUY_REQUESTED', userId, { tokenAddress: token.address, signalId: signal.id, riskScore: toNumber(risk.riskScore), riskClassification: risk.classification, signalScore, requestedAmount, overrideReason: 'EXPLICIT_USER_ACTION' });
-    return res.status(202).json({ ok: true, data: { status: 'PROCESSING', signalId: signal.id, tokenAddress: token.address, requestedAmount, message: 'A Paper vétel feldolgozása folyamatban.' } });
-  } catch (error) {
-    logger.error({ err: error }, 'Manual Paper buy failed');
-    return errorResponse(res, 500, 'A Paper vétel feldolgozása sikertelen');
-  }
-});
-
-/** Outcome of a manual Paper buy request, so the dashboard can tell the user what the worker decided. */
-app.get('/api/paper/orders/manual-buy/:signalId', async (req, res) => {
-  try {
-    const userId = req.user!.id;
-    const signal = await prisma.signal.findFirst({ where: { id: req.params.signalId, userId, signalType: 'MANUAL_PAPER' } });
-    if (!signal) return errorResponse(res, 404, 'A kérés nem található');
-
-    const order = await prisma.paperOrder.findFirst({ where: { userId, signalId: signal.id } });
-    if (order) {
-      const position = await prisma.position.findFirst({ where: { userId, signalId: signal.id } });
-      const signalMeta = signal.metadata && typeof signal.metadata === 'object' && !Array.isArray(signal.metadata) ? signal.metadata as Record<string, unknown> : {};
-      const orderMeta = order.metadata && typeof order.metadata === 'object' && !Array.isArray(order.metadata) ? order.metadata as Record<string, unknown> : {};
-      const finalDecision = orderMeta.finalDecision && typeof orderMeta.finalDecision === 'object' ? orderMeta.finalDecision as Record<string, unknown> : {};
-      return res.json({ ok: true, data: {
-        status: 'EXECUTED',
-        orderId: order.id,
-        positionId: position?.id ?? null,
-        positionStatus: position?.status ?? null,
-        exitReason: position?.exitReason ?? null,
-        notionalUsd: toNumber(order.filledNotionalUsd),
-        feeUsd: toNumber(order.feeUsd),
-        priceUsd: toNumber(order.executionPriceUsd),
-        requestedAmount: typeof signalMeta.requestedAmount === 'number' ? signalMeta.requestedAmount : null,
-        positionMultiplier: typeof finalDecision.positionMultiplier === 'number' ? finalDecision.positionMultiplier : null,
-        riskClassification: typeof finalDecision.riskClassification === 'string' ? finalDecision.riskClassification : null,
-      } });
-    }
-    const decision = await prisma.auditLog.findFirst({ where: { userId, details: { path: ['signalId'], equals: signal.id } }, orderBy: { createdAt: 'desc' } });
-    if (decision && (decision.action === 'TRADE_REJECTED' || decision.action === 'HARD_BLOCK_TRIGGERED')) {
-      const details = decision.details && typeof decision.details === 'object' && !Array.isArray(decision.details) ? decision.details as Record<string, unknown> : {};
-      const reasons = Array.isArray(details.decisionReasons) ? details.decisionReasons.filter((reason): reason is string => typeof reason === 'string') : [];
-      return res.json({ ok: true, data: { status: decision.action === 'HARD_BLOCK_TRIGGERED' ? 'BLOCKED' : 'REJECTED', reasons } });
-    }
-    // The worker only picks up requests while the bot is RUNNING and within its signal look-back window.
-    const expired = Date.now() - signal.createdAt.getTime() > 3 * 60_000;
-    return res.json({ ok: true, data: { status: expired ? 'EXPIRED' : 'PROCESSING', reasons: [] } });
-  } catch (error) {
-    logger.error({ err: error }, 'Failed to read manual Paper buy status');
-    return errorResponse(res, 500, 'A kérés állapota nem kérdezhető le');
   }
 });
 

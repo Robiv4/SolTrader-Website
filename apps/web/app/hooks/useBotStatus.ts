@@ -39,13 +39,5 @@ export function useBotStatus() {
     await mutate();
   }
 
-  async function toggleStrategy(strategyName: string, isEnabled: boolean) {
-    await apiRequest(`/api/bot/strategies/${encodeURIComponent(strategyName)}/toggle`, {
-      method: 'POST',
-      body: JSON.stringify({ isEnabled }),
-    });
-    await mutate();
-  }
-
-  return { ...result, botState: result.data?.data.botState ?? null, activeStrategies: result.data?.data.activeStrategies ?? [], command, toggleStrategy };
+  return { ...result, botState: result.data?.data.botState ?? null, activeStrategies: result.data?.data.activeStrategies ?? [], command };
 }

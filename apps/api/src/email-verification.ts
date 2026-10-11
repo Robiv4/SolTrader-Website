@@ -35,6 +35,8 @@ const ACTION_LABELS: Record<string, string> = {
   live_enable: 'LIVE kereskedés engedélyezése',
   emergency_stop_clear: 'vészleállítás feloldása',
   ml_model_status: 'ML modell státuszának módosítása',
+  ml_paper_approve: 'ML modell jóváhagyása PAPER kereskedésre',
+  ml_paper_enable: 'ML PAPER stratégia bekapcsolása / modellváltás',
 };
 
 /** Enabled unless EMAIL_VERIFICATION_ENABLED=false (read per call; off by default only inside the test runner). */

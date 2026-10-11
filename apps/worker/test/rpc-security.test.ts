@@ -1,13 +1,11 @@
 /**
  * Security UNKNOWN must never become SAFE (tests 68 / 69 / 35): RPC failure -> UNKNOWN -> WATCH / no automatic entry.
  */
-import { RPC_PRIORITY, SolanaRpcManager, type RpcTransport } from '@soltrader/blockchain';
+import { RPC_PRIORITY, RpcAllProvidersFailedError, SolanaRpcManager, type RpcTransport } from '@soltrader/blockchain';
 import { assessRisk, DEFAULT_RISK_THRESHOLDS } from '@soltrader/risk-engine';
 import { DEFAULT_NEW_LAUNCH_SETTINGS, evaluateNewLaunch, type LaunchSecurity } from '@soltrader/strategy-engine';
 import { buildTokenCandidate } from '@soltrader/token-discovery';
 import { describe, expect, it } from 'vitest';
-
-import { TokenScanner } from '../src/token-scanner.js';
 
 const MINT = 'MintSec1111111111111111111111111111111111';
 const snapshot = {
@@ -23,21 +21,14 @@ function manager(behaviour: (method: string) => { status: number; body: unknown 
   };
   return new SolanaRpcManager({ providers: [{ role: 'primary', url: 'https://p.test' }, { role: 'fallback', url: 'https://f.test' }], transport, batchingEnabled: false });
 }
-const scannerWith = (rpc: SolanaRpcManager) => new TokenScanner({
-  prisma: {} as never, provider: {} as never, cache: {} as never, repository: {} as never, registry: {} as never,
-  logger: { info: () => undefined, warn: () => undefined, error: () => undefined }, cacheTtlSeconds: 30, staleAfterMs: 120_000, discoveryLimit: 1, rpc,
-});
-type Enrich = (address: string, correlationId: string) => Promise<{ mintInfo?: unknown; holders?: unknown; onchain: { status: string; authority: string; holders: string; quality: string; errors: string[] } }>;
-const enrich = (scanner: TokenScanner): Enrich => (scanner as unknown as { enrichOnChainData: Enrich }).enrichOnChainData.bind(scanner);
+const securityRead = { caller: 'Test', priority: RPC_PRIORITY.SECURITY, batchable: false } as const;
 const mintAccount = { context: { slot: 1 }, value: { data: { program: 'spl-token', parsed: { info: { decimals: 6, supply: '1000000000', mintAuthority: null, freezeAuthority: null } } } } };
 
 describe('RPC security data: UNKNOWN never becomes SAFE', () => {
-  it('68. all providers fail -> UNAVAILABLE, authorities UNKNOWN, no ACCEPT (WATCH + infrastructure block)', async () => {
+  it('68. all providers fail -> authorities UNKNOWN, no ACCEPT (WATCH + infrastructure block)', async () => {
     const rpc = manager(() => ({ status: 503, body: 'down' }));
-    const result = await enrich(scannerWith(rpc))(MINT, 'c1');
-    expect(result.onchain).toMatchObject({ status: 'UNAVAILABLE', authority: 'UNKNOWN', holders: 'UNKNOWN', quality: 'INSUFFICIENT' });
-    expect(result.mintInfo).toBeUndefined();
-    expect(rpc.totals.securityDataUnavailable).toBe(1);
+    await expect(rpc.getMintAccount(MINT, securityRead)).rejects.toBeInstanceOf(RpcAllProvidersFailedError);
+    await expect(rpc.getTokenLargestAccounts(MINT, securityRead, 10)).rejects.toBeInstanceOf(RpcAllProvidersFailedError);
 
     const candidate = buildTokenCandidate({ snapshot, authorityStatusKnown: false, holderDataAvailable: false });
     // Even with otherwise excellent market data and an EXPLORATORY-friendly risk score, no automatic entry.
@@ -51,14 +42,14 @@ describe('RPC security data: UNKNOWN never becomes SAFE', () => {
     expect(assessment.factors.mintAuthorityRisk).toBe(100);
   });
 
-  it('69. partial: mint info succeeds, holders fail -> mint data kept, holders UNKNOWN, PARTIAL / MEDIUM', async () => {
+  it('69. partial: mint info succeeds, holders fail -> mint data kept, holders UNKNOWN', async () => {
     const rpc = manager((method) => (method === 'getTokenLargestAccounts'
       ? { status: 429, body: { jsonrpc: '2.0', error: { code: 429, message: 'Too many requests for a specific RPC call' } } }
       : { status: 200, body: { jsonrpc: '2.0', result: mintAccount } }));
-    const result = await enrich(scannerWith(rpc))(MINT, 'c2');
-    expect(result.onchain).toMatchObject({ status: 'PARTIAL', authority: 'AVAILABLE', holders: 'UNKNOWN', quality: 'MEDIUM' });
-    expect(result.mintInfo).toMatchObject({ mintAuthority: null, freezeAuthority: null });
-    const candidate = buildTokenCandidate({ snapshot, mintInfo: result.mintInfo as never, authorityStatusKnown: true, holderDataAvailable: false });
+    const mintInfo = await rpc.getMintAccount(MINT, securityRead);
+    expect(mintInfo).toMatchObject({ mintAuthority: null, freezeAuthority: null });
+    await expect(rpc.getTokenLargestAccounts(MINT, securityRead, 10)).rejects.toThrow();
+    const candidate = buildTokenCandidate({ snapshot, mintInfo: mintInfo as never, authorityStatusKnown: true, holderDataAvailable: false });
     const assessment = assessRisk(candidate, { thresholds: DEFAULT_RISK_THRESHOLDS });
     expect(candidate.authority).toMatchObject({ mintAuthorityRevoked: true, freezeAuthorityRevoked: true });
     expect(assessment.warnings).toContain('HOLDER_DATA_UNAVAILABLE');

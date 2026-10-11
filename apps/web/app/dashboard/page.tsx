@@ -73,7 +73,7 @@ export default function DashboardPage() {
   const snapshot = portfolio.data?.data ?? {};
   const analyticsData = analytics.data?.data;
   const mode = settings.data?.data?.tradingMode;
-  const enabledStrategies = Object.entries(settings.data?.data?.strategies ?? {}).filter(([, value]: [string, any]) => value?.isEnabled).map(([name]) => name);
+  const newLaunch = settings.data?.data?.newLaunch as { enabled: boolean; configVersion: string } | undefined;
   const positionRows = (positions.data?.data ?? []).filter((row: any) => row.status === 'OPEN');
   const tradeRows = trades.data?.data ?? [];
   const signalRows = signals.data?.data ?? [];
@@ -124,7 +124,7 @@ export default function DashboardPage() {
       <DashCard title="Bot összefoglaló" description="A kereskedő bot jelenlegi állapota">
         <dl className="dash-stat-list">
           <div><dt>Állapot</dt><dd><BotStatusBadge status={bot.botState?.status} /></dd></div>
-          <div><dt>Aktív stratégiák</dt><dd>{enabledStrategies.length ? enabledStrategies.join(', ') : <Link className="table-link" href="/settings#strategies">Nincs – bekapcsolás</Link>}</dd></div>
+          <div><dt>New Launch figyelés</dt><dd>{newLaunch?.enabled ? `Bekapcsolva · ${newLaunch.configVersion}` : <Link className="table-link" href="/settings#new-launch">Kikapcsolva – bekapcsolás</Link>}</dd></div>
           <div><dt>Szabad egyenleg</dt><dd>{fmt(snapshot.cash ?? paper.cashBalance)} USDC</dd></div>
           <div><dt>Kitettség</dt><dd>{fmt(snapshot.exposure)}%</dd></div>
           <div><dt>Visszaesés</dt><dd>{fmt(snapshot.drawdown)}%</dd></div>
@@ -151,7 +151,7 @@ export default function DashboardPage() {
     <section className="dash-grid-2">
       <DashCard title="Nyitott pozíciók" description="Kattints egy sorra a részletekért" action={<Link className="card-link" href="/positions">Összes <ArrowRight size={15} aria-hidden="true" /></Link>}>
         {positionRows.length === 0
-          ? <EmptyState message="Nincs nyitott pozíció. A Tokenfigyelőben nyithatsz Paper vételt." />
+          ? <EmptyState message="Nincs nyitott pozíció. A New Launch modul a feltételeknek megfelelő friss tokenekre nyit PAPER pozíciót." />
           : <DataTable headers={['Token', 'Belépés → most', 'Érték', 'P&L']}>{positionRows.slice(0, 6).map((row: any) => {
             const value = (numeric(row.quantity) ?? 0) * (numeric(row.currentPrice) ?? numeric(row.avgEntryPrice) ?? 0);
             return <tr key={row.id} className="clickable-row" onClick={() => router.push(`/positions/${row.id}`)}>

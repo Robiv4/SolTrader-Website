@@ -76,9 +76,10 @@ async function dataset() {
       include: { outcome: { select: { status: true, result: true } } },
       orderBy: [{ snapshotAt: 'asc' }, { id: 'asc' }],
     });
-    // Realised PAPER P&L of candidates that were actually bought (joined by mint, position opened after the snapshot).
-    const mints = [...new Set(snapshots.filter((row) => row.decision === 'BUY').map((row) => row.mint))];
-    const trades = mints.length ? await prisma.trade.findMany({ where: { tokenAddress: { in: mints }, decisionSource: 'NEW_LAUNCH', status: 'CLOSED' }, select: { tokenAddress: true, netPnl: true, entryAt: true } }) : [];
+    // Realised PAPER P&L of candidates that were actually bought by EITHER strategy (DEFAULT or ML; joined by mint,
+    // trade opened after the snapshot). Provenance only: never a feature; skipped candidates get no P&L.
+    const mints = [...new Set(snapshots.map((row) => row.mint))];
+    const trades = mints.length ? await prisma.trade.findMany({ where: { tokenAddress: { in: mints }, decisionSource: 'NEW_LAUNCH', status: 'CLOSED' }, select: { tokenAddress: true, netPnl: true, entryAt: true, exitAt: true, entryStrategy: true } }) : [];
     const rows: MlDatasetSourceRow[] = snapshots.map((row) => {
       const trade = trades.filter((item) => item.tokenAddress === row.mint && item.entryAt && item.entryAt.getTime() >= row.snapshotAt.getTime() - 60_000).sort((a, b) => a.entryAt!.getTime() - b.entryAt!.getTime())[0];
       const outcome = row.outcome && row.outcome.status !== 'TRACKING' ? row.outcome.result as unknown as CandidateOutcomeResult : null;
@@ -86,6 +87,7 @@ async function dataset() {
         snapshotId: row.id, candidateId: row.candidateId, mint: row.mint, source: row.source, kind: row.kind, snapshotAt: row.snapshotAt.getTime(), featureVersion: row.featureVersion,
         features: row.features as MlFeatures, validForTraining: row.validForTraining, invalidReasons: row.invalidReasons as string[], dataQuality: row.dataQuality,
         decision: row.decision, outcome, paperNetPnl: trade?.netPnl !== undefined && trade.netPnl !== null ? Number(trade.netPnl) : null,
+        paperExitAt: trade?.exitAt ? trade.exitAt.getTime() : null, paperEntryStrategy: trade ? trade.entryStrategy ?? 'DEFAULT' : null,
       };
     });
     const existing = await prisma.mlDatasetVersion.count();
@@ -149,21 +151,57 @@ async function train() {
   }
 }
 
+/** Redis target without credentials (host:port/db only). */
+function maskedRedis(url: string | undefined) {
+  try {
+    const parsed = new URL(url ?? '');
+    return `${parsed.protocol}//${parsed.hostname}:${parsed.port || '6379'}${parsed.pathname && parsed.pathname !== '/' ? parsed.pathname : ''}`;
+  } catch {
+    return 'invalid REDIS_URL';
+  }
+}
+
 async function status() {
   const prisma = new PrismaClient();
-  const redis = createClient({ url: process.env.REDIS_URL });
+  // Same connection settings as the worker (REDIS_URL + REDIS_PASSWORD).
+  const redis = createClient({ url: process.env.REDIS_URL, ...(process.env.REDIS_PASSWORD ? { password: process.env.REDIS_PASSWORD } : {}), socket: { connectTimeout: 5_000, reconnectStrategy: false } });
+  redis.on('error', () => undefined);
+  let redisError: string | null = null;
+  const keys: Record<string, { present: boolean; ttlSeconds: number | null }> = {};
+  let health: unknown = null;
   try {
-    await redis.connect().catch(() => undefined);
-    const health = redis.isOpen ? await redis.get('ml:health').catch(() => null) : null;
-    const [snapshots, outcomes, datasets, models] = await Promise.all([
+    try {
+      await redis.connect();
+      for (const key of ['ml:health', 'worker:heartbeat']) {
+        const value = await redis.get(key);
+        keys[key] = { present: value !== null, ttlSeconds: value !== null ? await redis.ttl(key) : null };
+        if (key === 'ml:health' && value) health = JSON.parse(value);
+      }
+    } catch (error) {
+      redisError = error instanceof Error ? error.message.slice(0, 200) : String(error);
+    }
+    const [snapshots, outcomes, datasets, models, lastSnapshot, lastOutcomeUpdate] = await Promise.all([
       prisma.mlFeatureSnapshot.groupBy({ by: ['kind'], _count: { _all: true } }),
       prisma.mlCandidateOutcome.groupBy({ by: ['status'], _count: { _all: true } }),
       prisma.mlDatasetVersion.findMany({ select: { version: true, rowCount: true, createdAt: true }, orderBy: { createdAt: 'desc' }, take: 5 }),
       prisma.mlModelVersion.findMany({ select: { version: true, algorithm: true, status: true, readiness: true }, orderBy: { createdAt: 'desc' }, take: 10 }),
+      prisma.mlFeatureSnapshot.findFirst({ orderBy: { createdAt: 'desc' }, select: { createdAt: true } }),
+      prisma.mlCandidateOutcome.findFirst({ orderBy: { updatedAt: 'desc' }, select: { updatedAt: true } }),
     ]);
-    console.log(JSON.stringify({ worker: health ? JSON.parse(health) : 'no ml:health (worker not running?)', snapshots, outcomes, datasets, models }, null, 2));
+    const ageSeconds = (date: Date | null | undefined) => (date ? Math.round((Date.now() - date.getTime()) / 1000) : null);
+    const worker = health ?? (redisError
+      ? `Redis unreachable from this shell (${maskedRedis(process.env.REDIS_URL)}): ${redisError}. The worker may still be running - see collection.lastSnapshotAgeSeconds.`
+      : keys['worker:heartbeat']?.present
+        ? 'worker heartbeat present but no ml:health (ML_MODE=OFF or an old worker build)'
+        : `no worker:heartbeat / ml:health in ${maskedRedis(process.env.REDIS_URL)} (worker not running, or it uses a different Redis than this shell)`);
+    console.log(JSON.stringify({
+      redis: { target: maskedRedis(process.env.REDIS_URL), error: redisError, keys },
+      worker,
+      collection: { lastSnapshotAgeSeconds: ageSeconds(lastSnapshot?.createdAt), lastOutcomeUpdateAgeSeconds: ageSeconds(lastOutcomeUpdate?.updatedAt) },
+      snapshots, outcomes, datasets, models,
+    }, null, 2));
   } finally {
-    if (redis.isOpen) await redis.quit();
+    if (redis.isOpen) await redis.quit().catch(() => undefined);
     await prisma.$disconnect();
   }
 }

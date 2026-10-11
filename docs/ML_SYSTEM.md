@@ -208,8 +208,8 @@ BUY candidates. It is used only by the trading simulation and is never a feature
 
 ## Shadow predictor and promotion
 
-- Statuses: `TRAINED`, `VALIDATED`, `SHADOW` and `RETIRED`. `PAPER_APPROVED` and `PAPER_ACTIVE` exist but are refused
-  in this release.
+- Statuses: `TRAINED`, `VALIDATED`, `SHADOW` and `RETIRED`. PAPER use is a separate, revocable approval
+  (`paperApproved`), see "ML PAPER strategy" below; the `PAPER_*` status values are not used.
 - Status changes are admin-only on the Machine Learning page, confirmed with an e-mail code and audited. Only one
   model can be SHADOW at a time. There is no automatic promotion and no automatic retraining.
 - The worker loads the SHADOW model every 5 minutes:
@@ -220,6 +220,49 @@ BUY candidates. It is used only by the trading simulation and is never a feature
   Any failure makes ML `UNAVAILABLE`; trading is unchanged.
 - Predictions are stored as `MlPrediction` rows: probability, calibrated flag, `mlEntryScore` 0–100, `ML_BUY` /
   `ML_SKIP`, data quality, latency, and the top contributions for logistic models.
+
+## ML PAPER strategy (selectable, PAPER only)
+
+A user can select which strategy makes New Launch PAPER entries: **DEFAULT** (rule-based, the default) or **ML** (an
+admin-approved model). LIVE is unreachable from this feature: ML entries go through the PAPER execution engine only,
+`POST /api/safety/live/enable` is refused while ML is selected, and ML cannot be selected unless the account and the
+server run in PAPER.
+
+**Approval (`POST /api/ml/models/:version/paper-approval`, admin + e-mail code).** `SHADOW_READY` alone grants nothing.
+Required: status VALIDATED or SHADOW, readiness SHADOW_READY, current feature version, the model has run in SHADOW and
+has at least 100 stored shadow predictions, its dataset snapshot kind is a supported prediction point, and the artifact
+sha256 matches. `DELETE` revokes (admin); RETIRED also revokes. Approval never switches anybody to ML.
+
+**Selection (`PUT /api/settings/ml-paper`).** Enabling ML or changing the model: administrator + e-mail code, approved
+model, PAPER mode. Threshold 0.50-0.90, decision window 2-30 s. Back to DEFAULT: always allowed for the owner.
+
+**Timing.** The model decides exactly once per user and candidate, at the snapshot point it was trained on (e.g.
+AGE_30S = detection + 30 s, tolerance 10 s), from the features known at that moment (same builder as the SHADOW
+collection). A candidate seen after the point is skipped, never decided late; a decision is never re-made with later
+data. An ML BUY can only be executed after the decision, inside the window, once every mandatory safety check is green.
+
+**Safety.** The model replaces only the strategic reasons (score / activity thresholds, exhaustion). Mandatory in ML
+mode: security hard blocks, sellability (honeypot), authorities, critical extensions, creator selling, liquidity
+minimum / maximum / critical drop, price impact, risk score and classification, launch window, quality gate and social
+ENFORCE filters; then the PAPER engine's position size, open positions, exposure, daily loss, emergency stop and exit
+capacity. Exits use the common exit engine (SL / TP / trailing) and never depend on the model.
+
+**Fail-closed.** Missing / revoked / retired model, hash or version mismatch, missing feature, leakage, failed or invalid
+inference, an unwritable decision row: `ML_ERROR`, no entry, and no automatic fallback to the rule-based strategy.
+
+**Exactly one strategy buys.** In ML mode the rule-based BUY creates no signal (its decision is still logged for
+comparison); at execution the signal's strategy (and for ML the selected, approved model) must still be active.
+
+**Audit (`MlPaperDecision`, one row per user and candidate).** Model / feature version, snapshot kind and time, the exact
+features + hash, probability, threshold, ML_BUY / ML_SKIP / ML_ERROR, the rule-based decision, safety blockers and the
+execution result (SIGNALED, EXECUTED, EXECUTION_REJECTED, SAFETY_BLOCKED, EXPIRED). Trades and positions store
+`entryStrategy` (DEFAULT | ML), trades also `mlModelVersion` and `mlPaperDecisionId`; existing New Launch trades were
+migrated to DEFAULT. A later model or strategy change never rewrites them.
+
+**Training data (task 12).** SHADOW collection runs for every candidate in both modes. Datasets join the real PAPER
+result of candidates bought by either strategy (provenance only, never a feature). `paperNetPositive` is a separate
+research target from real closed PAPER trades only (`selectionBiased: true`, label end = trade exit); skipped candidates
+never get an invented P&L. New models are never activated automatically.
 
 ## Analytics (/machine-learning)
 

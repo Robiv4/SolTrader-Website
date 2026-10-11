@@ -145,6 +145,7 @@ model User {
   aiConfig AiConfig?
   aiAnalyses AiAnalysis[]
   newLaunchConfig NewLaunchConfig?
+  mlPaperSettings MlPaperSettings?
   launchDecisions LaunchDecision[]
   newLaunchConfigVersions NewLaunchConfigVersion[]
   newLaunchOptimizationRuns NewLaunchOptimizationRun[]
@@ -321,6 +322,7 @@ model BotConfig {
   tradingMode           TradingMode @default(PAPER)
   isLiveEnabled         Boolean     @default(false)
   liveApprovalCompleted Boolean     @default(false)
+  /// Legacy (retired token scanner): no longer read or written by the app; kept for history / rollback.
   isScannerEnabled      Boolean     @default(true)
   isPaperModeDefault    Boolean     @default(true)
   isEmergencyStop       Boolean     @default(false)
@@ -335,9 +337,9 @@ model BotConfig {
   botTradingWalletAddress String?   @db.VarChar(255)
   /// Skip a token for this user once it has stayed blocked/unbuyable this many minutes (0 = never skip).
   skipUnbuyableAfterMinutes Int     @default(0)
-  /// How long a skipped token is left out of scanning, strategy evaluation and automatic buying.
+  /// How long a skipped token is left out of automatic (New Launch) buying.
   skipUnbuyableForMinutes   Int     @default(60)
-  /// How many tokens the scanner keeps in its rotating pool / the token monitor shows (10-300).
+  /// Legacy (retired token scanner): size of its rotating pool; no longer used, kept for history.
   maxMonitoredTokens        Int     @default(50)
   createdAt             DateTime    @default(now())
   updatedAt             DateTime    @updatedAt
@@ -1010,6 +1012,8 @@ model Position {
   exitPolicy       String?
   /// NewLaunch config version in force at entry (e.g. NL-v3).
   configVersion    String?
+  /// Entry strategy that opened the position: DEFAULT | ML (New Launch only; null = older positions).
+  entryStrategy    String?
   /// Snapshotted liquidity-safety exit threshold (percent drop vs entry liquidity); null = use owner setting.
   liquidityExitPercent Decimal? @db.Decimal(6, 2)
   /// Optional time-based exit (NewLaunch max hold); null = no time limit.
@@ -1090,6 +1094,12 @@ model Trade {
   /// STRATEGY | AI | MANUAL_PAPER — which system made the entry decision.
   decisionSource      String         @default("STRATEGY")
   aiAnalysisId        String?
+  /// New Launch entry strategy that initiated the PAPER entry: DEFAULT (rule-based) | ML (approved ML model). Immutable.
+  entryStrategy       String?
+  /// ML model version that made the entry decision (entryStrategy = ML only).
+  mlModelVersion      String?
+  /// MlPaperDecision row of the entry (entryStrategy = ML only).
+  mlPaperDecisionId   String?
   entryAt             DateTime?
   exitAt              DateTime?
   mode                TradingMode    @default(PAPER)
@@ -1432,6 +1442,74 @@ model MlModelVersion {
   createdBy      String?
   trainedAt      DateTime
   createdAt      DateTime @default(now())
+  /// Separate, revocable admin approval (e-mail confirmed) for ML PAPER entries. Never set automatically; SHADOW_READY alone grants nothing.
+  paperApproved   Boolean   @default(false)
+  paperApprovedAt DateTime?
+  paperApprovedBy String?
+  paperRevokedAt  DateTime?
+  paperRevokedBy  String?
+}
+
+/// Per-user New Launch entry strategy (PAPER only). DEFAULT = rule-based strategy; ML = an admin-approved model decides entries.
+model MlPaperSettings {
+  id                    String   @id @default(cuid())
+  userId                String   @unique
+  /// DEFAULT | ML
+  strategyMode          String   @default("DEFAULT")
+  modelVersion          String?
+  /// ML BUY when the calibrated probability >= threshold (0.50 - 0.90)
+  buyThreshold          Decimal  @default(0.7) @db.Decimal(4, 3)
+  /// How long an ML BUY may wait for the mandatory safety checks before it expires (seconds)
+  decisionWindowSeconds Int      @default(10)
+  enabledAt             DateTime?
+  enabledBy             String?
+  createdAt             DateTime @default(now())
+  updatedAt             DateTime @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+/// One immutable ML PAPER entry decision per user and candidate: the exact features the model saw at the prediction point,
+/// the score / threshold, the mandatory safety checks and the actual execution result.
+model MlPaperDecision {
+  id               String    @id @default(cuid())
+  userId           String
+  candidateId      String?
+  mint             String
+  modelVersion     String
+  featureVersion   String
+  /// Snapshot kind the model was trained on (e.g. AGE_30S) and the moment the features were taken
+  snapshotKind     String
+  snapshotAt       DateTime
+  detectedAt       DateTime
+  features         Json
+  featureHash      String
+  dataQuality      Int
+  probability      Decimal?  @db.Decimal(8, 6)
+  threshold        Decimal   @db.Decimal(4, 3)
+  /// ML_BUY | ML_SKIP | ML_ERROR
+  mlDecision       String
+  errorReason      String?
+  /// Rule-based (DEFAULT) decision at the same moment, for comparison only
+  baseDecision     String?
+  baseReasons      Json?
+  safetyPassed     Boolean?
+  safetyBlockers   Json?
+  /// PENDING | SIGNALED | EXECUTED | EXECUTION_REJECTED | SAFETY_BLOCKED | EXPIRED | SKIPPED | ERROR
+  outcome          String
+  signalId         String?
+  positionId       String?
+  tradeId          String?
+  executionReason  String?
+  decidedAt        DateTime
+  resolvedAt       DateTime?
+  createdAt        DateTime  @default(now())
+  updatedAt        DateTime  @updatedAt
+
+  @@unique([userId, mint])
+  @@index([modelVersion, decidedAt])
+  @@index([userId, decidedAt])
+  @@index([outcome])
 }
 
 /// Shadow prediction (never used by trading).

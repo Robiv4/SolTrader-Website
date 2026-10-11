@@ -1,6 +1,6 @@
 'use client';
 
-import { Activity, BarChart3, BrainCircuit, Rocket, Bot, ChevronRight, Command, LayoutDashboard, List, Menu, Settings2, ShieldCheck, Users, Wallet, X, type LucideIcon } from 'lucide-react';
+import { Activity, BarChart3, BrainCircuit, Rocket, ChevronRight, LayoutDashboard, List, Menu, Settings2, ShieldCheck, Users, Wallet, X, type LucideIcon } from 'lucide-react';
 import Link from 'next/link';
 import { usePathname, useRouter } from 'next/navigation';
 import { Children, cloneElement, isValidElement, useCallback, useEffect, useLayoutEffect, useRef, useState, type ReactElement, type ReactNode } from 'react';
@@ -10,8 +10,8 @@ import { ProfileMenu, ThemeToggle } from './topbar';
 
 const navGroups: Array<{ label: string; items: Array<{ href: string; label: string; icon: LucideIcon; adminOnly?: boolean }> }> = [
   { label: hu.nav.overview, items: [{ href: 'dashboard', label: hu.nav.dashboard, icon: LayoutDashboard }, { href: 'positions', label: hu.nav.positions, icon: List }, { href: 'trades', label: hu.nav.trades, icon: Activity }] },
-  { label: hu.nav.markets, items: [{ href: 'tokens', label: hu.nav.tokens, icon: Command }, { href: 'new-launch', label: hu.nav.newLaunch, icon: Rocket }, { href: 'signals', label: hu.nav.signals, icon: Activity }] },
-  { label: hu.nav.strategies, items: [{ href: 'strategies', label: hu.nav.strategies, icon: Bot }, { href: 'analytics', label: hu.nav.analytics, icon: BarChart3 }, { href: 'machine-learning', label: 'Machine Learning', icon: BrainCircuit }] },
+  { label: hu.nav.markets, items: [{ href: 'new-launch', label: hu.nav.newLaunch, icon: Rocket }, { href: 'signals', label: hu.nav.signals, icon: Activity }] },
+  { label: hu.nav.insights, items: [{ href: 'analytics', label: hu.nav.analytics, icon: BarChart3 }, { href: 'machine-learning', label: 'Machine Learning', icon: BrainCircuit }] },
   { label: hu.nav.account, items: [{ href: 'wallet', label: hu.nav.wallet, icon: Wallet }, { href: 'settings', label: hu.nav.settings, icon: Settings2 }, { href: 'users', label: 'Felhasználók', icon: Users, adminOnly: true }] },
   { label: hu.nav.system, items: [{ href: 'system', label: hu.nav.health, icon: ShieldCheck }, { href: 'logs', label: hu.nav.logs, icon: Activity }] },
 ];
@@ -185,7 +185,7 @@ function AuthenticatedShell({ children, pathname }: { children: ReactNode; pathn
       <header className="topbar"><div className="topbar-title"><span>{title}</span></div><div className="topbar-actions"><ThemeToggle /><ProfileMenu me={me?.data ?? null} mode={mode} onSignOut={() => void signOut()} /></div></header>
       <main className="content">{children}</main>
       <StepUpDialog />
-      <nav className="mobile-bottom-nav" aria-label="Quick navigation">{[{ href: 'dashboard', label: 'Főoldal', icon: LayoutDashboard }, { href: 'positions', label: 'Pozíciók', icon: List }, { href: 'signals', label: 'Jelzések', icon: Activity }, { href: 'strategies', label: 'Stratégiák', icon: Bot }].map(({ href, label, icon: Icon }) => <Link href={`/${href}`} key={href} className={pathname.startsWith(`/${href}`) ? 'active' : ''}><Icon size={19} /><span>{label}</span></Link>)}<button type="button" onClick={() => setMenuOpen(true)}><Menu size={19} /><span>Menü</span></button></nav>
+      <nav className="mobile-bottom-nav" aria-label="Quick navigation">{[{ href: 'dashboard', label: 'Főoldal', icon: LayoutDashboard }, { href: 'positions', label: 'Pozíciók', icon: List }, { href: 'new-launch', label: 'Új tokenek', icon: Rocket }, { href: 'signals', label: 'Jelzések', icon: Activity }].map(({ href, label, icon: Icon }) => <Link href={`/${href}`} key={href} className={pathname.startsWith(`/${href}`) ? 'active' : ''}><Icon size={19} /><span>{label}</span></Link>)}<button type="button" onClick={() => setMenuOpen(true)}><Menu size={19} /><span>Menü</span></button></nav>
     </div>
   </div>;
 }

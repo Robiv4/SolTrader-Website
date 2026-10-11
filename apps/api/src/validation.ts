@@ -1,7 +1,5 @@
 import { z } from 'zod';
 
-import { containsSensitiveField } from './secret-redaction.js';
-
 export const botStatusSchema = z.object({
   status: z.enum(['STARTED', 'STOPPED', 'PAUSED', 'RESUMED', 'EMERGENCY_STOP']).optional(),
 });
@@ -14,7 +12,6 @@ export const paginationSchema = z.object({
 export const settingsSchema = z.object({
   tradingMode: z.enum(['PAPER', 'LIVE', 'SEMI_AUTO', 'SCANNER']).default('PAPER'),
   isLiveEnabled: z.boolean().default(false),
-  isScannerEnabled: z.boolean().default(true),
   isPaperModeDefault: z.boolean().default(true),
   maxPositionSize: z.number().min(0).nullable().optional(),
   maxDailyLoss: z.number().min(0).nullable().optional(),
@@ -25,10 +22,8 @@ export const settingsSchema = z.object({
   minVolumeUsd: z.number().positive().nullable().optional(),
   /** Minutes a token may stay blocked/unbuyable before it is skipped (0 = never skip). */
   skipUnbuyableAfterMinutes: z.number().int().min(0).max(1440).optional(),
-  /** Minutes a skipped token stays out of scanning and automatic buying. */
+  /** Minutes a skipped token stays out of automatic buying. */
   skipUnbuyableForMinutes: z.number().int().min(1).max(10080).optional(),
-  /** Size of the scanner's rotating token pool / tokens shown in the token monitor. */
-  maxMonitoredTokens: z.number().int().min(10).max(300).optional(),
 });
 
 export const riskSettingsSchema = z.object({
@@ -41,10 +36,6 @@ export const riskSettingsSchema = z.object({
   moderatePositionMultiplier: z.number().min(0).max(1).optional(),
   highPositionMultiplier: z.number().min(0).max(1).optional(),
   veryHighPositionMultiplier: z.number().min(0).max(1).optional(),
-  aiAnalysisEnabled: z.boolean().optional(),
-  aiRequiredForHighRisk: z.boolean().optional(),
-  aiRequiredForVeryHighRisk: z.boolean().optional(),
-  allowManualPaperWatchBuy: z.boolean().optional(),
   maxPositionPercent: z.number().min(0).max(100).nullable().optional(),
   maxTotalExposurePercent: z.number().min(0).max(100).nullable().optional(),
   maxConcurrentPositions: z.number().int().min(1).max(50).nullable().optional(),
@@ -57,17 +48,6 @@ export const riskSettingsSchema = z.object({
   trailingStopPercent: z.number().min(0).max(100).nullable().optional(),
   trailingActivationPercent: z.number().min(0).max(1000).nullable().optional(),
   breakEvenActivationPercent: z.number().min(0).max(1000).nullable().optional(),
-});
-
-const safeStrategyParamsSchema = z.record(z.unknown()).superRefine((params, context) => {
-  if (containsSensitiveField(params)) {
-    context.addIssue({ code: z.ZodIssueCode.custom, message: 'Secrets must use server-side secret management, not strategy parameters.' });
-  }
-});
-
-export const strategySettingsSchema = z.object({
-  isEnabled: z.boolean().optional(),
-  params: safeStrategyParamsSchema.optional(),
 });
 
 const walletProviderSchema = z.enum(['PHANTOM', 'SOLFLARE', 'BACKPACK', 'METAMASK', 'SOLLET', 'WALLETCONNECT', 'OTHER']);
@@ -120,55 +100,11 @@ export const signalQuerySchema = paginationSchema.extend({
 
 export const settingsUpdateSchema = settingsSchema.partial();
 export const settingsRiskUpdateSchema = riskSettingsSchema.partial();
-export const manualPaperBuySchema = z.object({
-  tokenAddress: z.string().trim().min(32).max(64),
-  requestedAmount: z.number().positive().finite().max(1_000_000),
-  amountType: z.enum(['USDC', 'EQUITY_PERCENT']).default('USDC'),
-});
-export const settingsStrategyUpdateSchema = strategySettingsSchema.partial();
 export const settingsNotificationUpdateSchema = notificationSettingsSchema.partial();
 
 export const liveEnableSchema = z.object({
   confirmLiveTrading: z.literal(true),
 });
-
-const moduleSettingsSchema = z.object({
-  enabled: z.boolean().optional(),
-  weight: z.number().min(0).max(10).optional(),
-  minScore: z.number().min(0).max(100).optional(),
-}).catchall(z.union([z.number().min(0).max(1_000_000), z.boolean()]));
-
-/** Advanced strategy / composite signal settings (per user, stored in PostgreSQL). */
-export const advancedStrategySettingsSchema = z.object({
-  compositeEnabled: z.boolean().optional(),
-  minimumConfirmations: z.number().int().min(1).max(8).optional(),
-  minimumCompositeScore: z.number().int().min(0).max(100).optional(),
-  penalizeUnavailable: z.boolean().optional(),
-  exhaustionEnabled: z.boolean().optional(),
-  exhaustionWarningThreshold: z.number().int().min(0).max(100).optional(),
-  exhaustionStrongWarningThreshold: z.number().int().min(0).max(100).optional(),
-  exhaustionBlockThreshold: z.number().int().min(0).max(100).optional(),
-  exhaustionPolicy: z.enum(['BLOCK', 'WARN_ONLY']).optional(),
-  exhaustionPenaltyWeight: z.number().min(0).max(5).optional(),
-  liquidityOutflowExitEnabled: z.boolean().optional(),
-  liquidityOutflowExitPercent: z.number().min(1).max(99).optional(),
-  modules: z.record(z.enum(['Momentum', 'MomentumAcceleration', 'VolumeSpike', 'BuyPressure', 'ConfirmedBreakout', 'LiquidityInflow', 'RelativeStrength', 'PullbackContinuation', 'PumpExhaustion']), moduleSettingsSchema).optional(),
-}).refine((value) => value.exhaustionWarningThreshold === undefined || value.exhaustionBlockThreshold === undefined || value.exhaustionWarningThreshold <= value.exhaustionBlockThreshold, {
-  message: 'A figyelmeztetési küszöb nem lehet nagyobb a tiltási küszöbnél.',
-});
-
-/** Per-user AI token analysis settings (PostgreSQL). Provider credentials are never part of this. */
-export const aiSettingsSchema = z.object({
-  aiAnalysisEnabled: z.boolean().optional(),
-  aiMinimumConfidence: z.number().int().min(50).max(100).optional(),
-  aiRecheckSeconds: z.number().int().min(15).max(900).optional(),
-  aiMaxAnalysesPerMinute: z.number().int().min(1).max(120).optional(),
-  aiAllowHighRisk: z.boolean().optional(),
-  aiAllowVeryHighRisk: z.boolean().optional(),
-  aiDynamicExitSuggestionsEnabled: z.boolean().optional(),
-  aiDecisionTtlSeconds: z.number().int().min(30).max(3600).optional(),
-  aiUseExitParameters: z.boolean().optional(),
-}).strict();
 
 /** New Launch / Sniper settings (per user, PostgreSQL). System-level security rules are not settable. */
 export const newLaunchSettingsSchema = z.object({

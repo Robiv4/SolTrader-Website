@@ -27,20 +27,22 @@ describe('AI provider key stays server-side', () => {
     await prisma.user.delete({ where: { id: userId } });
   });
 
-  it('never returns the key; an unreachable provider cannot be switched on', async () => {
+  it('never returns the key from any settings / status endpoint', async () => {
     const user = await prisma.user.create({ data: { email, passwordHash: await hashPassword(password), role: 'USER' } });
     userId = user.id;
     const agent = request.agent(app);
     expect((await agent.post('/api/auth/login').send({ email, password })).status).toBe(200);
     const responses = [
-      await agent.get('/api/settings/ai'),
-      await agent.put('/api/settings/ai').send({ aiAnalysisEnabled: true }),
       await agent.get('/api/settings'),
+      await agent.get('/api/settings/risk'),
+      await agent.get('/api/settings/new-launch'),
+      await agent.get('/api/social/status'),
       await agent.get('/api/system/health'),
     ];
     for (const response of responses) expect(JSON.stringify(response.body)).not.toContain(SECRET);
-    expect(responses[0].body.data.provider).toMatchObject({ name: 'openai', model: 'test-model', status: 'UNAVAILABLE' });
-    expect(responses[1].status).toBe(409);
+    // The retired AI trader settings endpoint is gone (no AI entry mode can be switched on).
+    expect((await agent.get('/api/settings/ai')).status).toBe(404);
+    expect((await agent.put('/api/settings/ai').send({ aiAnalysisEnabled: true })).status).toBe(404);
     const audits = await prisma.auditLog.findMany({ where: { userId } });
     expect(JSON.stringify(audits)).not.toContain(SECRET);
     expect(JSON.stringify(await prisma.aiConfig.findMany({ where: { userId } }))).not.toContain(SECRET);

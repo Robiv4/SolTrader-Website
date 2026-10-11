@@ -1,5 +1,4 @@
 import { Prisma, type PrismaClient } from '@prisma/client';
-import { applyAiPositionMultiplier, automaticEntryDecisionSource } from '@soltrader/ai-engine';
 import type { TokenDataProvider } from '@soltrader/market-data';
 import {
   classifyRiskScore,
@@ -25,7 +24,6 @@ import {
   simulatedBuyFill,
 } from '@soltrader/trading-engine';
 
-import { loadAiSettings } from './ai-analysis-service.js';
 import { assessEntryCapacity } from './exit/entry-capacity.js';
 import { resolveNewLaunchSettings } from './launch/settings.js';
 import type { TradingLoopLogger } from './trading-loop.js';
@@ -64,9 +62,15 @@ interface ActiveUser {
     aiRequiredForVeryHighRisk: boolean;
   } | null;
   tradingMode: string;
-  /** Token scanner switch: when off, only NewLaunch and manual PAPER signals are executed for this user. */
-  scannerEnabled: boolean;
 }
+
+export type ExecutionDecisionSource = 'STRATEGY' | 'AI' | 'MANUAL_PAPER' | 'NEW_LAUNCH';
+
+/**
+ * Signal sources executed automatically. Only New Launch produces entries since the legacy token scanner,
+ * strategy runner, AI trader and manual token-list buy were retired; older signals of other sources are ignored.
+ */
+export const DEFAULT_AUTOMATIC_SOURCES: ReadonlyArray<ExecutionDecisionSource> = ['NEW_LAUNCH'];
 
 interface AbortSignalLike {
   readonly aborted: boolean;
@@ -98,11 +102,15 @@ interface CandidateSignal {
   primaryStrategy: string | null;
   exhaustionBlocked: boolean;
   criticalLiquidityOutflow: boolean;
-  /** Which system made the entry decision: STRATEGY, AI or MANUAL_PAPER. */
-  decisionSource: 'STRATEGY' | 'AI' | 'MANUAL_PAPER' | 'NEW_LAUNCH';
+  /** Which system made the entry decision (only NEW_LAUNCH in production, see DEFAULT_AUTOMATIC_SOURCES). */
+  decisionSource: ExecutionDecisionSource;
   /** NewLaunch decision context (timing, scores) when decisionSource = NEW_LAUNCH. */
   launch: Record<string, unknown> | null;
   aiAnalysisId: string | null;
+  /** New Launch entry strategy that created the signal (immutable origin of the trade). */
+  entryStrategy: 'DEFAULT' | 'ML';
+  /** ML PAPER decision context (entryStrategy = ML): decisionId, modelVersion, probability, threshold, snapshot. */
+  ml: Record<string, unknown> | null;
 }
 
 export interface PaperExecutionSummary {
@@ -134,6 +142,15 @@ export interface PaperExecutionDependencies {
   /** Live launch quote (trade stream / pool) for NEW_LAUNCH entries, incl. the real price impact of the order. */
   getLaunchQuote?: (mint: string) => { priceUsd: number; liquidityUsd: number | null; timestamp: Date; impactPercentFor(usd: number): number | null; curve?: import('@soltrader/trading-engine').CurveState | null; migrated?: boolean; streaming?: boolean } | null;
   publishLaunchEvent?: (payload: Record<string, unknown>) => Promise<void>;
+  /** Signal sources that may be executed (default: NEW_LAUNCH only). */
+  automaticSources?: ReadonlyArray<ExecutionDecisionSource>;
+}
+
+function decisionSourceOf(meta: Record<string, unknown>): ExecutionDecisionSource {
+  if (meta.executionSource === 'MANUAL_PAPER') return 'MANUAL_PAPER';
+  if (meta.decisionSource === 'AI') return 'AI';
+  if (meta.decisionSource === 'NEW_LAUNCH') return 'NEW_LAUNCH';
+  return 'STRATEGY';
 }
 
 function number(value: unknown, fallback = 0) {
@@ -242,8 +259,10 @@ export class PaperExecutionCoordinator {
   private readonly maxEntriesPerCycle: number;
   private readonly approvalTtlSeconds: number;
   private readonly staleAfterMs: number;
+  private readonly automaticSources: ReadonlySet<ExecutionDecisionSource>;
 
   constructor(private readonly deps: PaperExecutionDependencies) {
+    this.automaticSources = new Set(deps.automaticSources ?? DEFAULT_AUTOMATIC_SOURCES);
     this.concurrency = deps.concurrency ?? 4;
     this.lookbackMs = deps.lookbackMs ?? 120_000;
     this.maxEntriesPerCycle = deps.maxEntriesPerCycle ?? 10;
@@ -254,7 +273,6 @@ export class PaperExecutionCoordinator {
   async runCycle(signal: AbortSignalLike): Promise<PaperExecutionSummary> {
     const summary: PaperExecutionSummary = { users: 0, candidates: 0, executed: 0, proposed: 0, rejected: 0, errors: 0 };
     const users = (await this.deps.prisma.botConfig.findMany({
-      // The token-scanner switch only gates scanner (Strategy / AI) entries; NewLaunch and manual PAPER entries are separate.
       where: { status: 'RUNNING', tradingMode: { in: ['PAPER', 'SEMI_AUTO'] }, isEmergencyStop: false },
       include: { user: { include: { riskConfigs: true } } },
     })).map((config) => ({
@@ -262,7 +280,6 @@ export class PaperExecutionCoordinator {
       bot: { maxPositionSize: config.maxPositionSize, maxDailyLoss: config.maxDailyLoss },
       risk: config.user.riskConfigs[0] ?? null,
       tradingMode: config.tradingMode,
-      scannerEnabled: config.isScannerEnabled,
     } satisfies ActiveUser));
     summary.users = users.length;
     if (users.length === 0) return summary;
@@ -283,8 +300,7 @@ export class PaperExecutionCoordinator {
     for (const signalRow of candidates) {
       if (!signalRow.userId) continue;
       const signalMeta = record(signalRow.metadata);
-      const scannerSignal = signalMeta.decisionSource !== 'NEW_LAUNCH' && signalMeta.executionSource !== 'MANUAL_PAPER';
-      if (scannerSignal && !userById.get(signalRow.userId)?.scannerEnabled) continue;
+      if (!this.automaticSources.has(decisionSourceOf(signalMeta))) continue;
       const key = `${signalRow.userId}:${signalRow.tokenId}`;
       if (latestByToken.has(key)) continue;
       latestByToken.add(key);
@@ -317,9 +333,11 @@ export class PaperExecutionCoordinator {
         primaryStrategy: typeof record(signalRow.metadata).primaryStrategy === 'string' ? record(signalRow.metadata).primaryStrategy as string : signalRow.strategyName,
         exhaustionBlocked: record(signalRow.metadata).exhaustionBlocked === true,
         criticalLiquidityOutflow: record(signalRow.metadata).criticalLiquidityOutflow === true,
-        decisionSource: record(signalRow.metadata).executionSource === 'MANUAL_PAPER' ? 'MANUAL_PAPER' : record(signalRow.metadata).decisionSource === 'AI' ? 'AI' : record(signalRow.metadata).decisionSource === 'NEW_LAUNCH' ? 'NEW_LAUNCH' : 'STRATEGY',
+        decisionSource: decisionSourceOf(signalMeta),
         launch: record(signalRow.metadata).decisionSource === 'NEW_LAUNCH' ? record(record(signalRow.metadata).launch) : null,
         aiAnalysisId: typeof record(signalRow.metadata).aiAnalysisId === 'string' ? record(signalRow.metadata).aiAnalysisId as string : null,
+        entryStrategy: signalMeta.entryStrategy === 'ML' ? 'ML' : 'DEFAULT',
+        ml: signalMeta.entryStrategy === 'ML' ? record(signalMeta.ml) : null,
       });
       if (uniqueCandidates.length >= this.maxEntriesPerCycle) break;
     }
@@ -404,11 +422,6 @@ export class PaperExecutionCoordinator {
       }
       if (!market) return 'REJECTED';
 
-      // Decision mode is re-read at execution time: exactly one system (AI or strategies) may enter automatically,
-      // so a signal created just before a mode switch can never become a second, parallel entry.
-      const aiSettings = await loadAiSettings(this.deps.prisma, candidate.userId);
-      const decisionMode = automaticEntryDecisionSource(aiSettings);
-      let aiRow: Awaited<ReturnType<PrismaClient['aiAnalysis']['findFirst']>> = null;
       // NewLaunch runs as its own PAPER experiment next to Strategy/AI mode; central limits still apply below.
       const newLaunch = candidate.decisionSource === 'NEW_LAUNCH'
         ? resolveNewLaunchSettings(this.deps.prisma.newLaunchConfig?.findUnique ? await this.deps.prisma.newLaunchConfig.findUnique({ where: { userId: candidate.userId } }) as unknown as Record<string, unknown> | null : null)
@@ -417,6 +430,16 @@ export class PaperExecutionCoordinator {
         const policy = user.risk?.riskPolicy ?? candidate.riskPolicy;
         if (!newLaunch.enabled) return this.rejectCandidate(candidate, 'NEW_LAUNCH_DISABLED', policy);
         if (user.tradingMode !== 'PAPER') return this.rejectCandidate(candidate, 'NEW_LAUNCH_PAPER_ONLY', policy);
+        // Exactly one entry strategy may buy: the signal's strategy must still be the user's active one at execution.
+        const strategy = this.deps.prisma.mlPaperSettings?.findUnique ? await this.deps.prisma.mlPaperSettings.findUnique({ where: { userId: candidate.userId } }) : null;
+        const activeStrategy = strategy?.strategyMode === 'ML' ? 'ML' : 'DEFAULT';
+        if (candidate.entryStrategy !== activeStrategy) return this.rejectCandidate(candidate, 'ENTRY_STRATEGY_NOT_ACTIVE', policy);
+        if (candidate.entryStrategy === 'ML') {
+          const version = typeof candidate.ml?.modelVersion === 'string' ? candidate.ml.modelVersion : '';
+          if (!version || strategy?.modelVersion !== version) return this.rejectCandidate(candidate, 'ML_MODEL_NOT_SELECTED', policy);
+          const model = this.deps.prisma.mlModelVersion?.findUnique ? await this.deps.prisma.mlModelVersion.findUnique({ where: { version }, select: { paperApproved: true, status: true } }) : null;
+          if (!model?.paperApproved || model.status === 'RETIRED') return this.rejectCandidate(candidate, 'ML_MODEL_NOT_PAPER_APPROVED', policy);
+        }
         if (candidate.riskScore > newLaunch.maxRiskScore) return this.rejectCandidate(candidate, 'RISK_SCORE_ABOVE_LAUNCH_MAXIMUM', policy);
         const tradedBefore = await this.deps.prisma.trade.findFirst({ where: { userId: candidate.userId, tokenId: candidate.tokenId, decisionSource: 'NEW_LAUNCH' }, select: { id: true } });
         if (tradedBefore) return this.rejectCandidate(candidate, 'NEW_LAUNCH_ALREADY_TRADED', policy);
@@ -426,17 +449,8 @@ export class PaperExecutionCoordinator {
         const gate = (candidate.launch?.qualityGate ?? null) as { blocksEntry?: boolean } | null;
         if (gate?.blocksEntry) return this.rejectCandidate(candidate, 'QUALITY_GATE_FAILED', policy);
       }
-      if (!candidate.manualPaper && !newLaunch) {
-        if (decisionMode === 'AI' && candidate.decisionSource !== 'AI') return this.rejectCandidate(candidate, 'DECISION_MODE_AI_ACTIVE', user.risk?.riskPolicy ?? candidate.riskPolicy);
-        if (decisionMode === 'STRATEGY' && candidate.decisionSource === 'AI') return this.rejectCandidate(candidate, 'DECISION_MODE_STRATEGY_ACTIVE', user.risk?.riskPolicy ?? candidate.riskPolicy);
-        if (candidate.decisionSource === 'AI') {
-          aiRow = candidate.aiAnalysisId ? await this.deps.prisma.aiAnalysis.findFirst({ where: { id: candidate.aiAnalysisId, userId: candidate.userId } }) : null;
-          if (!aiRow || aiRow.status !== 'COMPLETED' || aiRow.effectiveDecision !== 'BUY' || number(aiRow.confidence) < aiSettings.aiMinimumConfidence) {
-            return this.rejectCandidate(candidate, 'AI_ANALYSIS_NOT_ACTIONABLE', user.risk?.riskPolicy ?? candidate.riskPolicy);
-          }
-          if (aiRow.expiresAt.getTime() <= Date.now()) return this.rejectCandidate(candidate, 'AI_ANALYSIS_EXPIRED', user.risk?.riskPolicy ?? candidate.riskPolicy);
-        }
-      }
+      // The retired AI trader can never open a position (its signals are not executed either).
+      if (candidate.decisionSource === 'AI') return this.rejectCandidate(candidate, 'AI_TRADER_RETIRED', user.risk?.riskPolicy ?? candidate.riskPolicy);
       if (!candidate.manualPaper && candidate.exhaustionBlocked) return this.rejectCandidate(candidate, 'PUMP_EXHAUSTION_BLOCK', user.risk?.riskPolicy ?? candidate.riskPolicy);
       if (!candidate.manualPaper && candidate.criticalLiquidityOutflow) return this.rejectCandidate(candidate, 'LIQUIDITY_CRITICAL_OUTFLOW', user.risk?.riskPolicy ?? candidate.riskPolicy);
 
@@ -530,10 +544,7 @@ export class PaperExecutionCoordinator {
       });
       await this.recordDecision(candidate, decision, user.risk?.riskPolicy ?? candidate.riskPolicy);
       if (decision.decision !== 'APPROVED' && decision.decision !== 'APPROVED_REDUCED_SIZE') return 'REJECTED';
-      // The AI may only reduce the risk-engine size (min of risk-adjusted and normal x AI multiplier).
-      let notional = aiRow
-        ? applyAiPositionMultiplier(decision.riskAdjustedPositionSize, normalPositionSize, aiRow.recommendedPositionMultiplier === null ? null : number(aiRow.recommendedPositionMultiplier))
-        : decision.riskAdjustedPositionSize;
+      let notional = decision.riskAdjustedPositionSize;
       if (!Number.isFinite(notional) || notional <= 0) return 'REJECTED';
       if (!candidate.manualPaper && notional < MIN_AUTOMATIC_ORDER_USD) return this.rejectCandidate(candidate, 'POSITION_BELOW_MINIMUM', user.risk?.riskPolicy ?? candidate.riskPolicy);
 
@@ -566,16 +577,13 @@ export class PaperExecutionCoordinator {
       // Protection levels are derived from the actual entry FILL (position economics) with the owner's
       // current settings. The signal's recommended levels are not used: they were computed from the
       // price at signal time, which can be minutes older than the fill.
-      // AI exit suggestions (already bounded by the output schema) are used only when the user opted in.
-      const useAiExits = Boolean(aiRow && aiSettings.aiUseExitParameters);
-      const aiExit = (value: Prisma.Decimal | null | undefined) => (useAiExits && value !== null && value !== undefined ? number(value) : null);
-      // NEW_LAUNCH -> NewLaunch exit strategy; STRATEGY / MANUAL -> global settings; AI -> AI suggestions if opted in.
+      // NEW_LAUNCH -> NewLaunch exit strategy; other (legacy / test) sources -> global settings.
       const launchExit = newLaunch ? newLaunchExitConfig(newLaunch) : null;
-      const stopLossPercent = launchExit ? launchExit.stopLossPercent : aiExit(aiRow?.suggestedStopLossPercent) ?? number(user.risk?.stopLossPercent, 0);
-      const takeProfitPercent = launchExit ? launchExit.takeProfitPercent : aiExit(aiRow?.suggestedTakeProfitPercent) ?? number(user.risk?.takeProfitPercent, 0);
+      const stopLossPercent = launchExit ? launchExit.stopLossPercent : number(user.risk?.stopLossPercent, 0);
+      const takeProfitPercent = launchExit ? launchExit.takeProfitPercent : number(user.risk?.takeProfitPercent, 0);
       const { stopLossPrice, takeProfitPrice } = protectionLevels(executionPrice, stopLossPercent, takeProfitPercent);
-      const trailingDistancePercent = launchExit ? launchExit.trailingDistancePercent ?? 0 : aiExit(aiRow?.suggestedTrailingDistancePercent) ?? number(user.risk?.trailingStopPercent, 0);
-      const trailingActivationPercent = launchExit ? launchExit.trailingActivationPercent ?? 0 : aiExit(aiRow?.suggestedTrailingActivationPercent) ?? number(user.risk?.trailingActivationPercent, 0);
+      const trailingDistancePercent = launchExit ? launchExit.trailingDistancePercent ?? 0 : number(user.risk?.trailingStopPercent, 0);
+      const trailingActivationPercent = launchExit ? launchExit.trailingActivationPercent ?? 0 : number(user.risk?.trailingActivationPercent, 0);
       const trailingStopFraction = trailingDistancePercent > 0 ? Math.min(0.9999, trailingDistancePercent / 100) : null;
       const trailingActivationFraction = trailingActivationPercent > 0 ? trailingActivationPercent / 100 : null;
       const breakEvenPercent = launchExit ? launchExit.breakEvenActivationPercent ?? 0 : number(user.risk?.breakEvenActivationPercent, 0);
@@ -629,6 +637,8 @@ export class PaperExecutionCoordinator {
         signalContext: await this.signalContext(candidate),
         launch: candidate.launch ? { ...candidate.launch, orderCreatedAt: now.toISOString(), fillAt: now.toISOString(), requestedEntryPrice: price, simulatedFillPrice: executionPrice, fillSlippagePercent: slippagePercent, quoteAt: launchQuote?.timestamp.toISOString() ?? null, exitCapacity: exitCapacitySnapshot } : null,
         decisionSource: candidate.decisionSource,
+        entryStrategy: newLaunch ? candidate.entryStrategy : null,
+        ml: candidate.ml,
         newLaunch: newLaunch && launchExit ? {
           configVersion: newLaunch.configVersion,
           entryConfig: newLaunchEntryConfig(newLaunch),
@@ -637,18 +647,7 @@ export class PaperExecutionCoordinator {
           qualityGateVersion: newLaunch.qualityGate.version,
           liquidityAtEntry: liquidity > 0 ? liquidity : null,
         } : null,
-        ai: aiRow ? {
-          aiAnalysisId: aiRow.id,
-          provider: aiRow.provider,
-          model: aiRow.model,
-          promptVersion: aiRow.promptVersion,
-          rawDecision: aiRow.rawDecision,
-          effectiveDecision: aiRow.effectiveDecision,
-          confidence: number(aiRow.confidence),
-          recommendedPositionMultiplier: aiRow.recommendedPositionMultiplier === null ? null : number(aiRow.recommendedPositionMultiplier),
-          minimumConfidence: aiSettings.aiMinimumConfidence,
-          usedExitParameters: useAiExits,
-        } : null,
+        ai: null,
       };
       // Last check right before the order: an emergency stop issued meanwhile blocks every new entry.
       const botNow = this.deps.prisma.botConfig.findUnique ? await this.deps.prisma.botConfig.findUnique({ where: { userId: candidate.userId }, select: { isEmergencyStop: true, status: true } }) : null;
@@ -710,6 +709,7 @@ export class PaperExecutionCoordinator {
             exitPolicy: launchExit ? 'NEW_LAUNCH' : null,
             breakEvenCostBuffer: launchExit?.breakEvenCostBufferPercent != null ? new Prisma.Decimal(launchExit.breakEvenCostBufferPercent / 100) : null,
             configVersion: newLaunch?.configVersion ?? null,
+            entryStrategy: newLaunch ? candidate.entryStrategy : null,
             liquidityExitPercent: launchExit?.liquidityDropExitPercent != null ? new Prisma.Decimal(launchExit.liquidityDropExitPercent) : null,
             maxHoldUntil: launchExit?.maxHoldMinutes ? new Date(now.getTime() + launchExit.maxHoldMinutes * 60_000) : null,
             highestPrice: new Prisma.Decimal(price),
@@ -719,20 +719,21 @@ export class PaperExecutionCoordinator {
             mode: 'PAPER',
           },
         });
-        const trade = await transaction.trade.create({ data: { userId: candidate.userId, tokenId: candidate.tokenId, strategyId: null, signalId: candidate.id, positionId: position.id, side: 'BUY', tokenAddress: candidate.tokenAddress, symbol: candidate.symbol, strategyName: candidate.strategyName, signalScore: new Prisma.Decimal(candidate.score), riskScore: new Prisma.Decimal(candidate.riskScore), riskClassification: candidate.riskClassification, riskPolicy: user.risk?.riskPolicy ?? candidate.riskPolicy, aiConfirmed: Boolean(aiRow), aiOpportunityScore: aiRow?.entryQuality ?? null, aiConfidence: aiRow?.confidence ?? null, entry: new Prisma.Decimal(executionPrice), size: new Prisma.Decimal(notional), quantity: new Prisma.Decimal(quantity), fees: new Prisma.Decimal(fee), slippage: new Prisma.Decimal(entrySlippage), entryMarketPrice: new Prisma.Decimal(price), stopLoss: stopLossPrice !== null ? new Prisma.Decimal(stopLossPrice) : null, takeProfit: takeProfitPrice !== null ? new Prisma.Decimal(takeProfitPrice) : null, trailingStop: trailingStopFraction !== null ? new Prisma.Decimal(trailingStopFraction) : null, configSnapshot: configSnapshot as unknown as Prisma.InputJsonValue, decisionSource: candidate.decisionSource, aiAnalysisId: aiRow?.id ?? null, entryAt: now, mode: 'PAPER', status: 'OPEN' } });
+        const trade = await transaction.trade.create({ data: { userId: candidate.userId, tokenId: candidate.tokenId, strategyId: null, signalId: candidate.id, positionId: position.id, side: 'BUY', tokenAddress: candidate.tokenAddress, symbol: candidate.symbol, strategyName: candidate.strategyName, signalScore: new Prisma.Decimal(candidate.score), riskScore: new Prisma.Decimal(candidate.riskScore), riskClassification: candidate.riskClassification, riskPolicy: user.risk?.riskPolicy ?? candidate.riskPolicy, aiConfirmed: false, aiOpportunityScore: null, aiConfidence: null, entry: new Prisma.Decimal(executionPrice), size: new Prisma.Decimal(notional), quantity: new Prisma.Decimal(quantity), fees: new Prisma.Decimal(fee), slippage: new Prisma.Decimal(entrySlippage), entryMarketPrice: new Prisma.Decimal(price), stopLoss: stopLossPrice !== null ? new Prisma.Decimal(stopLossPrice) : null, takeProfit: takeProfitPrice !== null ? new Prisma.Decimal(takeProfitPrice) : null, trailingStop: trailingStopFraction !== null ? new Prisma.Decimal(trailingStopFraction) : null, configSnapshot: configSnapshot as unknown as Prisma.InputJsonValue, decisionSource: candidate.decisionSource, aiAnalysisId: null, entryStrategy: newLaunch ? candidate.entryStrategy : null, mlModelVersion: candidate.entryStrategy === 'ML' && typeof candidate.ml?.modelVersion === 'string' ? candidate.ml.modelVersion : null, mlPaperDecisionId: candidate.entryStrategy === 'ML' && typeof candidate.ml?.decisionId === 'string' ? candidate.ml.decisionId : null, entryAt: now, mode: 'PAPER', status: 'OPEN' } });
         await recomputePaperAccount(transaction, candidate.userId);
-        await transaction.auditLog.create({ data: { userId: candidate.userId, action: decision.decision === 'APPROVED_REDUCED_SIZE' ? 'TRADE_APPROVED_REDUCED_SIZE' : 'TRADE_APPROVED', details: { signalId: candidate.id, orderId: order.id, positionId: position.id, tradeId: trade.id, idempotencyKey: key, riskScore: candidate.riskScore, riskClassification: candidate.riskClassification, hardBlocked: false, hardBlockReasons: [], warnings: candidate.riskWarnings, signalScore: candidate.score, aiOpportunityScore: aiRow ? number(aiRow.entryQuality) : null, aiConfidence: aiRow ? number(aiRow.confidence) : null, decisionSource: candidate.decisionSource, aiAnalysisId: aiRow?.id ?? null, riskPolicy: user.risk?.riskPolicy ?? candidate.riskPolicy, positionMultiplier: decision.positionMultiplier, normalPositionSize: decision.normalPositionSize, riskAdjustedPositionSize: decision.riskAdjustedPositionSize, finalDecision: decision.decision, decisionReasons: decision.reasons } } });
+        await transaction.auditLog.create({ data: { userId: candidate.userId, action: decision.decision === 'APPROVED_REDUCED_SIZE' ? 'TRADE_APPROVED_REDUCED_SIZE' : 'TRADE_APPROVED', details: { signalId: candidate.id, orderId: order.id, positionId: position.id, tradeId: trade.id, idempotencyKey: key, riskScore: candidate.riskScore, riskClassification: candidate.riskClassification, hardBlocked: false, hardBlockReasons: [], warnings: candidate.riskWarnings, signalScore: candidate.score, aiOpportunityScore: null, aiConfidence: null, decisionSource: candidate.decisionSource, aiAnalysisId: null, riskPolicy: user.risk?.riskPolicy ?? candidate.riskPolicy, positionMultiplier: decision.positionMultiplier, normalPositionSize: decision.normalPositionSize, riskAdjustedPositionSize: decision.riskAdjustedPositionSize, finalDecision: decision.decision, decisionReasons: decision.reasons } } });
         // Real price-path tracking (MFE / MAE / milestones) starts at the entry fill.
         if (transaction.positionPathMetric?.create) {
           await transaction.positionPathMetric.create({ data: { positionId: position.id, userId: candidate.userId, decisionSource: candidate.decisionSource, configVersion: newLaunch?.configVersion ?? null, entryPrice: new Prisma.Decimal(executionPrice), entryAt: now, quantity: new Prisma.Decimal(quantity), milestones: {}, liquidityAtEntry: liquidity > 0 ? new Prisma.Decimal(liquidity) : null, source: 'LIVE_TRACKING' } });
         }
         if (transaction.positionEvent?.create) {
-          await transaction.positionEvent.create({ data: { positionId: position.id, userId: candidate.userId, type: 'ENTRY', at: now, price: new Prisma.Decimal(executionPrice), details: { decisionSource: candidate.decisionSource, marketPrice: price, notional, slippagePercent, strategy: candidate.strategyName } as Prisma.InputJsonValue } });
+          await transaction.positionEvent.create({ data: { positionId: position.id, userId: candidate.userId, type: 'ENTRY', at: now, price: new Prisma.Decimal(executionPrice), details: { decisionSource: candidate.decisionSource, entryStrategy: newLaunch ? candidate.entryStrategy : null, marketPrice: price, notional, slippagePercent, strategy: candidate.strategyName } as Prisma.InputJsonValue } });
         }
         return { order, position, trade };
       });
 
       await this.deps.tracker?.recordSuccess(candidate.userId, candidate.tokenAddress).catch(() => undefined);
+      await this.resolveMlDecision(candidate, { outcome: 'EXECUTED', positionId: result.position.id, tradeId: result.trade.id, executionReason: decision.decision });
       await this.deps.publishLog?.({ userId: candidate.userId, action: decision.decision === 'APPROVED_REDUCED_SIZE' ? 'TRADE_APPROVED_REDUCED_SIZE' : 'TRADE_APPROVED', details: { signalId: candidate.id, tokenAddress: candidate.tokenAddress, symbol: candidate.symbol, notional, executionPrice } }).catch(() => undefined);
       if (candidate.decisionSource === 'NEW_LAUNCH') await this.deps.publishLaunchEvent?.({ userId: candidate.userId, event: 'new_launch_position_opened', mint: candidate.tokenAddress, symbol: candidate.symbol, positionId: result.position.id }).catch(() => undefined);
       await this.deps.publishEvent('position_update', { userId: candidate.userId, action: 'OPENED', decisionSource: candidate.decisionSource, positionId: result.position.id, token: candidate.tokenAddress, symbol: candidate.symbol, price, quantity });
@@ -757,6 +758,14 @@ export class PaperExecutionCoordinator {
       primaryStrategy: candidate.manualPaper ? 'MANUAL_PAPER' : candidate.primaryStrategy ?? candidate.strategyName,
       ...analysis,
     };
+  }
+
+  /** Writes the actual execution result back to the ML PAPER decision (audit trail; never blocks execution). */
+  private async resolveMlDecision(candidate: CandidateSignal, data: { outcome: 'EXECUTED' | 'EXECUTION_REJECTED'; executionReason: string; positionId?: string; tradeId?: string }) {
+    const decisionId = candidate.entryStrategy === 'ML' && typeof candidate.ml?.decisionId === 'string' ? candidate.ml.decisionId : null;
+    if (!decisionId || !this.deps.prisma.mlPaperDecision?.updateMany) return;
+    await this.deps.prisma.mlPaperDecision.updateMany({ where: { id: decisionId }, data: { ...data, executionReason: data.executionReason.slice(0, 500), resolvedAt: new Date() } })
+      .catch((error: unknown) => this.deps.logger.warn({ err: error instanceof Error ? error.message : String(error), decisionId }, 'ML PAPER decision result write failed'));
   }
 
   private async rejectCandidate(candidate: CandidateSignal, reason: string, policy: RiskPolicyName): Promise<'REJECTED'> {
@@ -806,6 +815,7 @@ export class PaperExecutionCoordinator {
       : this.deps.logger.warn;
     log.call(this.deps.logger, details, event);
     if (decision.decision === 'APPROVED' || decision.decision === 'APPROVED_REDUCED_SIZE') return;
+    await this.resolveMlDecision(candidate, { outcome: 'EXECUTION_REJECTED', executionReason: `${decision.decision}: ${decision.reasons.join(',')}` });
     if (this.deps.tracker) {
       try {
         const skip = await this.deps.tracker.recordFailure(candidate.userId, candidate.tokenAddress, decision.reasons);

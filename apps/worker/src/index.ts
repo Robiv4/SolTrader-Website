@@ -2,20 +2,19 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { Prisma, PrismaClient } from '@prisma/client';
-import { createAiProvider } from '@soltrader/ai-engine';
 import { createRpcManagerFromEnv, RPC_PRIORITY } from '@soltrader/blockchain';
-import { createMarketDataProvider, PrismaMarketDataRepository, RedisMarketDataCache } from '@soltrader/market-data';
-import { MonitoringRegistry } from '@soltrader/monitoring';
+import { createMarketDataProvider, PrismaMarketDataRepository } from '@soltrader/market-data';
 import { BotCommandSubscriber } from '@soltrader/shared';
 import { createClient } from 'redis';
 
-import { AiAnalysisService } from './ai-analysis-service.js';
 import { env } from './config.js';
 import { capacityMetrics } from './exit/entry-capacity.js';
 import { HotPositionMonitor, type MarketEvent } from './exit/hot-position-monitor.js';
+import { cycleMonitoredPositionsWhere, ThrottledWarning } from './exit/position-scope.js';
 import { NewLaunchService } from './launch/new-launch-service.js';
 import { MeteoraLaunchProvider, PumpFunLaunchProvider, RaydiumLaunchProvider } from './launch/providers.js';
 import { logger } from './logger.js';
+import { MlPaperEntryEngine, MlPaperModelRegistry } from './ml/ml-paper-engine.js';
 import { MlShadowService, startMlHealthPublisher, type MlMode } from './ml/ml-shadow-service.js';
 import { PaperExecutionCoordinator } from './paper-execution.js';
 import { type MarketQuote, PositionManager } from './position-manager.js';
@@ -23,33 +22,29 @@ import { createPrismaPositionStore } from './position-store.js';
 import { XSocialProvider } from './social/providers.js';
 import { SocialService } from './social/social-service.js';
 import { createGramJsGateway, TelegramSocialProvider, type TelegramGateway } from './social/telegram.js';
-import { StrategyRunner } from './strategy-runner.js';
 import { ThrottledTokenDataProvider } from './throttled-provider.js';
-import { TokenScanner } from './token-scanner.js';
 import { BotTradingLoop, type TradingLoopStore } from './trading-loop.js';
 import { type SkipRecord, type TrackerRedis, UnbuyableTokenTracker } from './unbuyable-tracker.js';
 
 const prisma = new PrismaClient();
-const ANALYSIS_TTL_SECONDS = 15 * 60;
-const analysisKey = (userId: string, tokenAddress: string) => `analysis:${userId}:${tokenAddress}`;
 /** Maximum age of the quote used to evaluate SL/TP/trailing of an open position. */
 const POSITION_QUOTE_MAX_AGE_MS = 5_000;
+const noFreshPriceWarning = new ThrottledWarning(5 * 60_000);
 const redisClient = createClient({ url: env.REDIS_URL, ...(env.REDIS_PASSWORD ? { password: env.REDIS_PASSWORD } : {}) });
 const redisSubscriber = redisClient.duplicate();
 const commandSubscriber = new BotCommandSubscriber(redisSubscriber);
 
-// One cached, rate-limited provider shared by the scanner, strategies, paper execution and position protection.
+// One cached, rate-limited provider shared by paper execution and position protection.
 const marketDataProvider = new ThrottledTokenDataProvider(createMarketDataProvider({
   MARKET_DATA_PROVIDER: env.MARKET_DATA_PROVIDER,
   MARKET_DATA_REQUEST_TIMEOUT_MS: String(env.MARKET_DATA_REQUEST_TIMEOUT_MS),
 }));
 
-// One shared RPC manager for every on-chain read in the worker (scanner, NewLaunch security, Raydium discovery):
+// One shared RPC manager for every on-chain read in the worker (NewLaunch security, Raydium discovery):
 // dedup, method-aware cache, batching, priority queue, circuit breakers, failover. Provider URLs are never logged.
 const rpcManager = createRpcManagerFromEnv(process.env, { logger });
-if (!rpcManager) logger.warn('Solana RPC not configured: on-chain security data stays UNKNOWN (no automatic scanner entries)');
+if (!rpcManager) logger.warn('Solana RPC not configured: on-chain security data stays UNKNOWN (New Launch candidates stay WATCH)');
 
-const monitoringRegistry = new MonitoringRegistry();
 const eventPublisher = createClient({ url: env.REDIS_URL, ...(env.REDIS_PASSWORD ? { password: env.REDIS_PASSWORD } : {}) });
 const trackerRedis: TrackerRedis = {
   get: (key) => redisClient.get(key),
@@ -66,68 +61,6 @@ async function onTokenSkipped(userId: string, tokenAddress: string, record: Skip
   await prisma.auditLog.create({ data: { userId, action: 'TOKEN_SKIPPED', details } });
   await publishLog({ userId, action: 'TOKEN_SKIPPED', details }).catch(() => undefined);
 }
-
-const tokenScanner = new TokenScanner({
-  tracker: unbuyableTracker,
-  onTokenSkipped,
-  prisma,
-  provider: marketDataProvider,
-  rpc: rpcManager ?? undefined,
-  cache: new RedisMarketDataCache(redisClient),
-  repository: new PrismaMarketDataRepository(prisma),
-  logger,
-  registry: monitoringRegistry,
-  cacheTtlSeconds: env.MARKET_DATA_CACHE_TTL_SECONDS,
-  staleAfterMs: env.MARKET_DATA_STALE_AFTER_MS,
-  discoveryLimit: env.MARKET_DATA_DISCOVERY_LIMIT,
-  publishEvent: async (type, payload) => {
-    const channels = { token_update: 'bot:tokens', risk_update: 'bot:risk', signal_update: 'bot:signals', decision_update: 'bot:decisions' } as const;
-    await eventPublisher.publish(channels[type], JSON.stringify({ type, payload, timestamp: new Date().toISOString() }));
-  },
-});
-
-// AI provider credentials stay server-side (process.env); only safe metadata is ever logged or published.
-const aiProvider = createAiProvider(process.env);
-const aiService = new AiAnalysisService({
-  prisma,
-  provider: aiProvider.provider,
-  providerInfo: aiProvider.info,
-  store: {
-    get: (key) => redisClient.get(key),
-    set: (key, value, options) => redisClient.set(key, value, options),
-    incrBy: (key, amount) => redisClient.incrBy(key, amount),
-    expire: (key, seconds) => redisClient.expire(key, seconds),
-  },
-  logger,
-  timeoutMs: env.AI_REQUEST_TIMEOUT_MS,
-  maxRetries: env.AI_MAX_RETRIES,
-  serverMaxPerMinute: env.AI_MAX_ANALYSES_PER_MINUTE,
-  concurrency: env.AI_CONCURRENCY,
-  staleAfterMs: env.MARKET_DATA_STALE_AFTER_MS,
-  publishLog: (entry) => publishLog(entry),
-  publishEvent: async (_type, payload) => {
-    await eventPublisher.publish('bot:signals', JSON.stringify({ type: 'signal_update', payload, timestamp: new Date().toISOString() }));
-  },
-});
-
-const strategyRunner = new StrategyRunner({
-  aiService,
-  tracker: unbuyableTracker,
-  prisma,
-  provider: marketDataProvider,
-  logger,
-  registry: monitoringRegistry,
-  lookbackMs: env.STRATEGY_LOOKBACK_MS,
-  historyWindow: env.STRATEGY_HISTORY_WINDOW,
-  staleAfterMs: env.MARKET_DATA_STALE_AFTER_MS,
-  // Latest analysis per user/token for the token details view (the DB only keeps throttled snapshots).
-  cacheAnalysis: async (userId, tokenAddress, analysis) => {
-    await redisClient.set(analysisKey(userId, tokenAddress), JSON.stringify(analysis), { EX: ANALYSIS_TTL_SECONDS });
-  },
-  publishEvent: async (_type, payload) => {
-    await eventPublisher.publish('bot:signals', JSON.stringify({ type: 'signal_update', payload, timestamp: new Date().toISOString() }));
-  },
-});
 
 async function publishLog(entry: { userId: string | null; action: string; details: Record<string, unknown> }) {
   await eventPublisher.publish('bot:logs', JSON.stringify({ ...entry, source: 'worker', createdAt: new Date().toISOString() }));
@@ -203,7 +136,13 @@ const mlService = new MlShadowService({
   },
 });
 
+// ML PAPER entries (users who explicitly selected an admin-approved model; DEFAULT strategy otherwise). Independent of
+// ML_MODE: SHADOW collection and PAPER decisions are separate. PAPER only - this engine never reaches LIVE execution.
+const mlPaperRegistry = new MlPaperModelRegistry({ prisma, repoRoot: mlRepoRoot, logger });
+const mlPaperEngine = new MlPaperEntryEngine({ prisma, registry: mlPaperRegistry, logger });
+
 const newLaunch = new NewLaunchService({
+  mlPaper: mlPaperEngine,
   social: socialService ?? undefined,
   ml: mlService.enabled ? mlService : undefined,
   prisma,
@@ -242,10 +181,6 @@ const paperExecution = new PaperExecutionCoordinator({
   concurrency: env.PAPER_EXECUTION_CONCURRENCY,
   lookbackMs: env.PAPER_SIGNAL_LOOKBACK_MS,
   maxEntriesPerCycle: env.PAPER_MAX_ENTRIES_PER_CYCLE,
-  loadLatestAnalysis: async (userId, tokenAddress) => {
-    const raw = await redisClient.get(analysisKey(userId, tokenAddress));
-    return raw ? JSON.parse(raw) as Record<string, unknown> : null;
-  },
   publishEvent: async (type, payload) => {
     const channels = { position_update: 'bot:positions', trade_update: 'bot:trades', pnl_update: 'bot:pnl', risk_update: 'bot:risk' } as const;
     await eventPublisher.publish(channels[type as keyof typeof channels], JSON.stringify({ type, payload, timestamp: new Date().toISOString() }));
@@ -305,16 +240,6 @@ const store: TradingLoopStore = {
 };
 
 const loop = new BotTradingLoop(store, commandSubscriber, {
-  async runTokenMonitor(signal) {
-    if (signal.aborted) return;
-    const summary = await tokenScanner.runCycle(signal);
-    logger.info({ ...summary }, 'Token monitor cycle complete');
-  },
-  async runStrategies(signal) {
-    if (signal.aborted) return;
-    const summary = await strategyRunner.runCycle(signal);
-    logger.info({ ...summary }, 'Strategy cycle complete');
-  },
   async runPaperExecution(signal) {
     if (signal.aborted) return;
     await paperExecution.runCycle(signal);
@@ -323,7 +248,7 @@ const loop = new BotTradingLoop(store, commandSubscriber, {
     if (signal.aborted) return;
 
     // NewLaunch positions are owned by the event-driven hot monitor (one evaluator per position, no stale overwrites).
-    const openPositions = await prisma.position.findMany({ where: { status: 'OPEN', mode: 'PAPER', ...(hotMonitor ? { NOT: { exitPolicy: 'NEW_LAUNCH' } } : {}) }, select: { tokenId: true, token: { select: { address: true } } } });
+    const openPositions = await prisma.position.findMany({ where: cycleMonitoredPositionsWhere(Boolean(hotMonitor)), select: { tokenId: true, token: { select: { address: true } } } });
     if (openPositions.length === 0) return;
     const now = Date.now();
 
@@ -356,8 +281,8 @@ const loop = new BotTradingLoop(store, commandSubscriber, {
       const storedPrice = Number(stored?.priceUsd);
       if (stored && Date.now() - stored.timestamp.getTime() <= env.MARKET_DATA_STALE_AFTER_MS && storedPrice > 0) {
         snapshot[address] = { price: storedPrice, liquidityUsd: Number(stored.liquidityUsd) || null, timestamp: stored.timestamp };
-      } else {
-        logger.warn({ token: address }, 'No fresh price for open position; exit evaluation skipped this cycle');
+      } else if (noFreshPriceWarning.shouldLog(address, now)) {
+        logger.warn({ token: address }, 'No fresh price for open position; exit evaluation skipped (repeats at most every 5 min)');
       }
     }
 
@@ -441,6 +366,11 @@ async function main() {
   await eventPublisher.connect();
   await loop.start();
   newLaunch.start();
+  // ML PAPER health (model load / approval / last prediction; no secrets) + bookkeeping of finished candidates.
+  globalThis.setInterval(() => {
+    void eventPublisher.set('ml:paper:health', JSON.stringify({ at: new Date().toISOString(), models: mlPaperRegistry.snapshot(), engine: mlPaperEngine.snapshot() }), { EX: 60 }).catch(() => undefined);
+    mlPaperEngine.prune((mint) => newLaunch.tracker.launches.has(mint));
+  }, 10_000);
   if (mlService.enabled) {
     // ML observability first (counts / latencies only): health is published even while the resume below runs.
     startMlHealthPublisher(mlService, (key, value, options) => eventPublisher.set(key, value, options), 10_000, (error) => logger.warn({ err: error instanceof Error ? error.message : String(error) }, 'ml:health publish failed'));
@@ -464,7 +394,7 @@ async function main() {
     .catch((error: unknown) => logger.warn({ err: error }, 'Worker heartbeat failed'));
   await beat();
   heartbeatTimer = globalThis.setInterval(() => void beat(), 10_000);
-  logger.info({ mode: env.TRADING_MODE, serverLiveTradingConfigured: env.LIVE_TRADING_ENABLED, aiProvider: aiProvider.info.provider, aiModel: aiProvider.info.model, aiConfigured: aiProvider.info.configured }, 'Worker service started');
+  logger.info({ mode: env.TRADING_MODE, serverLiveTradingConfigured: env.LIVE_TRADING_ENABLED }, 'Worker service started');
 }
 
 async function shutdown(signal: string) {

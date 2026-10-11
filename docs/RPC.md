@@ -12,10 +12,11 @@ critical traffic, stop sending traffic to unhealthy providers, and fail safely.
 | --- | --- | --- |
 | `NewLaunchSecurity` | `getAccountInfo` (mint), cached 30 s, batched | P2 SECURITY |
 | `NewLaunchDiscovery` (Raydium `initialize2`) | `getTransaction` (immutable, cached 10 min) | P4 ENRICHMENT |
-| `TokenScanner` | `getAccountInfo` (mint) + `getTokenLargestAccounts`, dropped when the scan is aborted | P4 ENRICHMENT |
 
 The exit path (HotPositionMonitor / PositionManager) uses **no Solana RPC**. Its prices come from the market-data
-streams. P0–P2 still have reserved concurrency slots, so scanner load can never occupy them.
+streams. P0–P2 still have reserved concurrency slots, so enrichment load can never occupy them.
+
+(The legacy `TokenScanner` caller was removed together with the token scanner, see `docs/SCANNER_REMOVAL.md`.)
 
 Other RPC traffic outside the manager:
 
@@ -72,7 +73,7 @@ deadline (P0 4 s, P1 8 s, P2 10 s, P3 6 s, P4 8 s, P5 15 s). The provider chain 
 
 ## Security data: UNKNOWN is never SAFE
 
-- **Scanner:** mint info and holders are fetched independently (`allSettled`), so a holder failure no longer discards
+- **Scanner (retired):** mint info and holders were fetched independently (`allSettled`), so a holder failure no longer discards
   the authorities. The result is COMPLETE, PARTIAL or UNAVAILABLE, with errors and a quality grade.
   - Unknown authorities → `authorityStatusKnown: false`. The conservative scoring values are kept, warnings
     `AUTHORITY_STATUS_UNKNOWN` and `RPC_SECURITY_DATA_UNAVAILABLE` are added, and the decision is capped at **WATCH**

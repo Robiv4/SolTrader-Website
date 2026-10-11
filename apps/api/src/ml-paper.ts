@@ -1,0 +1,341 @@
+/**
+ * ML PAPER strategy: model PAPER approval (admin + e-mail, revocable), per-user strategy selection (DEFAULT | ML) and the
+ * comparison / training-data analytics. PAPER only: nothing here can enable or reach LIVE trading.
+ *
+ * Rules:
+ *  - SHADOW_READY readiness alone grants nothing: a model needs an explicit, separate PAPER approval by an administrator,
+ *    confirmed by e-mail, after it has been tested in SHADOW (stored shadow predictions) with a verified artifact.
+ *  - Switching a user to ML (or changing the model) requires an administrator + e-mail confirmation and an approved model.
+ *    Switching back to DEFAULT is always allowed for the owner (it can only reduce automation).
+ *  - A revoked / retired model stops ML entries immediately; users stay on ML without entries (no silent fallback buying).
+ */
+import { createHash } from 'node:crypto';
+import { readFile } from 'node:fs/promises';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+import { Prisma, type PrismaClient } from '@prisma/client';
+import { ML_FEATURE_VERSION, ML_PAPER_SNAPSHOT_POINTS, ML_PAPER_THRESHOLD_MAX, ML_PAPER_THRESHOLD_MIN, ML_PAPER_WINDOW_MAX_SECONDS } from '@soltrader/strategy-engine';
+import { type Request, type Response, Router } from 'express';
+import { z } from 'zod';
+
+import type { StepUpGate } from './email-verification.js';
+
+/** Minimum number of stored SHADOW predictions before a model may be PAPER-approved. */
+export const MIN_SHADOW_PREDICTIONS_FOR_PAPER = 100;
+const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
+
+const fail = (res: Response, status: number, message: string, data?: unknown) => res.status(status).json({ ok: false, error: message, ...(data ? { data } : {}) });
+const num = (value: unknown) => (value === null || value === undefined ? null : Number(value));
+const record = (value: unknown) => (value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {});
+
+export interface MlPaperDeps {
+  prisma: PrismaClient;
+  stepUp: StepUpGate;
+  logAuditEvent: (action: string, userId: string | null, details?: Record<string, unknown>) => Promise<unknown>;
+  readJson: (key: string) => Promise<Record<string, unknown> | null>;
+  logger: { error(payload: unknown, message?: string): void };
+  /** Server trading mode (env TRADING_MODE); ML PAPER is refused unless it is PAPER. */
+  serverTradingMode: () => string;
+  /** Test hook: artifact reader (default: repository file, sha256 verified by the caller). */
+  readArtifact?: (artifactPath: string) => Promise<Buffer>;
+}
+
+type ModelRow = Awaited<ReturnType<PrismaClient['mlModelVersion']['findUnique']>> & object;
+
+/** Validation summary shown next to a model (no artifact contents). */
+export function modelSummary(model: ModelRow, snapshotKind: string | null) {
+  const metrics = record(model.metrics);
+  const split = record(metrics.metrics);
+  const test = record(split.test);
+  const validation = record(split.validation);
+  return {
+    version: model.version, algorithm: model.algorithm, status: model.status, readiness: model.readiness, target: model.target,
+    datasetVersion: model.datasetVersion, featureVersion: model.featureVersion, snapshotKind, trainedAt: model.trainedAt,
+    paperApproved: model.paperApproved, paperApprovedAt: model.paperApprovedAt, paperApprovedBy: model.paperApprovedBy, paperRevokedAt: model.paperRevokedAt,
+    metrics: {
+      testRocAuc: num(test.rocAuc), testPrAuc: num(test.prAuc), testPrecision: num(test.precision), testRecall: num(test.recall), testBrier: num(test.brier),
+      testRows: num(test.n), validationRocAuc: num(validation.rocAuc), walkForwardAucStd: num(metrics.walkForwardAucStd), overfittingRisk: metrics.overfittingRisk ?? null,
+    },
+  };
+}
+
+/** Reasons a model cannot be PAPER-approved (empty = eligible for an explicit approval). */
+export async function paperApprovalBlockers(prisma: PrismaClient, model: ModelRow, readArtifact: (artifactPath: string) => Promise<Buffer>) {
+  const blockers: string[] = [];
+  if (!['VALIDATED', 'SHADOW'].includes(model.status)) blockers.push(`STATUS_${model.status}`);
+  if (model.readiness !== 'SHADOW_READY') blockers.push(`READINESS_${model.readiness}`);
+  if (model.featureVersion !== ML_FEATURE_VERSION) blockers.push('FEATURE_VERSION_MISMATCH');
+  const history = Array.isArray(model.statusHistory) ? model.statusHistory as Array<{ status?: string }> : [];
+  if (!history.some((entry) => entry.status === 'SHADOW')) blockers.push('NEVER_RUN_IN_SHADOW');
+  const predictions = await prisma.mlPrediction.count({ where: { modelVersion: model.version } });
+  if (predictions < MIN_SHADOW_PREDICTIONS_FOR_PAPER) blockers.push(`SHADOW_PREDICTIONS_${predictions}_BELOW_${MIN_SHADOW_PREDICTIONS_FOR_PAPER}`);
+  const dataset = await prisma.mlDatasetVersion.findUnique({ where: { version: model.datasetVersion } });
+  const kind = record(dataset?.config).snapshotKind;
+  if (typeof kind !== 'string' || ML_PAPER_SNAPSHOT_POINTS[kind] === undefined) blockers.push('UNSUPPORTED_SNAPSHOT_KIND');
+  try {
+    const content = await readArtifact(model.artifactPath);
+    if (createHash('sha256').update(content).digest('hex') !== model.artifactHash) blockers.push('ARTIFACT_HASH_MISMATCH');
+  } catch {
+    blockers.push('ARTIFACT_MISSING');
+  }
+  return blockers;
+}
+
+async function snapshotKindOf(prisma: PrismaClient, datasetVersion: string) {
+  const dataset = await prisma.mlDatasetVersion.findUnique({ where: { version: datasetVersion }, select: { config: true } }).catch(() => null);
+  const kind = record(dataset?.config).snapshotKind;
+  return typeof kind === 'string' ? kind : null;
+}
+
+interface ClosedTrade { netPnl: number; fees: number; slippage: number; exitAt: Date | null; entryStrategy: string; mlModelVersion: string | null }
+
+/** PAPER trade statistics of one group (real closed trades only; never SHADOW labels). */
+export function paperStats(rows: ClosedTrade[]) {
+  const ordered = [...rows].sort((a, b) => (a.exitAt?.getTime() ?? 0) - (b.exitAt?.getTime() ?? 0));
+  const nets = ordered.map((row) => row.netPnl);
+  const wins = nets.filter((value) => value > 0);
+  const grossProfit = wins.reduce((sum, value) => sum + value, 0);
+  const grossLoss = -nets.filter((value) => value < 0).reduce((sum, value) => sum + value, 0);
+  let peak = 0;
+  let equity = 0;
+  let maxDrawdown = 0;
+  for (const value of nets) {
+    equity += value;
+    peak = Math.max(peak, equity);
+    maxDrawdown = Math.max(maxDrawdown, peak - equity);
+  }
+  return {
+    trades: rows.length,
+    wins: wins.length,
+    winRate: rows.length ? wins.length / rows.length : null,
+    netPnl: nets.reduce((sum, value) => sum + value, 0),
+    profitFactor: grossLoss > 0 ? grossProfit / grossLoss : null,
+    maxDrawdownUsd: maxDrawdown,
+    fees: rows.reduce((sum, row) => sum + row.fees, 0),
+    slippage: rows.reduce((sum, row) => sum + row.slippage, 0),
+    sufficientSample: rows.length >= 30,
+  };
+}
+
+export function createMlPaperRouter(deps: MlPaperDeps) {
+  const { prisma } = deps;
+  const router = Router();
+  const readArtifact = deps.readArtifact ?? (async (artifactPath: string) => {
+    const root = path.resolve(REPO_ROOT, 'ml', 'models');
+    const file = path.resolve(REPO_ROOT, artifactPath);
+    if (!file.startsWith(root)) throw new Error('Artifact path outside ml/models');
+    return readFile(file);
+  });
+
+  // ---------------------------------------------------------------- model PAPER approval (admin + e-mail)
+  router.get('/ml/models/:version/paper-approval', async (req: Request, res: Response) => {
+    const model = await prisma.mlModelVersion.findUnique({ where: { version: String(req.params.version) } });
+    if (!model) return fail(res, 404, 'Model not found');
+    return res.json({ ok: true, data: { ...modelSummary(model, await snapshotKindOf(prisma, model.datasetVersion)), blockers: await paperApprovalBlockers(prisma, model, readArtifact) } });
+  });
+
+  router.post('/ml/models/:version/paper-approval', async (req: Request, res: Response) => {
+    if (req.user?.role !== 'ADMIN') return fail(res, 403, 'Administrator authorization required');
+    try {
+      const model = await prisma.mlModelVersion.findUnique({ where: { version: String(req.params.version) } });
+      if (!model) return fail(res, 404, 'Model not found');
+      if (model.paperApproved) return fail(res, 409, 'A modell már PAPER-jóváhagyott.');
+      const blockers = await paperApprovalBlockers(prisma, model, readArtifact);
+      if (blockers.length) return fail(res, 409, 'A modell nem hagyható jóvá PAPER kereskedésre.', { blockers });
+      if (!await deps.stepUp(req, res, 'ml_paper_approve', { version: model.version })) return;
+      const history = [...(Array.isArray(model.statusHistory) ? model.statusHistory : []), { event: 'PAPER_APPROVED', at: new Date().toISOString(), by: req.user!.email }];
+      await prisma.mlModelVersion.update({ where: { version: model.version }, data: { paperApproved: true, paperApprovedAt: new Date(), paperApprovedBy: req.user!.email, paperRevokedAt: null, paperRevokedBy: null, statusHistory: history as Prisma.InputJsonValue } });
+      await deps.logAuditEvent('ml_model_paper_approved', req.user!.id, { modelVersion: model.version, readiness: model.readiness, status: model.status });
+      return res.json({ ok: true, data: { version: model.version, paperApproved: true } });
+    } catch (error) {
+      deps.logger.error({ err: error }, 'ML PAPER approval failed');
+      return fail(res, 500, 'PAPER approval failed');
+    }
+  });
+
+  /** Revocation is always possible for an administrator (it only removes ML entries). */
+  router.delete('/ml/models/:version/paper-approval', async (req: Request, res: Response) => {
+    if (req.user?.role !== 'ADMIN') return fail(res, 403, 'Administrator authorization required');
+    try {
+      const model = await prisma.mlModelVersion.findUnique({ where: { version: String(req.params.version) } });
+      if (!model) return fail(res, 404, 'Model not found');
+      const history = [...(Array.isArray(model.statusHistory) ? model.statusHistory : []), { event: 'PAPER_REVOKED', at: new Date().toISOString(), by: req.user!.email }];
+      await prisma.mlModelVersion.update({ where: { version: model.version }, data: { paperApproved: false, paperRevokedAt: new Date(), paperRevokedBy: req.user!.email, statusHistory: history as Prisma.InputJsonValue } });
+      const affected = await prisma.mlPaperSettings.count({ where: { strategyMode: 'ML', modelVersion: model.version } });
+      await deps.logAuditEvent('ml_model_paper_revoked', req.user!.id, { modelVersion: model.version, usersOnModel: affected });
+      return res.json({ ok: true, data: { version: model.version, paperApproved: false, usersOnModel: affected } });
+    } catch (error) {
+      deps.logger.error({ err: error }, 'ML PAPER revocation failed');
+      return fail(res, 500, 'PAPER revocation failed');
+    }
+  });
+
+  // ---------------------------------------------------------------- per-user strategy selection
+  async function settingsView(userId: string, isAdmin: boolean) {
+    const [row, bot, approved, decisions, lastPrediction, health] = await Promise.all([
+      prisma.mlPaperSettings.findUnique({ where: { userId } }),
+      prisma.botConfig.findUnique({ where: { userId }, select: { tradingMode: true, isLiveEnabled: true } }),
+      prisma.mlModelVersion.findMany({ where: { paperApproved: true, status: { not: 'RETIRED' } }, orderBy: { trainedAt: 'desc' } }),
+      prisma.mlPaperDecision.groupBy({ by: ['mlDecision'], where: { userId, decidedAt: { gte: new Date(Date.now() - 86_400_000) } }, _count: { _all: true } }),
+      prisma.mlPaperDecision.findFirst({ where: { userId, probability: { not: null } }, orderBy: { decidedAt: 'desc' }, select: { decidedAt: true, modelVersion: true, probability: true, mlDecision: true, mint: true, outcome: true } }),
+      deps.readJson('ml:paper:health').catch(() => null),
+    ]);
+    const selected = row?.modelVersion ? await prisma.mlModelVersion.findUnique({ where: { version: row.modelVersion } }) : null;
+    const models = await Promise.all(approved.map(async (model) => modelSummary(model, await snapshotKindOf(prisma, model.datasetVersion))));
+    const mode = row?.strategyMode === 'ML' ? 'ML' : 'DEFAULT';
+    const selectedHealth = row?.modelVersion ? record(record(health?.models)[row.modelVersion]) : {};
+    const enableBlockers: string[] = [];
+    if (!isAdmin) enableBlockers.push('ADMIN_REQUIRED');
+    if (models.length === 0) enableBlockers.push('NO_PAPER_APPROVED_MODEL');
+    if (bot?.tradingMode !== 'PAPER' || bot?.isLiveEnabled) enableBlockers.push('PAPER_MODE_REQUIRED');
+    if (deps.serverTradingMode() !== 'PAPER') enableBlockers.push('SERVER_NOT_PAPER');
+    return {
+      strategyMode: mode,
+      modelVersion: row?.modelVersion ?? null,
+      buyThreshold: row ? Number(row.buyThreshold) : 0.7,
+      decisionWindowSeconds: row?.decisionWindowSeconds ?? 10,
+      enabledAt: row?.enabledAt ?? null,
+      enabledBy: row?.enabledBy ?? null,
+      limits: { thresholdMin: ML_PAPER_THRESHOLD_MIN, thresholdMax: ML_PAPER_THRESHOLD_MAX, windowMaxSeconds: ML_PAPER_WINDOW_MAX_SECONDS },
+      selectedModel: selected ? { ...modelSummary(selected, await snapshotKindOf(prisma, selected.datasetVersion)), usable: selected.paperApproved && selected.status !== 'RETIRED' } : null,
+      approvedModels: models,
+      health: health ? { at: health.at ?? null, model: Object.keys(selectedHealth).length ? selectedHealth : null, engine: health.engine ?? null } : null,
+      lastPrediction: lastPrediction ? { ...lastPrediction, probability: num(lastPrediction.probability) } : null,
+      decisions24h: Object.fromEntries(decisions.map((item) => [item.mlDecision, item._count._all])),
+      canEnable: enableBlockers.length === 0,
+      enableBlockers,
+      liveTrading: 'DISABLED',
+    };
+  }
+
+  router.get('/settings/ml-paper', async (req: Request, res: Response) => {
+    try {
+      return res.json({ ok: true, data: await settingsView(req.user!.id, req.user!.role === 'ADMIN') });
+    } catch (error) {
+      deps.logger.error({ err: error }, 'ML PAPER settings failed');
+      return fail(res, 500, 'ML PAPER settings unavailable');
+    }
+  });
+
+  const updateSchema = z.object({
+    strategyMode: z.enum(['DEFAULT', 'ML']),
+    modelVersion: z.string().min(1).max(120).nullable().optional(),
+    buyThreshold: z.number().min(ML_PAPER_THRESHOLD_MIN).max(ML_PAPER_THRESHOLD_MAX).optional(),
+    decisionWindowSeconds: z.number().int().min(2).max(ML_PAPER_WINDOW_MAX_SECONDS).optional(),
+  }).strict();
+
+  router.put('/settings/ml-paper', async (req: Request, res: Response) => {
+    const body = { ...(req.body ?? {}) } as Record<string, unknown>;
+    delete body.verification;
+    const parsed = updateSchema.safeParse(body);
+    if (!parsed.success) return fail(res, 400, 'Érvénytelen ML PAPER beállítás', parsed.error.issues);
+    const userId = req.user!.id;
+    try {
+      const current = await prisma.mlPaperSettings.findUnique({ where: { userId } });
+      const data = parsed.data;
+      if (data.strategyMode === 'DEFAULT') {
+        // Back to the rule-based strategy: always allowed for the owner (no ML entries afterwards). Model / threshold kept.
+        const row = await prisma.mlPaperSettings.upsert({ where: { userId }, update: { strategyMode: 'DEFAULT' }, create: { userId, strategyMode: 'DEFAULT' } });
+        if (current?.strategyMode === 'ML') await deps.logAuditEvent('ml_paper_strategy_disabled', userId, { modelVersion: current.modelVersion });
+        return res.json({ ok: true, data: { ...(await settingsView(userId, req.user!.role === 'ADMIN')), updatedAt: row.updatedAt } });
+      }
+      if (req.user!.role !== 'ADMIN') return fail(res, 403, 'Az ML PAPER mód bekapcsolása adminisztrátori jogosultságot igényel.');
+      const modelVersion = data.modelVersion ?? current?.modelVersion ?? null;
+      if (!modelVersion) return fail(res, 400, 'Válassz modellverziót.');
+      const model = await prisma.mlModelVersion.findUnique({ where: { version: modelVersion } });
+      if (!model || !model.paperApproved || model.status === 'RETIRED') return fail(res, 409, 'Csak PAPER-jóváhagyott, nem visszavont modell választható.');
+      const bot = await prisma.botConfig.findUnique({ where: { userId }, select: { tradingMode: true, isLiveEnabled: true } });
+      if (bot?.tradingMode !== 'PAPER' || bot?.isLiveEnabled || deps.serverTradingMode() !== 'PAPER') return fail(res, 409, 'ML PAPER csak PAPER kereskedési módban (LIVE kikapcsolva) használható.');
+      const threshold = data.buyThreshold ?? (current ? Number(current.buyThreshold) : 0.7);
+      const window = data.decisionWindowSeconds ?? current?.decisionWindowSeconds ?? 10;
+      const switching = current?.strategyMode !== 'ML' || current?.modelVersion !== modelVersion;
+      // Turning ML on or changing the model needs an e-mail confirmed administrator action; threshold tuning while ML runs does not.
+      if (switching && !await deps.stepUp(req, res, 'ml_paper_enable', { modelVersion, buyThreshold: threshold, decisionWindowSeconds: window })) return;
+      await prisma.mlPaperSettings.upsert({
+        where: { userId },
+        update: { strategyMode: 'ML', modelVersion, buyThreshold: new Prisma.Decimal(threshold.toFixed(3)), decisionWindowSeconds: window, ...(switching ? { enabledAt: new Date(), enabledBy: req.user!.email } : {}) },
+        create: { userId, strategyMode: 'ML', modelVersion, buyThreshold: new Prisma.Decimal(threshold.toFixed(3)), decisionWindowSeconds: window, enabledAt: new Date(), enabledBy: req.user!.email },
+      });
+      await deps.logAuditEvent(switching ? 'ml_paper_strategy_enabled' : 'ml_paper_settings_update', userId, { modelVersion, buyThreshold: threshold, decisionWindowSeconds: window, previous: current ? { mode: current.strategyMode, modelVersion: current.modelVersion } : null });
+      return res.json({ ok: true, data: await settingsView(userId, true) });
+    } catch (error) {
+      deps.logger.error({ err: error }, 'ML PAPER settings update failed');
+      return fail(res, 500, 'ML PAPER settings update failed');
+    }
+  });
+
+  // ---------------------------------------------------------------- comparison + training data analytics
+  router.get('/ml/paper', async (req: Request, res: Response) => {
+    try {
+      const userId = req.user!.id;
+      const sinceDays = Math.min(365, Math.max(1, Number(req.query.days ?? 90) || 90));
+      const since = new Date(Date.now() - sinceDays * 86_400_000);
+      const trades = await prisma.trade.findMany({
+        where: { userId, decisionSource: 'NEW_LAUNCH', status: 'CLOSED', mode: 'PAPER', exitAt: { gte: since } },
+        select: { netPnl: true, fees: true, slippage: true, exitAt: true, entryStrategy: true, mlModelVersion: true },
+      });
+      const closed: ClosedTrade[] = trades.map((trade) => ({ netPnl: Number(trade.netPnl ?? 0), fees: Number(trade.fees ?? 0), slippage: Number(trade.slippage ?? 0), exitAt: trade.exitAt, entryStrategy: trade.entryStrategy ?? 'DEFAULT', mlModelVersion: trade.mlModelVersion }));
+      const mlTrades = closed.filter((trade) => trade.entryStrategy === 'ML');
+      const byModel = [...new Set(mlTrades.map((trade) => trade.mlModelVersion ?? 'ismeretlen'))].map((version) => ({ modelVersion: version, ...paperStats(mlTrades.filter((trade) => (trade.mlModelVersion ?? 'ismeretlen') === version)) }));
+      const [decisionGroups, outcomeGroups, openMl] = await Promise.all([
+        prisma.mlPaperDecision.groupBy({ by: ['modelVersion', 'mlDecision'], where: { userId, decidedAt: { gte: since } }, _count: { _all: true } }),
+        prisma.mlPaperDecision.groupBy({ by: ['outcome'], where: { userId, decidedAt: { gte: since }, mlDecision: 'ML_BUY' }, _count: { _all: true } }),
+        prisma.trade.count({ where: { userId, decisionSource: 'NEW_LAUNCH', status: 'OPEN', entryStrategy: 'ML' } }),
+      ]);
+      const recentDecisions = await prisma.mlPaperDecision.findMany({
+        where: { userId, decidedAt: { gte: since } }, orderBy: { decidedAt: 'desc' }, take: 50,
+        select: { id: true, mint: true, modelVersion: true, decidedAt: true, snapshotKind: true, probability: true, threshold: true, mlDecision: true, errorReason: true, baseDecision: true, outcome: true, executionReason: true, safetyBlockers: true, positionId: true },
+      });
+
+      // Training data (SHADOW collection; all candidates, independent of the active strategy).
+      const [snapshotKinds, outcomes, validity, lastDataset, mlTradesClosed] = await Promise.all([
+        prisma.mlFeatureSnapshot.groupBy({ by: ['kind'], _count: { _all: true } }),
+        prisma.mlCandidateOutcome.groupBy({ by: ['status'], _count: { _all: true } }),
+        prisma.mlFeatureSnapshot.groupBy({ by: ['validForTraining'], where: { kind: 'AGE_30S' }, _count: { _all: true } }),
+        prisma.mlDatasetVersion.findFirst({ orderBy: { createdAt: 'desc' }, select: { version: true, createdAt: true, rowCount: true, manifest: true } }),
+        prisma.trade.count({ where: { decisionSource: 'NEW_LAUNCH', status: 'CLOSED', entryStrategy: 'ML' } }),
+      ]);
+      const sinceLastDataset = lastDataset ? await prisma.mlFeatureSnapshot.count({ where: { kind: 'AGE_30S', validForTraining: true, createdAt: { gt: lastDataset.createdAt } } }) : null;
+      const range = await prisma.mlFeatureSnapshot.aggregate({ where: { kind: 'AGE_30S', validForTraining: true }, _min: { snapshotAt: true }, _max: { snapshotAt: true }, _count: { _all: true } });
+      const labelled = await prisma.mlCandidateOutcome.count({ where: { status: { in: ['COMPLETE', 'PARTIAL'] }, snapshot: { kind: 'AGE_30S', validForTraining: true } } });
+      const invalidReasons = await prisma.$queryRaw<Array<{ reason: string; n: number }>>`
+        SELECT reason, count(*)::int AS n FROM "MlFeatureSnapshot", jsonb_array_elements_text("invalidReasons") AS reason
+        WHERE kind = 'AGE_30S' AND "validForTraining" = false GROUP BY reason ORDER BY n DESC LIMIT 8`;
+      const outcomeCounts = Object.fromEntries(outcomes.map((item) => [item.status, item._count._all]));
+      const issues: string[] = [];
+      if ((outcomeCounts.INSUFFICIENT ?? 0) > (outcomeCounts.COMPLETE ?? 0)) issues.push('Több az elégtelen (INSUFFICIENT) kimenet, mint a teljes: stream-kiesések vagy lejárt követés.');
+      if (labelled < 1000) issues.push(`Kevés címkézett AGE_30S jelölt (${labelled}); megbízható tanításhoz legalább 1000 kell (és ≥ 50 pozitív).`);
+      for (const item of invalidReasons.slice(0, 3)) issues.push(`Tanításra alkalmatlan snapshotok fő oka: ${item.reason} (${item.n} db).`);
+
+      return res.json({ ok: true, data: {
+        label: 'PAPER RESULTS (real closed PAPER trades) - separate from SHADOW labels',
+        periodDays: sinceDays,
+        strategies: { DEFAULT: paperStats(closed.filter((trade) => trade.entryStrategy !== 'ML')), ML: paperStats(mlTrades) },
+        byModel,
+        openMlPositions: openMl,
+        decisions: decisionGroups.map((item) => ({ modelVersion: item.modelVersion, mlDecision: item.mlDecision, count: item._count._all })),
+        mlBuyOutcomes: Object.fromEntries(outcomeGroups.map((item) => [item.outcome, item._count._all])),
+        recentDecisions: recentDecisions.map((item) => ({ ...item, probability: num(item.probability), threshold: num(item.threshold) })),
+        training: {
+          label: 'SHADOW TRAINING DATA (all New Launch candidates, independent of the active strategy)',
+          snapshots: Object.fromEntries(snapshotKinds.map((item) => [item.kind, item._count._all])),
+          outcomes: outcomeCounts,
+          validForTraining: Object.fromEntries(validity.map((item) => [String(item.validForTraining), item._count._all])),
+          labelledCandidates: labelled,
+          coverage: { from: range._min.snapshotAt, to: range._max.snapshotAt, candidates: range._count._all },
+          mlPaperTradesClosed: mlTradesClosed,
+          lastDataset: lastDataset ? { version: lastDataset.version, createdAt: lastDataset.createdAt, rows: lastDataset.rowCount, readiness: record(lastDataset.manifest).readiness ?? null } : null,
+          newValidCandidatesSinceLastDataset: sinceLastDataset,
+          qualityIssues: issues,
+          invalidReasons,
+        },
+      } });
+    } catch (error) {
+      deps.logger.error({ err: error }, 'ML PAPER analytics failed');
+      return fail(res, 500, 'ML PAPER analytics unavailable');
+    }
+  });
+
+  return router;
+}

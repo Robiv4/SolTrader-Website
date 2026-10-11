@@ -36,7 +36,7 @@ async function runEntry(options: { configuredSize: number | null; manualAmount?:
     auditLog: { create: async ({ data }: any) => { audits.push(data); return data; } },
   };
   const prisma = {
-    botConfig: { findMany: async () => [{ userId: 'user-1', tradingMode: 'PAPER', isScannerEnabled: true, maxPositionSize: options.configuredSize === null ? null : decimal(options.configuredSize), maxDailyLoss: null, user: { riskConfigs: [riskConfig] } }] },
+    botConfig: { findMany: async () => [{ userId: 'user-1', tradingMode: 'PAPER', maxPositionSize: options.configuredSize === null ? null : decimal(options.configuredSize), maxDailyLoss: null, user: { riskConfigs: [riskConfig] } }] },
     signal: { findMany: async () => [signal] },
     paperOrder: { findFirst: async () => null },
     approvalRequest: { findFirst: async () => null },
@@ -51,6 +51,8 @@ async function runEntry(options: { configuredSize: number | null; manualAmount?:
     provider: { getTokenMetrics: async () => ({ metadata: { address: 'TOKEN', symbol: 'TKN' }, timestamp: new Date(), priceUsd: 1, liquidityUsd: 10_000_000, provider: 'test' }) } as any,
     publishEvent: async () => undefined,
     logger: { info: () => undefined, warn: () => undefined, error: () => undefined },
+    // Shared sizing engine with generic signals (production executes NEW_LAUNCH only).
+    automaticSources: ['STRATEGY', 'MANUAL_PAPER', 'NEW_LAUNCH'],
   });
   const summary = await coordinator.runCycle({ aborted: false });
   return { summary, order: orders[0], trade: trades[0], audits };

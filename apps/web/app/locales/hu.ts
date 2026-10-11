@@ -1,7 +1,7 @@
 export const hu = {
   nav: {
     overview: 'Áttekintés', dashboard: 'Irányítópult', positions: 'Pozíciók', trades: 'Kereskedések',
-    markets: 'Piacok', tokens: 'Tokenfigyelő', newLaunch: 'Új tokenek', signals: 'Jelzések', strategies: 'Stratégiák', analytics: 'Elemzések',
+    markets: 'Piacok', newLaunch: 'Új tokenek', signals: 'Jelzések', insights: 'Elemzés', analytics: 'Elemzések',
     account: 'Fiók', wallet: 'Tárca', settings: 'Beállítások', system: 'Rendszer', health: 'Rendszerállapot', logs: 'Naplók',
   },
   status: {

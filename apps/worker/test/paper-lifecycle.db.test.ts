@@ -42,7 +42,8 @@ async function enter(name: string) {
   const token = tokens[name];
   prices[token.address] = 1;
   await prisma.signal.create({ data: { tokenId: token.id, userId, strategyName: 'MomentumStrategy', direction: 'BUY', score: 65, riskScore: 60, signalType: 'STRATEGY', reasons: ['SIMULATION'], metadata: { riskClassification: 'HIGH', riskPolicy: 'EXPLORATORY' }, mode: 'SCANNER' } });
-  const coordinator = new PaperExecutionCoordinator({ prisma: scopedPrisma(), provider, publishEvent: async () => undefined, logger: { info: () => undefined, warn: () => undefined, error: () => undefined } });
+  // Shared order / exit lifecycle with a generic signal (production executes NEW_LAUNCH only).
+  const coordinator = new PaperExecutionCoordinator({ prisma: scopedPrisma(), provider, publishEvent: async () => undefined, logger: { info: () => undefined, warn: () => undefined, error: () => undefined }, automaticSources: ['STRATEGY', 'MANUAL_PAPER', 'NEW_LAUNCH'] });
   const summary = await coordinator.runCycle({ aborted: false });
   expect(summary.executed).toBe(1);
   return prisma.position.findFirstOrThrow({ where: { userId, tokenId: token.id, status: 'OPEN' } });
@@ -67,7 +68,7 @@ beforeAll(async () => {
   const user = await prisma.user.create({ data: { email: `paper-sim-${runId}@soltrader.test` } });
   userId = user.id;
   await prisma.paperAccount.create({ data: { userId, initialBalance: 1_000, cashBalance: 1_000, equity: 1_000 } });
-  await prisma.botConfig.create({ data: { userId, tradingMode: 'PAPER', status: 'RUNNING', isScannerEnabled: true } });
+  await prisma.botConfig.create({ data: { userId, tradingMode: 'PAPER', status: 'RUNNING' } });
   await prisma.riskConfig.create({ data: {
     userId, maxPositionPercent: 5, maxTotalExposurePercent: 25, maxConcurrentPositions: 4, dailyLossLimitPercent: 8, maxSlippagePercent: 3,
     minSignalScore: 35, cooldownSeconds: 60, stopLossPercent: 20, takeProfitPercent: 25, trailingStopPercent: 8, trailingActivationPercent: 15,

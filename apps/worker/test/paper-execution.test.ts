@@ -9,6 +9,32 @@ function decimal(value: number) {
   return new Prisma.Decimal(value);
 }
 
+describe('retired entry sources', () => {
+  it('by default only NEW_LAUNCH signals are executed: legacy STRATEGY / MANUAL_PAPER / AI signals are ignored', async () => {
+    let decided = 0;
+    const token = { address: 'TOKEN', symbol: 'TKN' };
+    const base = { userId: 'user-1', tokenId: 'token-1', score: decimal(95), riskScore: decimal(10), createdAt: new Date(), token };
+    const prisma = {
+      botConfig: { findMany: async () => [{ userId: 'user-1', tradingMode: 'PAPER', maxPositionSize: null, maxDailyLoss: null, user: { riskConfigs: [] } }] },
+      signal: { findMany: async () => [
+        { ...base, id: 'strategy', tokenId: 'token-1', strategyName: 'Momentum', metadata: {} },
+        { ...base, id: 'manual', tokenId: 'token-2', strategyName: 'MANUAL_PAPER', metadata: { executionSource: 'MANUAL_PAPER', requestedAmount: 10 } },
+        { ...base, id: 'ai', tokenId: 'token-3', strategyName: 'AI', metadata: { decisionSource: 'AI', aiAnalysisId: 'x' } },
+      ] },
+      paperOrder: { findFirst: async () => { decided += 1; return null; } },
+    } as unknown as PrismaClient;
+    const coordinator = new PaperExecutionCoordinator({
+      prisma,
+      provider: { getTokenMetrics: async () => { decided += 1; return null; } } as any,
+      publishEvent: async () => undefined,
+      logger: { info: () => undefined, warn: () => undefined, error: () => undefined },
+    });
+    const summary = await coordinator.runCycle({ aborted: false });
+    expect(summary).toMatchObject({ users: 1, candidates: 0, executed: 0, proposed: 0, rejected: 0, errors: 0 });
+    expect(decided).toBe(0);
+  });
+});
+
 describe('autonomous paper trading pipeline', () => {
   it('runs signal to paper buy, position, paper sell, trade, and P&L', async () => {
     const orders: Array<Record<string, unknown>> = [];
@@ -23,7 +49,6 @@ describe('autonomous paper trading pipeline', () => {
     const activeConfig = {
       userId: 'user-1',
       tradingMode: 'PAPER',
-      isScannerEnabled: true,
       maxPositionSize: null,
       riskThreshold: decimal(50),
       user: { riskConfigs: [{ maxPositionPercent: decimal(10), maxTotalExposurePercent: decimal(50), maxConcurrentPositions: 3, maxSlippagePercent: decimal(3), minSignalScore: decimal(70), cooldownSeconds: 0, stopLossPercent: decimal(2), takeProfitPercent: decimal(4), trailingStopPercent: decimal(2) }] },
@@ -71,6 +96,8 @@ describe('autonomous paper trading pipeline', () => {
       provider: { getTokenMetrics: async () => ({ metadata: { address: 'TOKEN', symbol: 'TKN' }, timestamp: new Date(), priceUsd: 100, liquidityUsd: 1_000_000, provider: 'test' }) } as any,
       publishEvent: async (type) => { events.push(type); },
       logger: { info: () => undefined, warn: () => undefined, error: () => undefined },
+      // Exercises the shared sizing / order / exit engine with a generic signal (production executes NEW_LAUNCH only).
+      automaticSources: ['STRATEGY', 'MANUAL_PAPER', 'NEW_LAUNCH'],
     });
 
     const summary = await coordinator.runCycle(new globalThis.AbortController().signal);

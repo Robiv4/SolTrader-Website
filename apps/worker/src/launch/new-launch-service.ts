@@ -1,13 +1,14 @@
 import { Prisma, type PrismaClient } from '@prisma/client';
 import type { TokenDataProvider } from '@soltrader/market-data';
 import { assessRisk, type RiskFactorInput } from '@soltrader/risk-engine';
-import { buyerTrendFromObservations, evaluateNewLaunch, socialBlocksEntry, evaluateQualityGate, socialSummary, type LaunchSecurity, type LaunchState, type NewLaunchStrategyResult, type QualityGateResult, type SocialSnapshotResult } from '@soltrader/strategy-engine';
+import { buildMlFeatureSnapshot, buyerTrendFromObservations, evaluateNewLaunch, mlEntrySafetyBlockers, socialBlocksEntry, evaluateQualityGate, socialSummary, type LaunchSecurity, type LaunchState, type NewLaunchStrategyResult, type QualityGateResult, type SocialSnapshotResult } from '@soltrader/strategy-engine';
 import { toRiskEngineConfig } from '@soltrader/token-discovery';
 
-import type { MlShadowService } from '../ml/ml-shadow-service.js';
-import { loadActiveUserScanSettings } from '../scan-config.js';
+import { DEFAULT_ML_PAPER_CONFIG, type MlPaperEntryEngine, type MlPaperUserConfig, toMlPaperConfig } from '../ml/ml-paper-engine.js';
+import { ML_REFERENCE_ORDER_USD, type MlShadowService } from '../ml/ml-shadow-service.js';
 import { inRejectedSample, type SocialService } from '../social/social-service.js';
 import type { TradingLoopLogger } from '../trading-loop.js';
+import { loadActiveUserRiskSettings } from '../user-risk-settings.js';
 
 import { LaunchTracker, type LaunchQuote, type TrackedLaunch } from './launch-tracker.js';
 import { type LaunchEvent, type LaunchProviderStatus, type NewLaunchProvider, WSOL_MINT } from './providers.js';
@@ -45,6 +46,11 @@ export interface NewLaunchServiceDependencies {
    * wrapped (failures isolated) and nothing is awaited: it cannot change or delay any trading decision.
    */
   ml?: Pick<MlShadowService, 'attach' | 'onTrade' | 'onComplete' | 'onEvaluation' | 'onTick' | 'onStreamDown' | 'onStreamUp'>;
+  /**
+   * ML PAPER entry engine (users who selected the ML strategy only). Replaces the strategic entry signal; every safety
+   * rule stays mandatory. Fail-closed: any ML failure means no entry for that candidate (no fallback buy).
+   */
+  mlPaper?: Pick<MlPaperEntryEngine, 'step' | 'markSignaled' | 'resolved'>;
   tickMs?: number;
   now?: () => number;
 }
@@ -55,6 +61,8 @@ interface UserContext {
   riskPolicy: string;
   riskConfig: ReturnType<typeof toRiskEngineConfig> | null;
   intendedOrderUsd: number | null;
+  /** Entry strategy of this user: DEFAULT (rule-based) or ML (approved model). Exactly one of them can buy. */
+  strategy: MlPaperUserConfig;
 }
 
 interface DecisionMemory {
@@ -201,16 +209,25 @@ export class NewLaunchService {
       this.userCache = { at: now, users: [] };
       return [];
     }
-    const scanSettings = await loadActiveUserScanSettings(this.deps.prisma).catch(() => []);
+    const scanSettings = await loadActiveUserRiskSettings(this.deps.prisma).catch(() => []);
+    // Strategy selection; unreadable -> treated as ML without a model (no entries at all), never as DEFAULT buying.
+    let strategies: Map<string, MlPaperUserConfig> | null = null;
+    try {
+      const rows = await this.deps.prisma.mlPaperSettings.findMany({ where: { userId: { in: configs.map((config) => config.userId) } } });
+      strategies = new Map((rows ?? []).map((row) => [row.userId, toMlPaperConfig(row)]));
+    } catch (error) {
+      this.deps.logger.warn({ err: error instanceof Error ? error.message : String(error) }, 'Strategy selection unreadable: New Launch entries paused this cycle');
+    }
     const users: UserContext[] = [];
     for (const config of configs) {
       const scan = scanSettings.find((entry) => entry.userId === config.userId);
-      // Only users whose bot runs in PAPER mode without emergency stop (the scan settings query applies that).
+      // Only users whose bot runs in PAPER mode without emergency stop (the risk settings query applies that).
       const bot = await this.deps.prisma.botConfig.findUnique({ where: { userId: config.userId }, select: { tradingMode: true } });
       if (!scan || bot?.tradingMode !== 'PAPER') continue;
       const account = await this.deps.prisma.paperAccount.findUnique({ where: { userId: config.userId }, select: { equity: true } }).catch(() => null);
       const settings = resolveNewLaunchSettings(config as unknown as Record<string, unknown>);
-      users.push({ userId: config.userId, settings, riskPolicy: scan.riskPolicy, riskConfig: toRiskEngineConfig(scan), intendedOrderUsd: account ? Number(account.equity) * settings.maxPositionPercent / 100 : null });
+      const strategy = strategies ? strategies.get(config.userId) ?? DEFAULT_ML_PAPER_CONFIG : { ...DEFAULT_ML_PAPER_CONFIG, mode: 'ML' as const };
+      users.push({ userId: config.userId, settings, riskPolicy: scan.riskPolicy, riskConfig: toRiskEngineConfig(scan), intendedOrderUsd: account ? Number(account.equity) * settings.maxPositionPercent / 100 : null, strategy });
     }
     this.userCache = { at: now, users };
     return users;
@@ -391,7 +408,9 @@ export class NewLaunchService {
     for (const user of users) {
       const key = `${user.userId}:${launch.mint}`;
       const memory = this.decisions.get(key);
-      if (memory?.sticky || memory?.signaled) continue;
+      const mlUser = user.strategy.mode === 'ML';
+      // ML users: the rule-based memory must not stop the (single) ML decision for this candidate.
+      if ((memory?.sticky || memory?.signaled) && (!mlUser || this.deps.mlPaper?.resolved(user.userId, launch.mint) !== false)) continue;
       const security = await this.securityFor(launch, user.settings.minObservedSellers, now);
       const state = this.tracker.state(launch.mint, user.intendedOrderUsd);
       if (!state) continue;
@@ -415,6 +434,14 @@ export class NewLaunchService {
       const reasonKey = `${result.decision}|${result.status}|${result.reasons.join(',')}|${gate ? `${gate.mode}:${gate.reasons.join(',')}` : ''}`;
       // Copy of the decision for the ML learning pipeline (read-only; the decision above is already final).
       this.mlSafe(() => this.deps.ml?.onEvaluation({ userId: user.userId, mint: launch.mint, at: now, decision: result.decision, status: result.status, reasons: result.reasons, score: result.score, riskScore: risk.riskScore, configVersion: user.settings.configVersion ?? null, social }));
+      if (mlUser) {
+        try {
+          await this.mlPaperStep({ launch, user, result, risk, security, state, social, now, getCandidateId: async () => (candidateId ??= await this.ensureCandidate(launch)) });
+        } catch (error) {
+          // Fail-closed: an ML failure never opens anything and never touches exits.
+          this.deps.logger.warn({ err: error instanceof Error ? error.message : String(error), mint: launch.mint, userId: user.userId }, 'ML PAPER step failed: no entry');
+        }
+      }
       if (memory && memory.reasonKey === reasonKey) continue;
       const decisionRow = await this.deps.prisma.launchDecision.create({
         data: {
@@ -446,7 +473,8 @@ export class NewLaunchService {
         this.deps.logger.info({ event: 'new_launch_social_blocked', userId: user.userId, mint: launch.mint, warnings: social?.warnings }, 'new_launch_social_blocked');
         continue;
       }
-      if (result.decision === 'BUY' && risk.riskScore !== null && risk.classification) {
+      // ML strategy users never get a rule-based entry (one strategy buys, never both).
+      if (!mlUser && result.decision === 'BUY' && risk.riskScore !== null && risk.classification) {
         const signalId = await this.createBuySignal(launch, user, result, risk, decisionRow.id, security.completedAt, now, state, security.security, gate, social);
         const current = this.decisions.get(key);
         if (current) current.signaled = Boolean(signalId);
@@ -486,8 +514,55 @@ export class NewLaunchService {
     }, user.settings.qualityGate);
   }
 
-  /** Idempotent: at most one NEW_LAUNCH BUY signal per user and mint. */
-  private async createBuySignal(launch: TrackedLaunch, user: UserContext, result: NewLaunchStrategyResult, risk: ReturnType<NewLaunchService['riskFor']>, decisionId: string, securityCompletedAt: number | null, now: number, state: LaunchState, security: LaunchSecurity, gate: QualityGateResult | null, social: SocialSnapshotResult | null = null) {
+  /**
+   * ML strategy: the single ML decision at the model's snapshot point, then (ML BUY only) the BUY signal once every
+   * mandatory safety rule is green inside the decision window. The rule-based result is used for its safety facts only.
+   */
+  private async mlPaperStep(context: { launch: TrackedLaunch; user: UserContext; result: NewLaunchStrategyResult; risk: ReturnType<NewLaunchService['riskFor']>; security: SecurityMemory; state: LaunchState; social: SocialSnapshotResult | null; now: number; getCandidateId: () => Promise<string> }) {
+    const engine = this.deps.mlPaper;
+    const { launch, user, result, risk, security, state, social, now } = context;
+    if (!engine) return;
+    const mlState = () => this.tracker.state(launch.mint, ML_REFERENCE_ORDER_USD);
+    const step = await engine.step({
+      userId: user.userId, mint: launch.mint, detectedAt: launch.detectedAt, now, config: user.strategy,
+      candidateId: context.getCandidateId,
+      buildFeatures: () => {
+        const reference = mlState();
+        return buildMlFeatureSnapshot({
+          snapshotAt: now, source: launch.source, detectedAt: launch.detectedAt, createdAt: launch.createdAt, firstTradeAt: launch.firstTradeAt,
+          state: reference, security: security.security, securityObservedAt: security.completedAt, riskScore: risk.riskScore, riskObservedAt: risk.riskScore === null ? null : now,
+          social, referenceImpactPct: reference?.priceImpactPercent ?? null,
+        });
+      },
+      eligible: (snapshot) => {
+        const last = mlState()?.observations.at(-1);
+        return snapshot.referencePriceUsd !== null && (last?.buyCount ?? 0) + (last?.sellCount ?? 0) >= 2;
+      },
+      safetyBlockers: () => {
+        const blockers = mlEntrySafetyBlockers({ result, security: security.security, riskScore: risk.riskScore, riskHardBlockReasons: risk.hardBlockReasons, settings: user.settings, detectedAt: launch.detectedAt, now });
+        if (risk.classification === null) blockers.push('RISK_NOT_CLASSIFIED');
+        // User-configured entry filters can only remove an entry, in ML mode too.
+        const gate = this.qualityGateFor(result, state, user);
+        if (gate.blocksEntry) blockers.push('QUALITY_GATE_FAILED');
+        if (socialBlocksEntry({ decision: 'BUY', mode: user.settings.socialDecisionMode, shadowDecision: social?.shadowDecision })) blockers.push('SOCIAL_AVOID');
+        return blockers;
+      },
+      base: { decision: result.decision, reasons: result.reasons },
+    });
+    if (step.action !== 'SIGNAL') return;
+    const candidateId = await context.getCandidateId();
+    const decisionRow = await this.deps.prisma.launchDecision.findFirst({ where: { userId: user.userId, candidateId }, orderBy: { decisionAt: 'desc' }, select: { id: true } }).catch(() => null);
+    const gate = this.qualityGateFor(result, state, user);
+    const signalId = await this.createBuySignal(launch, user, result, risk, decisionRow?.id ?? null, security.completedAt, now, state, security.security, gate, social, {
+      entryStrategy: 'ML', decisionId: step.decisionId, modelVersion: step.modelVersion, probability: step.probability, threshold: step.threshold,
+      snapshotKind: step.snapshotKind, snapshotAt: new Date(step.snapshotAt).toISOString(), featureHash: step.featureHash,
+    });
+    await engine.markSignaled(user.userId, launch.mint, signalId, now);
+    if (signalId) this.deps.logger.info({ event: 'ml_paper_buy_signal', userId: user.userId, mint: launch.mint, modelVersion: step.modelVersion, probability: step.probability, threshold: step.threshold }, 'ml_paper_buy_signal');
+  }
+
+  /** Idempotent: at most one NEW_LAUNCH BUY signal per user and mint (whichever strategy made it). */
+  private async createBuySignal(launch: TrackedLaunch, user: UserContext, result: NewLaunchStrategyResult, risk: ReturnType<NewLaunchService['riskFor']>, decisionId: string | null, securityCompletedAt: number | null, now: number, state: LaunchState, security: LaunchSecurity, gate: QualityGateResult | null, social: SocialSnapshotResult | null = null, ml: Record<string, unknown> | null = null) {
     const token = await this.deps.prisma.token.upsert({
       where: { address: launch.mint },
       update: {},
@@ -495,7 +570,8 @@ export class NewLaunchService {
       select: { id: true },
     });
     const existing = await this.deps.prisma.signal.findFirst({ where: { userId: user.userId, tokenId: token.id, strategyName: NEW_LAUNCH_STRATEGY, direction: 'BUY' }, select: { id: true } });
-    if (existing) return existing.id;
+    // An ML BUY never piggybacks on an older signal: it reports "not created" and stays unexecuted.
+    if (existing) return ml ? null : existing.id;
     const strategy = await this.deps.prisma.strategy.upsert({ where: { name: NEW_LAUNCH_STRATEGY }, update: {}, create: { name: NEW_LAUNCH_STRATEGY, type: 'new-launch', mode: 'SCANNER', isEnabled: true } });
     const f = result.features;
     const signal = await this.deps.prisma.signal.create({
@@ -505,6 +581,8 @@ export class NewLaunchService {
         reasons: result.reasons as Prisma.InputJsonValue, entryConditions: ['all launch conditions met', 'sellability verified', 'no hard block'] as Prisma.InputJsonValue, invalidationConditions: [] as Prisma.InputJsonValue,
         metadata: {
           decisionSource: 'NEW_LAUNCH', primaryStrategy: NEW_LAUNCH_STRATEGY,
+          // Which strategy initiated the entry (immutable origin): DEFAULT rule-based or ML model.
+          entryStrategy: ml ? 'ML' : 'DEFAULT', ml,
           riskClassification: risk.classification, hardBlocked: false, hardBlockReasons: [], riskPolicy: user.riskPolicy,
           riskPositionMultiplier: risk.positionMultiplier, riskWarnings: risk.warnings, riskFactors: risk.factors,
           exhaustionBlocked: false, criticalLiquidityOutflow: false,
@@ -567,7 +645,7 @@ export class NewLaunchService {
         } as unknown as Prisma.InputJsonValue,
       },
     });
-    await this.deps.prisma.launchDecision.update({ where: { id: decisionId }, data: { signalId: signal.id } });
+    if (decisionId) await this.deps.prisma.launchDecision.update({ where: { id: decisionId }, data: { signalId: signal.id } });
     this.deps.logger.info({ event: 'new_launch_buy_signal', userId: user.userId, mint: launch.mint, score: result.score }, 'new_launch_buy_signal');
     return signal.id;
   }

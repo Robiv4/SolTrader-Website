@@ -18,19 +18,15 @@ function setup(initialStatus: WorkerBotStatus = 'STOPPED') {
     recordEvent: async (action) => { events.push(action); },
   };
   const subscriber = new FakeSubscriber();
-  let tokenCycles = 0;
-  let strategyCycles = 0;
   let executionCycles = 0;
   let positionCycles = 0;
   let cancelled: string | undefined;
   const loop = new BotTradingLoop(store, subscriber, {
-    runTokenMonitor: async () => { tokenCycles += 1; },
-    runStrategies: async () => { strategyCycles += 1; },
     runPaperExecution: async () => { executionCycles += 1; },
     monitorOpenPositions: async () => { positionCycles += 1; },
     cancelPendingOffers: async (reason) => { cancelled = reason; },
   }, 60_000);
-  return { loop, subscriber, states, events, counters: { get token() { return tokenCycles; }, get strategy() { return strategyCycles; }, get execution() { return executionCycles; }, get positions() { return positionCycles; } }, get cancelled() { return cancelled; } };
+  return { loop, subscriber, states, events, counters: { get execution() { return executionCycles; }, get positions() { return positionCycles; } }, get cancelled() { return cancelled; } };
 }
 
 describe('worker trading state machine', () => {
@@ -40,9 +36,8 @@ describe('worker trading state machine', () => {
     await Promise.resolve();
     await Promise.resolve();
     expect(fixture.loop.currentStatus).toBe('RUNNING');
-    expect(fixture.counters.token).toBeGreaterThan(0);
-    expect(fixture.counters.strategy).toBeGreaterThan(0);
     expect(fixture.counters.execution).toBeGreaterThan(0);
+    expect(fixture.counters.positions).toBeGreaterThan(0);
     await fixture.loop.stop();
   });
 
@@ -52,7 +47,7 @@ describe('worker trading state machine', () => {
     await Promise.resolve();
     await Promise.resolve();
     expect(fixture.counters.positions).toBeGreaterThan(0);
-    expect(fixture.counters.token).toBe(0);
+    expect(fixture.counters.execution).toBe(0);
     await fixture.loop.stop();
   });
 

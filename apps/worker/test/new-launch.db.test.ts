@@ -29,7 +29,7 @@ async function createUser(options: { aiEnabled: boolean; launchEnabled: boolean;
   const user = await prisma.user.create({ data: { email: `new-launch-${randomUUID().slice(0, 8)}@soltrader.test` } });
   createdUsers.push(user.id);
   await prisma.paperAccount.create({ data: { userId: user.id, initialBalance: 1_000, cashBalance: 1_000, equity: 1_000 } });
-  await prisma.botConfig.create({ data: { userId: user.id, tradingMode: options.tradingMode ?? 'PAPER', status: 'RUNNING', isScannerEnabled: true, maxPositionSize: 200 } });
+  await prisma.botConfig.create({ data: { userId: user.id, tradingMode: options.tradingMode ?? 'PAPER', status: 'RUNNING', maxPositionSize: 200 } });
   await prisma.riskConfig.create({ data: {
     userId: user.id, maxPositionPercent: 5, maxTotalExposurePercent: 25, maxConcurrentPositions: 4, dailyLossLimitPercent: 8, maxSlippagePercent: 3,
     minSignalScore: 60, cooldownSeconds: 0, stopLossPercent: 12, takeProfitPercent: 40, trailingStopPercent: 8, trailingActivationPercent: 15,

@@ -49,7 +49,7 @@ pnpm install
 pnpm db:generate
 pnpm db:deploy
 pnpm --dir apps/api dev      # http://localhost:3001
-pnpm --dir apps/worker dev   # scanner, strategies, paper execution, position protection
+pnpm --dir apps/worker dev   # New Launch discovery, paper execution, position protection, ML SHADOW
 pnpm --dir apps/web dev      # http://localhost:3000
 ```
 

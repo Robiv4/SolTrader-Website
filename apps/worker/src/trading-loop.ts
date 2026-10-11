@@ -7,9 +7,11 @@ function createAbortController() {
   return new globalThis.AbortController();
 }
 
+/**
+ * Hooks of one RUNNING cycle. Discovery and entry decisions come from the event-driven New Launch service; the loop
+ * executes its PAPER signals and protects open positions (the legacy token monitor / strategy hooks were retired).
+ */
 export interface TradingLoopHooks {
-  runTokenMonitor(signal: WorkerAbortSignal): Promise<void>;
-  runStrategies(signal: WorkerAbortSignal): Promise<void>;
   runPaperExecution(signal: WorkerAbortSignal): Promise<void>;
   monitorOpenPositions(signal: WorkerAbortSignal): Promise<void>;
   cancelPendingOffers(reason: 'STOP' | 'EMERGENCY_STOP'): Promise<void>;
@@ -28,8 +30,6 @@ export interface TradingLoopLogger {
 }
 
 const defaultHooks: TradingLoopHooks = {
-  runTokenMonitor: async () => undefined,
-  runStrategies: async () => undefined,
   runPaperExecution: async () => undefined,
   monitorOpenPositions: async () => undefined,
   cancelPendingOffers: async () => undefined,
@@ -165,10 +165,6 @@ export class BotTradingLoop {
 
   private async runRunningCycle() {
     const signal = this.cycleAbortController.signal;
-    await this.hooks.runTokenMonitor(signal);
-    if (signal.aborted || this.status !== 'RUNNING') return;
-    await this.hooks.runStrategies(signal);
-    if (signal.aborted || this.status !== 'RUNNING') return;
     await this.hooks.runPaperExecution(signal);
     if (signal.aborted || this.status !== 'RUNNING') return;
     await this.hooks.monitorOpenPositions(signal);

@@ -16,7 +16,7 @@ describe('dashboard polling does not starve trading actions', () => {
     const reads = await Promise.all(Array.from({ length: 150 }, () => request(app).get('/api/bot/status')));
     // 150 reads exceed the former 120/min shared limit but stay far below the read budget.
     expect(reads.some((response) => response.status === 429)).toBe(false);
-    const write = await request(app).post('/api/paper/orders/manual-buy').send({});
+    const write = await request(app).post('/api/bot/start').send({});
     expect(write.status).not.toBe(429);
   });
 });
