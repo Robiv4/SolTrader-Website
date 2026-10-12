@@ -95,6 +95,14 @@ export default function NewLaunchPage() {
   const [showProviders, setShowProviders] = useState(false);
 
   useEffect(() => { if (lastEvent) refresh(); }, [lastEvent, refresh]);
+  // Top bar search: ?q=… on arrival, or an event while the list is open.
+  useEffect(() => {
+    const initial = new globalThis.URLSearchParams(globalThis.location.search).get('q');
+    if (initial) setQuery(initial);
+    const onSearch = (event: globalThis.Event) => setQuery(String((event as globalThis.CustomEvent<string>).detail ?? ''));
+    globalThis.addEventListener('soltrader:search', onSearch);
+    return () => globalThis.removeEventListener('soltrader:search', onSearch);
+  }, []);
   useEffect(() => {
     const timer = globalThis.setInterval(() => { if (globalThis.document.visibilityState === 'visible') refresh(); }, POLL_MS);
     return () => globalThis.clearInterval(timer);

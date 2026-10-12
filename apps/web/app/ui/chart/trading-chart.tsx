@@ -54,7 +54,7 @@ function cssVar(name: string, fallback: string) {
 function themeColors() {
   return {
     text: cssVar('--muted', '#8b94a6'), grid: cssVar('--border-soft', 'rgba(148,163,199,0.08)'), border: cssVar('--border', '#1f2633'),
-    up: cssVar('--up', '#2fd492'), down: cssVar('--down', '#ff5c72'), brand: cssVar('--brand', '#8b80ff'), warning: cssVar('--warning', '#f5b84a'), info: cssVar('--info', '#6ea8ff'), trailing: cssVar('--trailing', '#ff9a4d'),
+    up: cssVar('--up', '#2fd492'), down: cssVar('--down', '#ff5c72'), brand: cssVar('--brand', '#2be36f'), warning: cssVar('--warning', '#f5b84a'), info: cssVar('--info', '#6ea8ff'), trailing: cssVar('--trailing', '#ff9a4d'),
   };
 }
 

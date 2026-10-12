@@ -1,0 +1,209 @@
+/* ==========================================================================
+   SolTrader visual theme (loaded last): neutral graphite surfaces, one signal-green accent,
+   large soft radii, icon rail navigation. No gradients, glows or tinted haze.
+   ========================================================================== */
+
+:root {
+  --bg: #f2f3f2;
+  --surface: #ffffff;
+  --surface-2: #f6f7f6;
+  --surface-3: #ebedeb;
+  --input: #f6f7f6;
+  --border: #e3e5e3;
+  --border-strong: #cdd1cd;
+  --border-soft: rgba(0, 0, 0, 0.06);
+  --glass: rgba(242, 243, 242, 0.94);
+  --text: #111312;
+  --text-2: #3a3f3c;
+  --muted: #646b67;
+  --faint: #959b97;
+  /* Accent: green that keeps 4.5:1 as text on white; buttons use the brighter fill + dark label. */
+  --brand: #0b8a3e;
+  --brand-2: #0fa24a;
+  --brand-fill: #19c95c;
+  --on-brand: #06120a;
+  --brand-soft: rgba(25, 201, 92, 0.13);
+  --brand-gradient: linear-gradient(var(--brand-fill), var(--brand-fill));
+  --positive: #0b8a3e;
+  --positive-soft: rgba(25, 201, 92, 0.13);
+  --negative: #d6283a;
+  --negative-soft: rgba(214, 40, 58, 0.1);
+  --accent-text: #0b7a37;
+  --up: #12b257;
+  --down: #e5363f;
+  --radius-xl: 20px;
+  --radius-lg: 16px;
+  --radius: 12px;
+  --radius-sm: 9px;
+  --shadow: none;
+  --shadow-pop: 0 16px 44px rgba(0, 0, 0, 0.16);
+}
+
+:root[data-theme='dark'] {
+  --bg: #121212;
+  --surface: #1c1c1e;
+  --surface-2: #242427;
+  --surface-3: #2c2c30;
+  --input: #2a2a2d;
+  --border: #2a2a2e;
+  --border-strong: #3a3a3f;
+  --border-soft: rgba(255, 255, 255, 0.05);
+  --glass: rgba(18, 18, 18, 0.94);
+  --text: #f4f4f5;
+  --text-2: #cfcfd4;
+  --muted: #8f8f96;
+  --faint: #626268;
+  --brand: #2be36f;
+  --brand-2: #4cf088;
+  --brand-fill: #2be36f;
+  --on-brand: #04140a;
+  --brand-soft: rgba(43, 227, 111, 0.13);
+  --brand-gradient: linear-gradient(var(--brand-fill), var(--brand-fill));
+  --positive: #2be36f;
+  --positive-soft: rgba(43, 227, 111, 0.12);
+  --negative: #ff4d56;
+  --negative-soft: rgba(255, 77, 86, 0.13);
+  --warning: #f2b544;
+  --warning-soft: rgba(242, 181, 68, 0.13);
+  --info: #6aa8ff;
+  --info-soft: rgba(106, 168, 255, 0.13);
+  --accent-text: #8ff2b3;
+  --negative-text: #ffc0c4;
+  --up: #2be36f;
+  --down: #ff4d56;
+  --shadow: none;
+  --shadow-pop: 0 18px 50px rgba(0, 0, 0, 0.6);
+}
+:root[data-theme='dark'] body::before, body::before { display: none; background: none; }
+body { background: var(--bg); }
+
+/* ---------- Accent surfaces: solid fill, dark label, no glow ---------- */
+.primary-button, .login-button, .wallet-btn.connect { background: var(--brand-fill); color: var(--on-brand); box-shadow: none; border-color: transparent; }
+.primary-button:hover:not(:disabled), .login-button:hover:not(:disabled), .wallet-btn.connect:hover { background: var(--brand-2); filter: none; }
+.toggle-label input:checked + .toggle-track { background: var(--brand-fill); }
+.wallet-symbol, .settings-nav-item.active .settings-nav-icon { background: var(--brand-fill); color: var(--on-brand); }
+.kpi-brand { background: var(--surface); border-color: var(--border); color: var(--text); }
+.kpi-brand .kpi-icon { background: var(--brand-soft); color: var(--brand); }
+.kpi-brand .kpi-label, .kpi-brand .kpi-note, .kpi-brand .kpi-value small { color: var(--muted); }
+.kpi-brand .kpi-sub span { color: inherit !important; }
+.kpi-brand .kpi-sub .positive-value { color: var(--positive) !important; }
+.kpi-brand .kpi-sub .negative-value { color: var(--negative) !important; }
+.eyebrow { background: none; color: var(--muted); }
+:focus-visible { outline: 2px solid var(--brand-fill); outline-offset: 2px; }
+
+/* ---------- Cards: one radius, flat surfaces ---------- */
+.tcard, .scard, .dash-card, .panel, .kpi, .token-header, .tchart, .side-block, .nl-stats, .wallet-hero, .wallet-empty, .sep-card { border-radius: var(--radius-xl); box-shadow: none; }
+.tcard, .scard, .dash-card, .kpi { border-color: transparent; }
+.nl-stats { border-color: transparent; gap: 1px; background: var(--border); }
+
+/* ---------- Pills: segmented controls, chips, tabs ---------- */
+.seg, .segmented { gap: 4px; padding: 4px; border: 0; border-radius: 12px; background: var(--surface-2); }
+.seg button, .segmented button { min-height: 30px; padding: 0 12px; border-radius: 9px; color: var(--muted); font-weight: 650; }
+.seg button.active, .segmented button.selected { background: var(--brand-fill); color: var(--on-brand); box-shadow: none; }
+.chip { border-color: transparent; background: var(--surface-2); color: var(--text-2); }
+.chip.active { background: var(--brand-fill); color: var(--on-brand); }
+.chip.active .chip-count { color: var(--on-brand); opacity: 0.7; }
+.tabnav button[aria-selected='true'], .tabnav .active { color: var(--text); }
+.filterbar-search, .top-search { border-color: transparent; background: var(--input); }
+
+/* ---------- Icon rail (desktop) ---------- */
+.sidebar { flex: 0 0 84px; width: 84px; align-items: center; padding: 18px 12px 16px; border-right: 0; background: var(--bg); }
+.brand { justify-content: center; padding: 0 0 18px; }
+.brand-mark { flex-basis: 44px; width: 44px; height: 44px; border-radius: 50%; background: transparent; color: var(--brand); box-shadow: inset 0 0 0 2px var(--brand); }
+.brand-text { display: none; }
+.nav { display: flex; flex-direction: column; align-items: center; gap: 12px; width: 100%; overflow: visible; padding: 0; }
+.nav-spacer { flex: 1; }
+/* The rail must not clip the hover labels. */
+.sidebar > .nav { overflow: visible; }
+@media (min-width: 861px) and (max-height: 780px) {
+  .nav { gap: 8px; }
+  .nav-group { gap: 2px; padding: 4px; }
+  .nav-item { width: 38px; height: 38px; }
+  .brand { padding-bottom: 10px; }
+}
+.nav-group { display: flex; flex-direction: column; align-items: center; gap: 6px; margin: 0; padding: 6px; border-radius: 999px; background: var(--surface); }
+.nav-group-label { display: none; }
+.nav-item { justify-content: center; width: 44px; height: 44px; min-height: 0; margin: 0; padding: 0; border-radius: 50%; color: var(--muted); }
+.nav-item > span { display: none; }
+.nav-item > svg { color: inherit; }
+.nav-item:hover { background: var(--surface-3); color: var(--text); }
+.nav-item.active { background: var(--brand-fill); color: var(--on-brand); }
+.nav-item.active > svg { color: var(--on-brand); }
+.nav-item.active::before { display: none; }
+/* Tooltip label for the icon-only rail (hover and keyboard focus). */
+.nav-item::after {
+  content: attr(data-label); position: absolute; left: calc(100% + 12px); top: 50%; z-index: 60; padding: 6px 10px; border-radius: 8px;
+  background: var(--text); color: var(--bg); font-size: 12.5px; font-weight: 650; white-space: nowrap; pointer-events: none;
+  opacity: 0; transform: translate(-4px, -50%); transition: opacity 120ms ease, transform 120ms ease;
+}
+.nav-item:hover::after, .nav-item:focus-visible::after { opacity: 1; transform: translate(0, -50%); }
+.sidebar-foot { display: none; }
+
+/* ---------- Top bar ---------- */
+.topbar { gap: 12px; min-height: 72px; padding: 14px 28px 10px 8px; border-bottom: 0; background: var(--glass); backdrop-filter: none; }
+.topbar-title { display: none; flex: 0 1 auto; }
+.top-search { position: relative; display: flex; align-items: center; gap: 10px; flex: 1 1 auto; max-width: 520px; min-height: 46px; padding: 0 14px; border-radius: 14px; background: var(--surface); color: var(--muted); }
+.top-search:focus-within { box-shadow: 0 0 0 2px var(--brand-soft); color: var(--text); }
+.top-search input { flex: 1; min-width: 0; height: 44px; border: 0; background: transparent; color: var(--text); font-size: 14px; outline: none; }
+.top-search input::-webkit-search-cancel-button { display: none; }
+.top-search kbd { padding: 1px 7px; border: 1px solid var(--border-strong); border-radius: 6px; color: var(--faint); font: 600 11.5px var(--font-code); }
+.topbar-actions { gap: 10px; margin-left: auto; }
+.icon-btn, .theme-toggle, .status-pill, .balance-chip, .profile-card, .wallet-btn { border: 0; border-radius: 14px; background: var(--surface); }
+.icon-btn { width: 46px; height: 46px; }
+.status-pill { min-height: 46px; padding: 4px 14px 4px 10px; }
+.balance-chip { display: inline-flex; align-items: center; gap: 8px; min-height: 46px; padding: 0 14px; color: var(--text); font-size: 14px; font-weight: 700; white-space: nowrap; font-variant-numeric: tabular-nums; }
+.balance-chip svg { color: var(--muted); }
+.balance-chip:hover, .status-pill:hover, .profile-card:hover { background: var(--surface-3); }
+.wallet-btn { min-height: 46px; }
+.theme-toggle { min-height: 46px; padding: 5px; }
+.theme-toggle-option { border-radius: 10px; }
+.profile-card { min-height: 46px; padding: 5px 12px 5px 5px; }
+.profile-avatar { flex-basis: 36px; width: 36px; height: 36px; }
+.content { padding: 8px 28px 56px 8px; max-width: 1640px; }
+
+@media (max-width: 1280px) {
+  .balance-chip span { display: none; }
+  .balance-chip { padding: 0 13px; }
+}
+@media (max-width: 1100px) {
+  .top-search kbd { display: none; }
+  .status-pill-text { display: none; }
+}
+@media (max-width: 1024px) {
+  .sidebar { flex-basis: 84px; width: 84px; }
+  .content { padding: 8px 18px 48px 4px; }
+  .topbar { padding: 12px 18px 8px 4px; }
+}
+
+/* ---------- Mobile: labelled drawer + bottom bar ---------- */
+@media (max-width: 860px) {
+  .sidebar { align-items: stretch; width: min(290px, calc(100vw - 54px)); padding: 18px 14px; background: var(--surface); }
+  .brand { justify-content: flex-start; gap: 12px; padding: 0 6px 16px; }
+  .brand-text { display: block; }
+  .nav, .sidebar > .nav { align-items: stretch; overflow-y: auto; }
+  .nav-spacer { display: none; }
+  .nav-group { align-items: stretch; gap: 2px; padding: 0; border-radius: 0; background: transparent; }
+  .nav-group-label { display: block; padding: 6px 10px; }
+  .nav-item { justify-content: flex-start; gap: 12px; width: auto; height: 44px; padding: 0 12px; border-radius: 12px; }
+  .nav-item > span { display: inline; }
+  .nav-item::after { display: none; }
+  .topbar { min-height: 60px; padding: 8px 12px; }
+  .topbar-title { display: block; flex: 1; }
+  .top-search { display: none; }
+  .balance-chip { display: none; }
+  .icon-btn, .status-pill, .profile-card, .wallet-btn { min-height: 40px; }
+  .icon-btn { width: 40px; height: 40px; }
+  .content { padding: 10px 12px calc(84px + env(safe-area-inset-bottom)); }
+  .mobile-nav { border-top: 0; background: var(--surface); }
+  .mobile-nav a.active { color: var(--brand); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .nav-item::after { transition: none; }
+}
+
+/* ---------- Remaining legacy accents (blue glow / haze) ---------- */
+.account-hero { background: var(--surface); border-color: transparent; box-shadow: none; }
+input:focus, select:focus, textarea:focus { border-color: var(--brand-fill) !important; box-shadow: 0 0 0 3px var(--brand-soft); }
+.settings-message { border-color: transparent; background: var(--brand-soft); }
+.decision-mode-banner.ai { background: var(--info-soft); }
+.primary-button:hover:not(:disabled), .login-button:hover:not(:disabled) { transform: none; box-shadow: none; }

@@ -150,6 +150,7 @@ function AuthenticatedShell({ children, pathname }: { children: ReactNode; pathn
   const [menuOpen, setMenuOpen] = useState(false);
   const { data: settings } = useApi<{ data?: ShellStatus }>('/api/settings');
   const { data: me, refresh: refreshMe } = useApi<{ data: { id: string; email: string; name: string | null; role: string; avatarVersion: number | null } }>('/api/auth/me');
+  const { data: account } = useApi<{ data?: { equity?: number | string | null } }>('/api/paper-account');
   // The profile picture panel announces changes so the top bar avatar updates at once.
   useEffect(() => {
     globalThis.addEventListener('soltrader:profile-updated', refreshMe);
@@ -165,7 +166,7 @@ function AuthenticatedShell({ children, pathname }: { children: ReactNode; pathn
       {menuOpen && <button className="drawer-backdrop" type="button" aria-label="Menü bezárása" onClick={() => setMenuOpen(false)} />}
       <Sidebar pathname={pathname} isAdmin={me?.data?.role === 'ADMIN'} open={menuOpen} onNavigate={() => setMenuOpen(false)} />
       <div className="workspace">
-        <Topbar pathname={pathname} status={settings?.data ?? null} me={me?.data ?? null} menuOpen={menuOpen} onMenu={() => setMenuOpen(!menuOpen)} onSignOut={() => void signOut()} />
+        <Topbar pathname={pathname} status={settings?.data ?? null} me={me?.data ?? null} balance={account?.data?.equity != null && Number.isFinite(Number(account.data.equity)) ? Number(account.data.equity) : null} menuOpen={menuOpen} onMenu={() => setMenuOpen(!menuOpen)} onSignOut={() => void signOut()} />
         <main className="content">{children}</main>
         <StepUpDialog />
         <WalletModal />
