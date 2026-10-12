@@ -29,7 +29,7 @@ function NotConnected() {
     <ul className="wallet-empty-points">
       <li><ShieldCheck size={16} aria-hidden="true" /> Soha nem kérünk seed phrase-t vagy privát kulcsot.</li>
       <li><ShieldCheck size={16} aria-hidden="true" /> A tulajdonjogot egy díjmentes, egyszer használatos üzenet aláírása igazolja – nem tranzakció.</li>
-      <li><ShieldCheck size={16} aria-hidden="true" /> Csak a nyilvános címet tároljuk. A tárca nem kap kereskedési jogosultságot, és nem kapcsol be LIVE kereskedést.</li>
+      <li><ShieldCheck size={16} aria-hidden="true" /> Csak a nyilvános címet tároljuk. A tárca nem kap kereskedési jogosultságot.</li>
     </ul>
     <small className="muted">Támogatott: Phantom, Solflare, Backpack és más Wallet Standard-kompatibilis Solana tárcák.</small>
   </section>;
@@ -111,8 +111,8 @@ export default function WalletPage() {
 
     <section className="wallet-separation">
       <div className="sep-card"><span className="badge badge-brand">Saját tárca</span><p>Böngészős wallet, a te tulajdonod. On-chain, csak olvasva jelenik meg; a bot nem használja.</p></div>
-      <div className="sep-card"><span className="badge badge-neutral">PAPER számla</span><p>Szimulált kereskedési egyenleg: <strong>{paper?.data?.equity != null ? `${fmt(paper.data.equity)} USDC` : '—'}</strong>. Nem valódi pénz, nem azonos a tárca egyenlegével. <Link href="/settings#bot" className="link-btn">Kezelés</Link></p></div>
-      <div className="sep-card"><span className="badge badge-warning">Bot kereskedő tárca</span><p>Külön adminisztrációs beállítás (lent). LIVE kereskedés tiltva.</p></div>
+      <div className="sep-card"><span className="badge badge-neutral">Bot számla</span><p>Szimulált kereskedési egyenleg: <strong>{paper?.data?.equity != null ? `${fmt(paper.data.equity)} USDC` : '—'}</strong>. Nem valódi pénz, nem azonos a tárca egyenlegével. <Link href="/settings#bot" className="link-btn">Kezelés</Link></p></div>
+      <div className="sep-card"><span className="badge badge-warning">Bot kereskedő tárca</span><p>Külön adminisztrációs beállítás (lent).</p></div>
     </section>
 
     <details className="tcard admin-section">

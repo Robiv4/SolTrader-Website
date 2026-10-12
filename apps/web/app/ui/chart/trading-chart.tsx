@@ -198,7 +198,7 @@ export function TradingChart({ address, height = 440 }: { address: string; heigh
       position: marker.kind === 'PAPER_SELL' ? 'aboveBar' : 'belowBar',
       color: marker.kind === 'PAPER_BUY' ? colors.up : marker.kind === 'PAPER_SELL' ? colors.down : colors.brand,
       shape: marker.kind === 'PAPER_SELL' ? 'arrowDown' : marker.kind === 'PAPER_BUY' ? 'arrowUp' : 'circle',
-      text: marker.kind === 'ML_BUY' ? 'ML' : marker.kind === 'PAPER_BUY' ? 'P·VÉTEL' : 'P·ELADÁS',
+      text: marker.kind === 'ML_BUY' ? 'ML' : marker.kind === 'PAPER_BUY' ? 'VÉTEL' : 'ELADÁS',
     }));
     current.price.setMarkers(markers.sort((a, b) => Number(a.time) - Number(b.time)));
     for (const line of current.lines) current.price.removePriceLine(line);
@@ -208,7 +208,7 @@ export function TradingChart({ address, height = 440 }: { address: string; heigh
       const add = (value: number | null, title: string, color: string, style: number) => {
         if (value !== null && value > 0) current.lines.push(current.price.createPriceLine({ price: value, color, lineWidth: 1, lineStyle: style, axisLabelVisible: true, title }));
       };
-      add(levels.entry, 'Belépés (PAPER)', colors.info, 0);
+      add(levels.entry, 'Belépés', colors.info, 0);
       add(levels.stopLoss, 'SL', colors.down, 2);
       add(levels.takeProfit, 'TP', colors.up, 2);
       add(levels.trailingStop, 'Trailing', colors.trailing, 1);
@@ -250,7 +250,7 @@ export function TradingChart({ address, height = 440 }: { address: string; heigh
     <footer className="tchart-foot">
       <span>Forrás: {data?.sourceLabel ?? '—'}{data?.chartType === 'line' ? ' · vonaldiagram' : ''}</span>
       {data?.gaps.length ? <span className="warn-text">{data.gaps.length} adatrés az időtávban</span> : null}
-      {data?.overlays.markers.length || data?.overlays.levels ? <span>Jelölések: PAPER (szimulált) kötések{data?.overlays.markers.some((marker) => marker.kind === 'ML_BUY') ? ', ML BUY' : ''}</span> : null}
+      {data?.overlays.markers.length || data?.overlays.levels ? <span>Jelölések: saját kötések{data?.overlays.markers.some((marker) => marker.kind === 'ML_BUY') ? ', ML BUY' : ''}</span> : null}
       <span className="muted">{fetchedAt ? `frissítve ${new Date(fetchedAt).toLocaleTimeString('hu-HU')}` : ''}</span>
     </footer>
   </section>;

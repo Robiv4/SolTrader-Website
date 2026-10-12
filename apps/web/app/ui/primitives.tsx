@@ -94,7 +94,7 @@ export function shortAddress(address: string | null | undefined, head = 4, tail 
 /** Price with enough significant digits for micro-priced tokens: $0.0₅4123 style subscript zeros. */
 export function formatTokenPrice(value: number | null | undefined) {
   if (value === null || value === undefined || !Number.isFinite(value) || value <= 0) return '—';
-  if (value >= 1) return `$${value.toLocaleString('hu-HU', { maximumFractionDigits: 4 })}`;
+  if (value >= 1) return `$${value.toLocaleString('en-US', { maximumFractionDigits: 4 })}`;
   const text = value.toFixed(20);
   const match = /^0\.(0+)(\d+)/.exec(text);
   if (!match || match[1].length < 4) return `$${value.toLocaleString('en-US', { useGrouping: false, maximumSignificantDigits: 5 })}`;

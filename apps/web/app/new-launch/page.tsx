@@ -139,21 +139,21 @@ export default function NewLaunchPage() {
   const live = connectionState === 'OPEN';
   const updatedSeconds = d?.updatedAt ? Math.max(0, Math.round((Date.now() - Date.parse(d.updatedAt)) / 1000)) : null;
   const stale = updatedSeconds === null || updatedSeconds > 30;
-  const header = <PageHeader eyebrow="Kereskedés" title="Új tokenek" subtitle="Frissen indult Solana tokenek valós idejű észlelése és PAPER döntései" action={<StatusBadge tone="warning">CSAK PAPER</StatusBadge>} />;
+  const header = <PageHeader eyebrow="Kereskedés" title="Új tokenek" subtitle="Frissen indult Solana tokenek valós idejű észlelése és döntései" />;
 
   if (loading && !d) return <>{header}<section className="tcard"><SkeletonRows rows={8} columns={6} /></section></>;
   if (error && !d) return <>{header}<ErrorState message={error} /></>;
 
   return <>
     {header}
-    {d && !d.enabled ? <p className="notice notice-warning"><span>Az Új token stratégia ki van kapcsolva: a figyelés fut, de PAPER vétel nem történik. Bekapcsolás: <Link href="/settings#new-launch">Beállítások</Link>.</span></p> : null}
+    {d && !d.enabled ? <p className="notice notice-warning"><span>Az Új token stratégia ki van kapcsolva: a figyelés fut, de vétel nem történik. Bekapcsolás: <Link href="/settings#new-launch">Beállítások</Link>.</span></p> : null}
 
     <section className="nl-stats" aria-label="Mai összesítő">
       <div><span>Ma észlelt</span><strong>{fmt(stats?.detectedToday ?? 0, 0)}</strong></div>
       <div><span>Vételre alkalmas</span><strong className={stats?.eligible ? 'up' : ''}>{fmt(stats?.eligible ?? 0, 0)}</strong></div>
       <div><span>Figyelés</span><strong>{fmt(stats?.watching ?? 0, 0)}</strong></div>
       <div><span>Elutasítva</span><strong>{fmt(stats?.rejected ?? 0, 0)}</strong></div>
-      <div><span>Nyitott PAPER</span><strong>{fmt(stats?.paperPositions ?? 0, 0)}</strong></div>
+      <div><span>Nyitott pozíció</span><strong>{fmt(stats?.paperPositions ?? 0, 0)}</strong></div>
       <div><span>Átl. észlelési késés</span><strong>{stats?.averageDetectionLatencyMs == null ? '—' : `${fmt(stats.averageDetectionLatencyMs / 1000, 1)} mp`}</strong></div>
       <div className="nl-live">
         <StatusBadge tone={stale ? 'warning' : live ? 'positive' : 'info'} dot>{stale ? 'Nem friss' : live ? 'Élő' : 'Frissítés 5 mp-enként'}</StatusBadge>
@@ -245,7 +245,7 @@ export default function NewLaunchPage() {
             </button>;
           })}
         </div>
-        <small className="muted nl-foot">{rows.length} / {launches.length} token · Ismeretlen eladhatóság soha nem számít biztonságosnak (FIGYELÉS). Minden vétel szimulált (PAPER).</small>
+        <small className="muted nl-foot">{rows.length} / {launches.length} token · Ismeretlen eladhatóság soha nem számít biztonságosnak (FIGYELÉS).</small>
       </>}
     </section>
   </>;

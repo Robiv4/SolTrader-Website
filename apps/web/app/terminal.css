@@ -442,3 +442,12 @@ body { font-size: 14.5px; line-height: 1.55; }
 @media (max-width: 600px) {
   .tchart-canvas { height: 320px !important; }
 }
+
+/* ---------- Positions / trades tables ---------- */
+.pnl-cell { display: inline-flex; flex-direction: column; align-items: flex-end; line-height: 1.25; }
+.pnl-cell b { font-weight: 650; }
+.pnl-cell small { font-size: 11.5px; opacity: .85; }
+.nl-table .nl-token { max-width: 210px; }
+.nl-table td:has(> .danger-button) { padding-right: 14px; }
+.nl-stats strong { white-space: nowrap; }
+.nl-stats > div { min-width: 0; }

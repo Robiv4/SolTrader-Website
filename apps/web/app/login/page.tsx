@@ -63,7 +63,7 @@ export default function LoginPage() {
       <div className="brand login-brand"><span className="brand-mark">S</span><div><strong>Soltrader</strong><small>CONTROL ROOM</small></div></div>
       <p className="eyebrow">Privát munkaterület</p>
       <h1>Bejelentkezés</h1>
-      <p className="annotation">A paper kereskedési irányítópult eléréséhez használd az API-fiókod adatait.</p>
+      <p className="annotation">A kereskedési irányítópult eléréséhez jelentkezz be a fiókoddal.</p>
       {challenge ? <form onSubmit={verify} className="login-form">
         <p className="annotation">Új IP-címről lépsz be. Elküldtünk egy 6 jegyű kódot ide: <strong>{challenge.emailHint}</strong> (10 percig érvényes).</p>
         <label>Megerősítő kód<input inputMode="numeric" autoComplete="one-time-code" maxLength={6} autoFocus value={code} onChange={(event) => setCode(event.target.value.replace(/\D/g, '').slice(0, 6))} required /></label>
@@ -76,7 +76,6 @@ export default function LoginPage() {
         {error && <p className="login-error" role="alert">{error}</p>}
         <button className="login-button" type="submit" disabled={loading}>{loading ? 'Bejelentkezés...' : 'Bejelentkezés'}</button>
       </form>}
-      <p className="login-note">A kereskedési módot a szerver vezérli. Az éles végrehajtás alapértelmezés szerint le van tiltva.</p>
     </section>
   </main>;
 }

@@ -1,7 +1,7 @@
 'use client';
 
 import {
-  Activity, BarChart3, BrainCircuit, ChevronDown, ChevronRight, History, LayoutDashboard, Layers, ListTree, Menu, Rocket, ScrollText, Settings2, ShieldCheck,
+  Activity, BarChart3, BrainCircuit, ChevronDown, ChevronRight, History, LayoutDashboard, Layers, Menu, Rocket, ScrollText, Settings2, ShieldCheck,
   Users, Wallet, X, type LucideIcon,
 } from 'lucide-react';
 import Link from 'next/link';
@@ -91,7 +91,6 @@ export function Sidebar({ pathname, isAdmin, open, onNavigate }: { pathname: str
         </div>;
       })}
     </nav>
-    <div className="sidebar-foot"><ListTree size={13} aria-hidden="true" /> PAPER kereskedés · LIVE tiltva</div>
   </aside>;
 }
 
@@ -107,7 +106,7 @@ export function BotStatusPill({ status }: { status: ShellStatus | null }) {
   const tone: Tone = emergency ? 'negative' : running ? 'positive' : 'warning';
   const strategy = status.paperStrategy?.mode === 'ML' ? 'ML' : 'Alap';
   return <Link href="/settings#bot" className={`status-pill tone-${tone}`} title={`Kereskedési mód: ${status.tradingMode} · Bot: ${BOT_LABEL[status.botStatus ?? ''] ?? status.botStatus} · Stratégia: ${strategy}`}>
-    <StatusBadge tone={status.tradingMode === 'PAPER' ? 'brand' : 'warning'}>{status.tradingMode.replace('_', '-')}</StatusBadge>
+    {status.tradingMode !== 'PAPER' ? <StatusBadge tone="warning">{status.tradingMode.replace('_', '-')}</StatusBadge> : null}
     <span className={`conn-dot ${emergency ? 'error' : running ? 'live' : 'stale'}`} aria-hidden="true" />
     <span className="status-pill-text">{emergency ? 'Vészleállítás' : BOT_LABEL[status.botStatus ?? ''] ?? 'Ismeretlen'}</span>
     <span className="status-pill-strategy">{strategy}</span>

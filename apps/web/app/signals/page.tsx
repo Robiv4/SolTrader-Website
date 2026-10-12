@@ -34,7 +34,7 @@ export default function SignalsPage() {
 		<section className="kpi-grid" aria-label="Jelzés összefoglaló">
 			<Kpi icon={<Radar size={20} />} label="Jelzések" value={<>{rows.length} <small>db</small></>} note="a legutóbbi jelzések listája" />
 			<Kpi icon={<Sparkles size={20} />} label="Ma" value={<>{todayCount} <small>db</small></>} note="ma létrehozott jelzés" />
-			<Kpi icon={<CheckCircle2 size={20} />} label="Megvéve" value={<span className="positive-value">{executedCount}</span>} note="PAPER vétellé vált jelzés" />
+			<Kpi icon={<CheckCircle2 size={20} />} label="Megvéve" value={<span className="positive-value">{executedCount}</span>} note="vétellé vált jelzés" />
 			<Kpi icon={<Ban size={20} />} label="Elutasítva / blokkolva" value={rejectedCount} note="a kockázati vagy számlaszabályok miatt" />
 		</section>
 		<Panel title="Jelzésfolyam" className="signal-feed-panel" description="Minden kártyán látszik a bot döntése és a „Miért ez a jelzés?” indoklás.">

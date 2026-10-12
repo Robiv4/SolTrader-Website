@@ -46,7 +46,7 @@ export function TokenSidePanel({ token, trading }: { token: TokenDetail; trading
     {ml || shadow ? <section className="side-block">
       <header><h3>Machine Learning</h3>{ml ? <StatusBadge tone={ml.mlDecision === 'ML_BUY' ? 'positive' : ml.mlDecision === 'ML_ERROR' ? 'negative' : 'neutral'}>{ml.mlDecision.replace('_', ' ')}</StatusBadge> : <StatusBadge tone="info">SHADOW</StatusBadge>}</header>
       <KeyValueList items={[
-        ml ? ['PAPER döntés', `${ml.probability !== null ? ml.probability.toFixed(3) : '—'} / küszöb ${ml.threshold?.toFixed(2) ?? '—'}`] : null,
+        ml ? ['Döntés', `${ml.probability !== null ? ml.probability.toFixed(3) : '—'} / küszöb ${ml.threshold?.toFixed(2) ?? '—'}`] : null,
         ml ? ['Eredmény', ml.outcome] : null,
         shadow ? ['SHADOW előrejelzés', `${shadow.probability !== null ? shadow.probability.toFixed(3) : '—'} (${shadow.predictedClass.replace('_', ' ')})`] : null,
         ['Modell', ml?.modelVersion ?? shadow?.modelVersion ?? '—'],
@@ -75,7 +75,7 @@ export function TokenSidePanel({ token, trading }: { token: TokenDetail; trading
     </section>
 
     <section className="side-block">
-      <header><h3>PAPER pozíció</h3>{position ? <StatusBadge tone="info">NYITOTT</StatusBadge> : <StatusBadge>NINCS</StatusBadge>}</header>
+      <header><h3>Pozíció</h3>{position ? <StatusBadge tone="info">NYITOTT</StatusBadge> : <StatusBadge>NINCS</StatusBadge>}</header>
       {position ? <>
         <KeyValueList items={[
           ['Belépés', formatTokenPrice(position.entry)],
@@ -84,7 +84,7 @@ export function TokenSidePanel({ token, trading }: { token: TokenDetail; trading
           ['Stratégia', position.entryStrategy === 'ML' ? 'ML-modell' : 'Alapstratégia'],
         ]} />
         <Link className="secondary-button small" href={`/positions/${position.id}`}>Pozíció részletei</Link>
-      </> : <small className="muted">Szimulált (PAPER) pozíció ehhez a tokenhez nincs nyitva.</small>}
+      </> : <small className="muted">Ehhez a tokenhez nincs nyitott pozíció.</small>}
     </section>
 
     {blockers.length ? <section className="side-block">

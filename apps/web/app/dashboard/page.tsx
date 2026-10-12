@@ -7,7 +7,7 @@ import { useEffect, useState, type ReactNode } from 'react';
 
 import { TokenLabel } from '../avatars';
 import { BotMasterControls, BotStatusBadge } from '../bot-controls';
-import { apiRequest, DataTable, date, EmptyState, ErrorState, fmt, formatPrice, LoadingState, ModeBadge, PageHeader, Stacked, Status, useApi } from '../components';
+import { apiRequest, DataTable, date, EmptyState, ErrorState, fmt, formatPrice, LoadingState, PageHeader, Stacked, useApi } from '../components';
 import { useBotStatus } from '../hooks/useBotStatus';
 import { useRealtimeEvents } from '../hooks/useRealtimeEvents';
 import { exitReasonLabel } from '../locales/hu';
@@ -84,7 +84,7 @@ export default function DashboardPage() {
     return () => globalThis.clearInterval(timer);
   }, [overview.refresh]);
 
-  const header = (action?: ReactNode) => <PageHeader eyebrow="Áttekintés" title="Dashboard" subtitle="PAPER számla, bot, New Launch és ML egy helyen" action={action} />;
+  const header = (action?: ReactNode) => <PageHeader eyebrow="Áttekintés" title="Dashboard" subtitle="Számla, bot, New Launch és ML egy helyen" action={action} />;
   const loading = !account.data || !portfolio.data || !settings.data || !positions.data || !trades.data;
   const error = account.error ?? portfolio.error ?? settings.error ?? positions.error ?? trades.error;
   if (error && loading) return <>{header()}<ErrorState message={error} /></>;
@@ -93,7 +93,6 @@ export default function DashboardPage() {
   const paper = account.data?.data ?? {};
   const snapshot = portfolio.data?.data ?? {};
   const analyticsData = analytics.data?.data;
-  const mode = settings.data?.data?.tradingMode;
   const newLaunch = settings.data?.data?.newLaunch as { enabled: boolean; configVersion: string } | undefined;
   const positionRows = (positions.data?.data ?? []).filter((row: any) => row.status === 'OPEN');
   const tradeRows = trades.data?.data ?? [];
@@ -136,7 +135,7 @@ export default function DashboardPage() {
   const rangeLabel = range === 'all' ? 'teljes időszak' : range === '30d' ? 'utolsó 30 nap' : 'utolsó 7 nap';
 
   return <>
-    {header(<div className="header-actions">{mode ? <ModeBadge mode={mode} /> : <Status>MÓD ISMERETLEN</Status>}<BotStatusBadge status={bot.botState?.status} /></div>)}
+    {header()}
 
     {snapshot.dailyLossLimitReached && <div className="alert-banner warning" role="alert">
       <strong>A napi veszteségkorlát elérve – a bot ma nem nyit új pozíciót.</strong>
@@ -144,11 +143,11 @@ export default function DashboardPage() {
     </div>}
 
     <section className="kpi-grid" aria-label="Számla összefoglaló">
-      <Kpi icon={<Wallet size={20} />} label="Paper számla értéke" value={<>{fmt(equity)} <small>USDC</small></>} tone="brand"
+      <Kpi icon={<Wallet size={20} />} label="Számla értéke" value={<>{fmt(equity)} <small>USDC</small></>} tone="brand"
         sub={<span className={`${tone(totalResult)}-value`}>{signed(totalResult, ' USDC')}{totalResultPercent !== null ? ` (${signed(totalResultPercent, '%')})` : ''}</span>} note={`kezdőtőke: ${fmt(initial)} USDC`} />
       <Kpi icon={<CalendarClock size={20} />} label="Mai P&L" value={<span className={`${tone(snapshot.dailyPnl)}-value`}>{signed(snapshot.dailyPnl)} <small>USDC</small></span>} note={`realizált összesen: ${signed(snapshot.realizedPnl)} USDC`} />
       <Kpi icon={<Layers size={20} />} label="Nyitott pozíciók" value={<>{positionRows.length} <small>db</small></>} note={`érték: ${fmt(snapshot.openPositionValue)} USDC · nem realizált: ${signed(snapshot.unrealizedPnl)}`} />
-      <Kpi icon={<Brain size={20} />} label="Aktív PAPER stratégia" value={strategy?.mode === 'ML' ? 'ML-modell' : 'Alapstratégia'} note={strategy?.mode === 'ML' ? `modell: ${strategy.modelVersion ?? '—'}` : <Link className="table-link" href="/settings#bot">módosítás a Beállításokban</Link>} />
+      <Kpi icon={<Brain size={20} />} label="Aktív stratégia" value={strategy?.mode === 'ML' ? 'ML-modell' : 'Alapstratégia'} note={strategy?.mode === 'ML' ? `modell: ${strategy.modelVersion ?? '—'}` : <Link className="table-link" href="/settings#bot">módosítás a Beállításokban</Link>} />
       <Kpi icon={<Target size={20} />} label="Nyerési arány" value={winRate === null ? '—' : <>{fmt(winRate, 0)}<small>%</small></>} note={rangeLabel} />
     </section>
 
@@ -188,7 +187,7 @@ export default function DashboardPage() {
     <section className="dash-grid-2">
       <DashCard title="Nyitott pozíciók" description="Kattints egy sorra a részletekért" action={<Link className="card-link" href="/positions">Összes <ArrowRight size={15} aria-hidden="true" /></Link>}>
         {positionRows.length === 0
-          ? <EmptyState message="Nincs nyitott pozíció. A New Launch modul a feltételeknek megfelelő friss tokenekre nyit PAPER pozíciót." />
+          ? <EmptyState message="Nincs nyitott pozíció. A New Launch modul a feltételeknek megfelelő friss tokenekre nyit pozíciót." />
           : <DataTable headers={['Token', 'Belépés → most', 'Érték', 'P&L']}>{positionRows.slice(0, 6).map((row: any) => {
             const value = (numeric(row.quantity) ?? 0) * (numeric(row.currentPrice) ?? numeric(row.avgEntryPrice) ?? 0);
             return <tr key={row.id} className="clickable-row" onClick={() => router.push(`/positions/${row.id}`)}>
@@ -223,14 +222,14 @@ export default function DashboardPage() {
             {launch.decision ? <StatusBadge tone={LAUNCH_DECISION[launch.decision].tone}>{LAUNCH_DECISION[launch.decision].text}</StatusBadge> : <StatusBadge>ÚJ</StatusBadge>}
           </Link>)}</div>}
       </DashCard>
-      <DashCard title="ML és adatgyűjtés" description="Mai ML PAPER döntések és a SHADOW tanítóadat-gyűjtés" action={<Link className="card-link" href="/machine-learning">ML oldal <ArrowRight size={15} aria-hidden="true" /></Link>}>
+      <DashCard title="ML és adatgyűjtés" description="Mai ML döntések és a tanítóadat-gyűjtés" action={<Link className="card-link" href="/machine-learning">ML oldal <ArrowRight size={15} aria-hidden="true" /></Link>}>
         <div className="ml-counts">
           <div><span>ML BUY</span><strong className="up">{mlCounts.ML_BUY ?? 0}</strong></div>
           <div><span>ML SKIP</span><strong>{mlCounts.ML_SKIP ?? 0}</strong></div>
           <div><span>ML ERROR</span><strong className={(mlCounts.ML_ERROR ?? 0) > 0 ? 'down' : ''}>{mlCounts.ML_ERROR ?? 0}</strong></div>
           <div><span>Snapshot (24 ó)</span><strong>{status ? fmt(status.ml.snapshots24h, 0) : '—'}</strong></div>
         </div>
-        <p className="muted dash-note">{strategy?.mode === 'ML' ? 'Az ML-modell dönt a PAPER belépésekről; minden döntés szimulált.' : 'Az alapstratégia aktív: ML PAPER döntés csak ML stratégia mellett születik, a SHADOW adatgyűjtés ettől függetlenül fut.'}</p>
+        <p className="muted dash-note">{strategy?.mode === 'ML' ? 'Az ML-modell dönt a belépésekről.' : 'Az alapstratégia aktív: ML döntés csak ML stratégia mellett születik, az adatgyűjtés ettől függetlenül fut.'}</p>
         <div className="diag-links"><Link href="/system">Rendszerállapot</Link><Link href="/logs">Naplók</Link><Link href="/machine-learning">ML diagnosztika</Link><Link href="/analytics">Analitika</Link></div>
       </DashCard>
     </section>

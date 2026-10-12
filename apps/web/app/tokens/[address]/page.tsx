@@ -82,7 +82,7 @@ export default function TokenDetailPage() {
     const list: Array<TabItem<TabId>> = [{ id: 'overview', label: 'Áttekintés' }, { id: 'risk', label: 'Biztonság és kockázat' }];
     if (token.launch) list.push({ id: 'launch', label: 'New Launch elemzés' }, { id: 'social', label: 'Közösségi adatok' });
     if (tradingData?.ml.paperDecision || tradingData?.ml.shadowPrediction) list.push({ id: 'ml', label: 'ML-elemzés' });
-    list.push({ id: 'paper', label: 'PAPER előzmények', count: tradingData?.paperTrades.length ?? null });
+    list.push({ id: 'paper', label: 'Kereskedések', count: tradingData?.paperTrades.length ?? null });
     if (token.signals.length || token.aiAnalysis) list.push({ id: 'history', label: 'Korábbi jelzések', count: token.signals.length });
     return list;
   }, [token, tradingData]);
@@ -162,14 +162,14 @@ export default function TokenDetailPage() {
 
         {activeTab === 'ml' ? <div className="tab-grid">
           {tradingData?.ml.paperDecision ? <KeyValueList items={[
-            ['ML PAPER döntés', tradingData.ml.paperDecision.mlDecision],
+            ['ML döntés', tradingData.ml.paperDecision.mlDecision],
             ['Valószínűség / küszöb', `${tradingData.ml.paperDecision.probability?.toFixed(3) ?? '—'} / ${tradingData.ml.paperDecision.threshold?.toFixed(2) ?? '—'}`],
             ['Döntési pont', `${tradingData.ml.paperDecision.snapshotKind} · ${date(tradingData.ml.paperDecision.decidedAt)}`],
             ['Alapstratégia ugyanekkor', tradingData.ml.paperDecision.baseDecision ?? '—'],
             ['Eredmény', `${tradingData.ml.paperDecision.outcome}${tradingData.ml.paperDecision.executionReason ? ` · ${tradingData.ml.paperDecision.executionReason}` : ''}`],
             tradingData.ml.paperDecision.errorReason ? ['Hiba / kihagyás oka', tradingData.ml.paperDecision.errorReason] : null,
             ['Modell', tradingData.ml.paperDecision.modelVersion],
-          ]} /> : <p className="muted">Ehhez a tokenhez nem született ML PAPER döntés (az ML stratégia nincs kiválasztva).</p>}
+          ]} /> : <p className="muted">Ehhez a tokenhez nem született ML döntés (az ML stratégia nincs kiválasztva).</p>}
           {tradingData?.ml.shadowPrediction ? <KeyValueList items={[
             ['SHADOW előrejelzés', tradingData.ml.shadowPrediction.predictedClass],
             ['Valószínűség', tradingData.ml.shadowPrediction.probability?.toFixed(3) ?? '—'],
@@ -188,7 +188,7 @@ export default function TokenDetailPage() {
             <td>{trade.exitReason ?? '—'}</td>
             <td>{trade.entryStrategy === 'ML' ? `ML (${trade.mlModelVersion ?? '?'})` : 'Alap'}{trade.positionId ? <> · <Link className="table-link" href={`/positions/${trade.positionId}`}>pozíció</Link></> : null}</td>
           </tr>)}
-        </DataTable> : <EmptyState message="Ehhez a tokenhez még nem volt PAPER kereskedésed." />) : null}
+        </DataTable> : <EmptyState message="Ehhez a tokenhez még nem volt kereskedésed." />) : null}
 
         {activeTab === 'history' ? <>
           {token.aiAnalysis ? <AiAnalysisPanel analysis={token.aiAnalysis as never} decisionMode="STRATEGY" /> : null}

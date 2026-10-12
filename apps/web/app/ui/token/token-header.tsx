@@ -48,6 +48,6 @@ export function TokenHeader({ token }: { token: TokenDetail }) {
       <div><dt>Piaci kap.</dt><dd>{formatCompactUsd(token.marketCap)}</dd></div>
       <div><dt>Frissítve</dt><dd><StatusBadge tone={updated.tone} dot>{updated.text}</StatusBadge></dd></div>
     </dl>
-    {token.openPositionId ? <Link className="primary-button token-position-link" href={`/positions/${token.openPositionId}`}>Nyitott PAPER pozíció →</Link> : null}
+    {token.openPositionId ? <Link className="primary-button token-position-link" href={`/positions/${token.openPositionId}`}>Nyitott pozíció →</Link> : null}
   </header>;
 }
