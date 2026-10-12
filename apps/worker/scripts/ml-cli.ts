@@ -26,6 +26,8 @@ import {
 } from '@soltrader/strategy-engine';
 import { createClient } from 'redis';
 
+import { indexPaperTrades, loadAllPages, loadPaperTradesInBatches, matchPaperTrade, paperProvenance } from '../src/ml/dataset-source.js';
+
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
 // Server-side configuration (DATABASE_URL, REDIS_URL) from the repository .env; values are never printed.
 if (existsSync(path.join(ROOT, '.env'))) process.loadEnvFile(path.join(ROOT, '.env'));
@@ -71,23 +73,30 @@ async function dataset() {
     if (!ML_TARGETS[target]) throw new Error(`Unknown target ${target}. Known: ${Object.keys(ML_TARGETS).join(', ')}`);
     const kind = option('kind', 'AGE_30S');
     const minQuality = Number(option('min-quality', '50'));
-    const snapshots = await prisma.mlFeatureSnapshot.findMany({
+    // Paged (keyset on id after the same ordering): the outcome include never exceeds the bind-parameter limit.
+    const snapshots = await loadAllPages((cursor, take) => prisma.mlFeatureSnapshot.findMany({
       where: { featureVersion: ML_FEATURE_VERSION, kind },
       include: { outcome: { select: { status: true, result: true } } },
       orderBy: [{ snapshotAt: 'asc' }, { id: 'asc' }],
-    });
+      take,
+      ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
+    }));
     // Realised PAPER P&L of candidates that were actually bought by EITHER strategy (DEFAULT or ML; joined by mint,
-    // trade opened after the snapshot). Provenance only: never a feature; skipped candidates get no P&L.
-    const mints = [...new Set(snapshots.map((row) => row.mint))];
-    const trades = mints.length ? await prisma.trade.findMany({ where: { tokenAddress: { in: mints }, decisionSource: 'NEW_LAUNCH', status: 'CLOSED' }, select: { tokenAddress: true, netPnl: true, entryAt: true, exitAt: true, entryStrategy: true } }) : [];
+    // trade opened after the snapshot). Provenance only: never a feature; skipped candidates get no P&L. Needed for
+    // every target: paper_trade targets label with it, classification targets carry it in the CSV (paper_net_pnl),
+    // the manifest and the training threshold curve. Queried in batches of <= 1000 mints (bind-parameter limit).
+    const trades = await loadPaperTradesInBatches(snapshots.map((row) => row.mint), (batch) => prisma.trade.findMany({
+      where: { tokenAddress: { in: batch }, decisionSource: 'NEW_LAUNCH', status: 'CLOSED' },
+      select: { tokenAddress: true, netPnl: true, entryAt: true, exitAt: true, entryStrategy: true },
+    }));
+    const tradeIndex = indexPaperTrades(trades);
     const rows: MlDatasetSourceRow[] = snapshots.map((row) => {
-      const trade = trades.filter((item) => item.tokenAddress === row.mint && item.entryAt && item.entryAt.getTime() >= row.snapshotAt.getTime() - 60_000).sort((a, b) => a.entryAt!.getTime() - b.entryAt!.getTime())[0];
+      const trade = matchPaperTrade(tradeIndex, row.mint, row.snapshotAt.getTime());
       const outcome = row.outcome && row.outcome.status !== 'TRACKING' ? row.outcome.result as unknown as CandidateOutcomeResult : null;
       return {
         snapshotId: row.id, candidateId: row.candidateId, mint: row.mint, source: row.source, kind: row.kind, snapshotAt: row.snapshotAt.getTime(), featureVersion: row.featureVersion,
         features: row.features as MlFeatures, validForTraining: row.validForTraining, invalidReasons: row.invalidReasons as string[], dataQuality: row.dataQuality,
-        decision: row.decision, outcome, paperNetPnl: trade?.netPnl !== undefined && trade.netPnl !== null ? Number(trade.netPnl) : null,
-        paperExitAt: trade?.exitAt ? trade.exitAt.getTime() : null, paperEntryStrategy: trade ? trade.entryStrategy ?? 'DEFAULT' : null,
+        decision: row.decision, outcome, ...paperProvenance(trade),
       };
     });
     const existing = await prisma.mlDatasetVersion.count();
