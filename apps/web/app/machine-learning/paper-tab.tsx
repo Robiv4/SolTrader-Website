@@ -2,6 +2,7 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
 import { DataTable, date, EmptyState, ErrorState, fmt, LoadingState, Metric, Panel, Status, useApi } from '../components';
+import { launchReasons } from '../locales/position-labels';
 
 const pct = (value: number | null | undefined) => (value == null ? '—' : `${(value * 100).toFixed(1)}%`);
 const usd = (value: number | null | undefined) => (value == null ? '—' : `${fmt(value, 2)} USDC`);
@@ -34,11 +35,13 @@ export function PaperTab() {
   const t = d.training ?? {};
   const decisionTotals = (d.decisions ?? []).reduce((acc: Record<string, number>, item: any) => ({ ...acc, [item.mlDecision]: (acc[item.mlDecision] ?? 0) + item.count }), {});
   return <>
-    <p className="sfield-help">Valós, lezárt PAPER kereskedések (utolsó {d.periodDays} nap) – elkülönítve a SHADOW célcímkéktől. A LIVE kereskedés tiltott; az ML csak PAPER belépésről dönthet, a kilépést a közös Exit Engine végzi.</p>
+    <p className="sfield-help"><strong>ML belépés + szabályalapú kilépés.</strong> Az ML stratégia kizárólag a vételi döntést hozza (az alapstratégia döntése csak összehasonlítás); a kilépést a közös, szabályalapú Exit Engine végzi. ML-alapú eladás (ML SELL) még nincs. Három külön adatréteg: <em>SHADOW-előrejelzések</em> (minden jelölt, kereskedés nélkül), <em>ML PAPER döntések</em> (az ML stratégiát választók jelöltjei) és <em>lezárt PAPER tradek</em> (valós szimulált eredmény, utolsó {d.periodDays} nap).</p>
+    <h3 className="section-title">3. Lezárt PAPER tradek – stratégiánként külön</h3>
     <div className="dash-grid-2">
       <StrategyStats title="Alapstratégia (DEFAULT) PAPER" stats={d.strategies?.DEFAULT} />
-      <StrategyStats title="ML-modell PAPER" stats={d.strategies?.ML} />
+      <StrategyStats title="ML belépések PAPER (csak ML-eredetű tradek)" stats={d.strategies?.ML} />
     </div>
+    <h3 className="section-title">2. ML PAPER döntések</h3>
     <Panel title="ML vételi döntések" description="Egy döntés jelöltenként, a modell snapshot-időpontjában. Az ML BUY csak akkor lesz belépés, ha minden kötelező biztonsági feltétel teljesül.">
       <div className="metric-grid">
         <Metric label="ML BUY" value={fmt(decisionTotals.ML_BUY ?? 0, 0)} />
@@ -55,7 +58,7 @@ export function PaperTab() {
       </DataTable>}
     </Panel>
     <Panel title="Legutóbbi ML PAPER döntések">
-      {(d.recentDecisions ?? []).length === 0 ? <EmptyState message="Még nincs ML PAPER döntés (az ML stratégia alapból kikapcsolt)." /> : <DataTable wide headers={['Idő', 'Token', 'Modell', 'Pontszám / küszöb', 'ML', 'Alapstratégia', 'Eredmény']}>
+      {(d.recentDecisions ?? []).length === 0 ? <EmptyState message="Még nincs ML PAPER döntés (az ML stratégia alapból kikapcsolt)." /> : <DataTable wide headers={['Idő', 'Token', 'Modell', 'Valószínűség / küszöb', 'ML döntés', 'Alapstratégia (összehasonlítás)', 'Eredmény', 'Akadályozó kötelező szabály']}>
         {d.recentDecisions.map((row: any) => {
           const outcome = OUTCOME_LABELS[row.outcome] ?? { text: row.outcome, tone: 'neutral' };
           return <tr key={row.id}>
@@ -64,10 +67,17 @@ export function PaperTab() {
             <td>{row.modelVersion}</td>
             <td>{row.probability == null ? '—' : `${row.probability.toFixed(3)} / ${row.threshold?.toFixed(2)}`}</td>
             <td><Status tone={row.mlDecision === 'ML_BUY' ? 'positive' : row.mlDecision === 'ML_ERROR' ? 'danger' : 'neutral'}>{row.mlDecision}</Status>{row.errorReason ? <small className="sfield-help" style={{ display: 'block' }}>{row.errorReason}</small> : null}</td>
-            <td>{row.baseDecision ?? '—'}</td>
-            <td><Status tone={outcome.tone}>{outcome.text}</Status>{row.executionReason ? <small className="sfield-help" style={{ display: 'block' }}>{row.executionReason}</small> : null}</td>
+            <td>{row.baseDecision ?? '—'}{launchReasons((row.baseReasons ?? []).filter((reason: string) => reason.startsWith('COMPARE_'))).map((text) => <small key={text} className="sfield-help" style={{ display: 'block' }}>{text}</small>)}</td>
+            <td><Status tone={outcome.tone}>{outcome.text}</Status>{row.executionReason && !(row.safetyBlockers ?? []).length ? <small className="sfield-help" style={{ display: 'block' }}>{row.executionReason}</small> : null}</td>
+            <td>{(row.safetyBlockers ?? []).length ? launchReasons(row.safetyBlockers).join(', ') : '—'}</td>
           </tr>;
         })}
+      </DataTable>}
+    </Panel>
+    <h3 className="section-title">1. SHADOW-előrejelzések (nincs kereskedés)</h3>
+    <Panel title="SHADOW-előrejelzések modellenként" description="Minden New Launch jelöltre készül, kereskedés nélkül – nem azonos az ML PAPER döntésekkel és a tényleges tradekkel.">
+      {(d.shadowPredictions ?? []).length === 0 ? <EmptyState message="Ebben az időszakban nem készült SHADOW-előrejelzés." /> : <DataTable headers={['Modell', 'Előrejelzett osztály', 'Darab']}>
+        {d.shadowPredictions.map((row: any) => <tr key={`${row.modelVersion}-${row.predictedClass}`}><td>{row.modelVersion}</td><td>{row.predictedClass}</td><td>{fmt(row.count, 0)}</td></tr>)}
       </DataTable>}
     </Panel>
     <Panel title="Tanítóadat a következő modellhez" description="SHADOW adatgyűjtés minden New Launch jelöltről (a kihagyottakról is), az aktív stratégiától függetlenül. Új modell csak kézi tanítás, validáció, SHADOW teszt és admin jóváhagyás után kerülhet PAPER használatba – automatikus modellcsere nincs.">

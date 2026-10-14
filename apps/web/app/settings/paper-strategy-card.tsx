@@ -67,6 +67,7 @@ export function PaperStrategyCard() {
   return <div className="paper-strategy">
     <div className="status-list">
       <div className="status-row"><span>Aktív PAPER stratégia</span><Status tone={active ? 'info' : 'positive'}>{active ? `ML-MODELL · ${settings.modelVersion}` : 'ALAPSTRATÉGIA'}</Status></div>
+      {active ? <div className="status-row"><span>Kereskedési mód</span><Status tone="info">ML BELÉPÉS + SZABÁLYALAPÚ KILÉPÉS</Status></div> : null}
       {active ? <div className="status-row"><span>Modell állapota</span>{settings.selectedModel?.usable ? <Status tone={health?.status === 'LOADED' ? 'positive' : 'warning'}>{health?.status === 'LOADED' ? 'BETÖLTVE' : health ? 'NEM ELÉRHETŐ' : 'NINCS JELENTÉS'}</Status> : <Status tone="danger">VISSZAVONVA – NINCS ML BELÉPÉS</Status>}</div> : null}
       {active && health?.error ? <p className="settings-warning">Modellhiba: {health.error}. Amíg fennáll, az ML nem nyit pozíciót, és nem vált át automatikusan az alapstratégiára.</p> : null}
       {active && settings.selectedModel && !settings.selectedModel.usable ? <p className="settings-warning">A kiválasztott modell PAPER-jóváhagyását visszavonták. Új ML belépés nem történik; válts modellt vagy térj vissza az alapstratégiára.</p> : null}
@@ -77,7 +78,7 @@ export function PaperStrategyCard() {
     <fieldset className="strategy-choice">
       <legend className="sfield-label">Stratégia kiválasztása</legend>
       <label className={`choice${mode === 'DEFAULT' ? ' selected' : ''}`}><input type="radio" name="paper-strategy" checked={mode === 'DEFAULT'} onChange={() => setMode('DEFAULT')} /><span><strong>Alapstratégia</strong><small>A jelenlegi szabályalapú New Launch BUY / WATCH / REJECT logika. Az ML a háttérben SHADOW módban gyűjt és előrejelez.</small></span></label>
-      <label className={`choice${mode === 'ML' ? ' selected' : ''}`}><input type="radio" name="paper-strategy" checked={mode === 'ML'} onChange={() => setMode('ML')} /><span><strong>ML-modell</strong><small>Egy admin által PAPER-re jóváhagyott modell dönt a belépésről. A biztonsági, kockázati és likviditási szabályok, a limitek és az Exit Engine változatlanul érvényesek.</small></span></label>
+      <label className={`choice${mode === 'ML' ? ' selected' : ''}`}><input type="radio" name="paper-strategy" checked={mode === 'ML'} onChange={() => setMode('ML')} /><span><strong>ML-modell</strong><small>ML belépés + szabályalapú kilépés. A vételi döntést kizárólag egy admin által PAPER-re jóváhagyott modell hozza (az alapstratégia BUY / WATCH / REJECT döntése, pontszám-küszöbei, időablaka, minőségi szűrője és közösségi szűrője nem vétózhatja meg). A kötelező biztonsági, kockázati és likviditási szabályok, a limitek és az Exit Engine változatlanul érvényesek. ML-alapú eladás nincs.</small></span></label>
     </fieldset>
 
     {mode === 'ML' ? <>

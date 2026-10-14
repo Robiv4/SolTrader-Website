@@ -96,6 +96,11 @@ export const LAUNCH_REASON_LABELS: Record<string, string> = {
   HIGH_EARLY_SUPPLY_CONCENTRATION: 'magas korai tokenkoncentráció',
   AUTHORITY_STATUS_UNKNOWN: 'authority állapot ismeretlen',
   HIGH_VOLATILITY: 'magas volatilitás',
+  MARKET_PRICE_UNKNOWN: 'nincs érvényes piaci ár',
+  RISK_NOT_CLASSIFIED: 'kockázati besorolás hiányzik',
+  RPC_SECURITY_DATA_UNAVAILABLE: 'biztonsági adat nem elérhető (RPC)',
+  COMPARE_QUALITY_GATE_WOULD_BLOCK: 'minőségi szűrő tiltaná (csak összehasonlítás)',
+  COMPARE_SOCIAL_WOULD_AVOID: 'közösségi szűrő kerülné (csak összehasonlítás)',
 };
 
 export function launchReasons(reasons: unknown) {

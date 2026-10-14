@@ -155,6 +155,9 @@ describe('ML PAPER strategy API', () => {
     expect(response.status).toBe(200);
     expect(response.body.data.strategies.DEFAULT).toMatchObject({ trades: 1, netPnl: 5 });
     expect(response.body.data.strategies.ML).toMatchObject({ trades: 2, netPnl: 1, wins: 1, profitFactor: 1.5, maxDrawdownUsd: 2 });
+    // ML strategy = ML entries + the common rule-based exit; SHADOW predictions are reported separately from PAPER results.
+    expect(response.body.data.exitMode).toBe('RULE_BASED');
+    expect(Array.isArray(response.body.data.shadowPredictions)).toBe(true);
     expect(response.body.data.byModel).toEqual([expect.objectContaining({ modelVersion: READY, trades: 2 })]);
     expect(response.body.data.training.label).toMatch(/SHADOW TRAINING DATA/);
   });

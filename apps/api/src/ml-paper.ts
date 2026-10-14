@@ -278,6 +278,8 @@ export function createMlPaperRouter(deps: MlPaperDeps) {
       const closed: ClosedTrade[] = trades.map((trade) => ({ netPnl: Number(trade.netPnl ?? 0), fees: Number(trade.fees ?? 0), slippage: Number(trade.slippage ?? 0), exitAt: trade.exitAt, entryStrategy: trade.entryStrategy ?? 'DEFAULT', mlModelVersion: trade.mlModelVersion }));
       const mlTrades = closed.filter((trade) => trade.entryStrategy === 'ML');
       const byModel = [...new Set(mlTrades.map((trade) => trade.mlModelVersion ?? 'ismeretlen'))].map((version) => ({ modelVersion: version, ...paperStats(mlTrades.filter((trade) => (trade.mlModelVersion ?? 'ismeretlen') === version)) }));
+      // SHADOW predictions (every candidate, no trading) - kept apart from ML PAPER decisions and closed PAPER trades.
+      const shadowGroups = await prisma.mlPrediction.groupBy({ by: ['modelVersion', 'predictedClass'], where: { predictedAt: { gte: since } }, _count: { _all: true } }).catch(() => []);
       const [decisionGroups, outcomeGroups, openMl] = await Promise.all([
         prisma.mlPaperDecision.groupBy({ by: ['modelVersion', 'mlDecision'], where: { userId, decidedAt: { gte: since } }, _count: { _all: true } }),
         prisma.mlPaperDecision.groupBy({ by: ['outcome'], where: { userId, decidedAt: { gte: since }, mlDecision: 'ML_BUY' }, _count: { _all: true } }),
@@ -285,7 +287,7 @@ export function createMlPaperRouter(deps: MlPaperDeps) {
       ]);
       const recentDecisions = await prisma.mlPaperDecision.findMany({
         where: { userId, decidedAt: { gte: since } }, orderBy: { decidedAt: 'desc' }, take: 50,
-        select: { id: true, mint: true, modelVersion: true, decidedAt: true, snapshotKind: true, probability: true, threshold: true, mlDecision: true, errorReason: true, baseDecision: true, outcome: true, executionReason: true, safetyBlockers: true, positionId: true },
+        select: { id: true, mint: true, modelVersion: true, decidedAt: true, snapshotKind: true, probability: true, threshold: true, mlDecision: true, errorReason: true, baseDecision: true, baseReasons: true, outcome: true, executionReason: true, safetyBlockers: true, positionId: true },
       });
 
       // Training data (SHADOW collection; all candidates, independent of the active strategy).
@@ -314,6 +316,9 @@ export function createMlPaperRouter(deps: MlPaperDeps) {
         strategies: { DEFAULT: paperStats(closed.filter((trade) => trade.entryStrategy !== 'ML')), ML: paperStats(mlTrades) },
         byModel,
         openMlPositions: openMl,
+        /** The ML strategy decides entries only; exits are made by the common rule-based Exit Engine (no ML SELL model). */
+        exitMode: 'RULE_BASED',
+        shadowPredictions: shadowGroups.map((item) => ({ modelVersion: item.modelVersion, predictedClass: item.predictedClass, count: item._count._all })),
         decisions: decisionGroups.map((item) => ({ modelVersion: item.modelVersion, mlDecision: item.mlDecision, count: item._count._all })),
         mlBuyOutcomes: Object.fromEntries(outcomeGroups.map((item) => [item.outcome, item._count._all])),
         recentDecisions: recentDecisions.map((item) => ({ ...item, probability: num(item.probability), threshold: num(item.threshold) })),
