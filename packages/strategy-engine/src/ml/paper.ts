@@ -13,7 +13,7 @@ import type { LaunchSecurity, NewLaunchSettings, NewLaunchStrategyResult } from 
 export const ML_PAPER_SNAPSHOT_POINTS: Record<string, number> = { AGE_15S: 15_000, AGE_30S: 30_000, AGE_60S: 60_000 };
 /** A prediction point missed by more than this (worker busy / restarted) is skipped, never decided late. */
 export const ML_PAPER_POINT_TOLERANCE_MS = 10_000;
-export const ML_PAPER_THRESHOLD_MIN = 0.5;
+export const ML_PAPER_THRESHOLD_MIN = 0.05;
 export const ML_PAPER_THRESHOLD_MAX = 0.9;
 export const ML_PAPER_WINDOW_MAX_SECONDS = 30;
 
