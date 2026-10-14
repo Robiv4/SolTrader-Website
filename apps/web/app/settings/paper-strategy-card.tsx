@@ -29,7 +29,13 @@ export function PaperStrategyCard() {
   useEffect(() => {
     if (!settings) return;
     setMode(settings.strategyMode);
-    setModelVersion(settings.modelVersion ?? settings.approvedModels?.[0]?.version ?? '');
+    setModelVersion(
+      (settings.approvedModels ?? []).some(
+        (model: { version: string }) => model.version === settings.modelVersion
+      )
+        ? settings.modelVersion
+        : settings.approvedModels?.[0]?.version ?? ''
+    );
     setThreshold(settings.buyThreshold);
     setWindowSeconds(settings.decisionWindowSeconds);
   }, [settings]);
