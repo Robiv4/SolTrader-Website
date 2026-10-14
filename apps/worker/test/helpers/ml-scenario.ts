@@ -22,19 +22,19 @@ const logger = { info: () => undefined, warn: (payload: unknown, message?: strin
 
 const constantArtifact = (version: string, p: number): MlModelArtifact => ({ ...fixture.LR.artifact, modelVersion: version, calibration: null, logistic: { coef: fixture.LR.artifact.columns.map(() => 0), intercept: Math.log(p / (1 - p)) } });
 
-interface Strategy { mode: 'DEFAULT' | 'ML'; probability?: number; approved?: boolean; engine?: 'real' | 'throwing' | 'none' }
+interface Strategy { mode: 'DEFAULT' | 'ML'; probability?: number; approved?: boolean; engine?: 'real' | 'throwing' | 'none'; /** New Launch config overrides of the user (e.g. thresholds, quality gate). */ config?: Record<string, unknown>; /** Token security (default: authorities revoked, classic SPL). */ mint?: { mintAuthority: string | null; freezeAuthority: string | null; tokenProgram: string; extensions: string[] } }
 
-function fakePrisma(record: { decisions: any[]; signals: any[]; ml: Record<string, any[]> }, strategy: Strategy) {
+function fakePrisma(record: { decisions: any[]; signals: any[]; signalMetadata: any[]; ml: Record<string, any[]> }, strategy: Strategy) {
   let id = 0;
   const overrides: Record<string, Record<string, (args: any) => any>> = {
-    newLaunchConfig: { findMany: () => [{ userId: 'u1', enabled: true }] },
+    newLaunchConfig: { findMany: () => [{ userId: 'u1', enabled: true, ...strategy.config }] },
     botConfig: {
       findMany: () => [{ userId: 'u1', minLiquidityUsd: null, minVolumeUsd: null, maxTokenAgeHours: 168, user: { riskConfigs: [{ riskPolicy: 'EXPLORATORY', maxSlippagePercent: 50, lowRiskMax: 30, moderateRiskMax: 50, highRiskMax: 90, veryHighRiskMax: 100, lowPositionMultiplier: 1, moderatePositionMultiplier: 1, highPositionMultiplier: 1, veryHighPositionMultiplier: 1 }] } }],
       findUnique: () => ({ tradingMode: 'PAPER' }),
     },
     paperAccount: { findUnique: () => ({ equity: 1_000 }) },
     launchDecision: { create: ({ data }: any) => { record.decisions.push({ decision: data.decision, status: data.status, reasons: data.reasons, score: data.score }); return { id: `d${++id}` }; } },
-    signal: { create: ({ data }: any) => { record.signals.push({ strategyName: data.strategyName, direction: data.direction, entryStrategy: data.metadata.entryStrategy, ml: data.metadata.ml }); return { id: `s${++id}` }; } },
+    signal: { create: ({ data }: any) => { record.signals.push({ strategyName: data.strategyName, direction: data.direction, entryStrategy: data.metadata.entryStrategy, ml: data.metadata.ml }); record.signalMetadata.push(data.metadata); return { id: `s${++id}` }; } },
     mlPaperSettings: { findMany: () => (strategy.mode === 'ML' ? [{ userId: 'u1', strategyMode: 'ML', modelVersion: 'M1', buyThreshold: 0.7, decisionWindowSeconds: 30 }] : [{ userId: 'u1', strategyMode: 'DEFAULT', modelVersion: null, buyThreshold: 0.7, decisionWindowSeconds: 10 }]) },
   };
   const shadowTable = (model: string) => ({
@@ -86,7 +86,7 @@ function mlPaper(strategy: Strategy) {
 
 export async function runScenario(strategy: Strategy, options: { shadow?: boolean; social?: (now: () => number) => any } = {}) {
   let now = Date.parse('2026-10-05T10:00:00Z');
-  const record = { decisions: [] as any[], signals: [] as any[], ml: {} as Record<string, any[]> };
+  const record = { decisions: [] as any[], signals: [] as any[], signalMetadata: [] as any[], ml: {} as Record<string, any[]> };
   const prisma = fakePrisma(record, strategy);
   const paper = strategy.engine === 'none' ? null : mlPaper(strategy);
   const shadow = options.shadow ? new MlShadowService({ prisma, logger, mode: 'SHADOW', repoRoot: process.cwd(), now: () => now }) : undefined;
@@ -95,7 +95,7 @@ export async function runScenario(strategy: Strategy, options: { shadow?: boolea
   const service = new NewLaunchService({
     prisma, providers: [provider as any], logger, now: () => now,
     marketData: { getTokenMetrics: async () => ({ priceUsd: 150, metadata: { address: 'So11111111111111111111111111111111111111112' } }) } as any,
-    getMintInfo: async () => ({ mintAuthority: null, freezeAuthority: null, tokenProgram: 'spl-token', extensions: [] }),
+    getMintInfo: async () => strategy.mint ?? ({ mintAuthority: null, freezeAuthority: null, tokenProgram: 'spl-token', extensions: [] }),
     store: { set: async () => 'OK', incrBy: async () => 1, expire: async () => 1 },
     publish: async () => undefined,
     ml: shadow,

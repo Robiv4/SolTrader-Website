@@ -22,6 +22,17 @@ export const NEW_LAUNCH_STRATEGY = 'NewLaunchStrategy';
 /** Risk-engine hard blocks that the launch policy handles as "wait" while the launch window is open. */
 const LAUNCH_WAITABLE_BLOCKS = new Set(['LIQUIDITY_BELOW_ABSOLUTE_MINIMUM', 'EXTREME_PRICE_IMPACT', 'MARKET_DATA_UNAVAILABLE']);
 /** Reasons after which a candidate is not re-evaluated for that user. */
+/** Latest ML prediction point (AGE_60S) + tolerance + max. decision window, with margin. */
+const ML_EVALUATION_WINDOW_MS = 120_000;
+
+/** DEFAULT optional filters as comparison flags next to an ML decision (never a veto in ML mode). */
+function defaultFilterComparison(gate: QualityGateResult, user: UserContext, social: SocialSnapshotResult | null) {
+  const flags: string[] = [];
+  if (gate.blocksEntry) flags.push('COMPARE_QUALITY_GATE_WOULD_BLOCK');
+  if (socialBlocksEntry({ decision: 'BUY', mode: user.settings.socialDecisionMode, shadowDecision: social?.shadowDecision })) flags.push('COMPARE_SOCIAL_WOULD_AVOID');
+  return flags;
+}
+
 const STICKY_REASONS = new Set(['LAUNCH_WINDOW_EXPIRED', 'CREATOR_SELLING', 'LAUNCH_EXHAUSTED', 'CRITICAL_LIQUIDITY', 'RISK_SCORE_ABOVE_LAUNCH_MAXIMUM', 'LIQUIDITY_ABOVE_MAXIMUM']);
 
 export interface NewLaunchStore {
@@ -258,7 +269,9 @@ export class NewLaunchService {
       const users = await this.users();
       for (const launch of this.tracker.launches.values()) {
         if (users.length === 0) break;
-        const maxWindow = Math.max(...users.map((user) => user.settings.maxAgeSeconds)) * 1000 + 30_000;
+        // ML users are evaluated at least until their model's snapshot point + decision window has passed (independent of
+        // the DEFAULT max. age setting).
+        const maxWindow = Math.max(...users.map((user) => user.settings.maxAgeSeconds * 1000 + 30_000), users.some((user) => user.strategy.mode === 'ML') ? ML_EVALUATION_WINDOW_MS : 0);
         if (now - (launch.createdAt ?? launch.detectedAt) > maxWindow) continue;
         if (launch.buyCount + launch.sellCount === 0 && !launch.external) continue;
         await this.evaluateLaunch(launch, users, now).catch((error: unknown) => this.deps.logger.warn({ err: error instanceof Error ? error.message : String(error), mint: launch.mint }, 'New launch evaluation failed'));
@@ -540,21 +553,21 @@ export class NewLaunchService {
       candidateId: context.getCandidateId,
       buildFeatures: () => build().snapshot,
       eligible: () => build().eligible,
+      // Mandatory safety only: the DEFAULT strategy's decision, thresholds, timing window, quality gate and social AVOID
+      // never veto an ML BUY (ML-only mode, see ML_IGNORED_DEFAULT_FILTERS).
       safetyBlockers: () => {
         const blockers = mlEntrySafetyBlockers({ result, security: security.security, riskScore: risk.riskScore, riskHardBlockReasons: risk.hardBlockReasons, settings: user.settings, detectedAt: launch.detectedAt, now });
         if (risk.classification === null) blockers.push('RISK_NOT_CLASSIFIED');
-        // User-configured entry filters can only remove an entry, in ML mode too.
-        const gate = this.qualityGateFor(result, state, user);
-        if (gate.blocksEntry) blockers.push('QUALITY_GATE_FAILED');
-        if (socialBlocksEntry({ decision: 'BUY', mode: user.settings.socialDecisionMode, shadowDecision: social?.shadowDecision })) blockers.push('SOCIAL_AVOID');
         return blockers;
       },
-      base: { decision: result.decision, reasons: result.reasons },
+      // Comparison only (stored with the ML decision): what the DEFAULT strategy and its optional filters said at this moment.
+      base: { decision: result.decision, reasons: [...result.reasons, ...defaultFilterComparison(this.qualityGateFor(result, state, user), user, social)] },
     });
     if (step.action !== 'SIGNAL') return;
     const candidateId = await context.getCandidateId();
     const decisionRow = await this.deps.prisma.launchDecision.findFirst({ where: { userId: user.userId, candidateId }, orderBy: { decisionAt: 'desc' }, select: { id: true } }).catch(() => null);
-    const gate = this.qualityGateFor(result, state, user);
+    // Stored for comparison only; PAPER execution never applies the DEFAULT quality gate to an ML entry.
+    const gate = { ...this.qualityGateFor(result, state, user), appliesToEntry: false };
     const signalId = await this.createBuySignal(launch, user, result, risk, decisionRow?.id ?? null, security.completedAt, now, state, security.security, gate, social, {
       entryStrategy: 'ML', decisionId: step.decisionId, modelVersion: step.modelVersion, probability: step.probability, threshold: step.threshold,
       snapshotKind: step.snapshotKind, snapshotAt: new Date(step.snapshotAt).toISOString(), featureHash: step.featureHash,

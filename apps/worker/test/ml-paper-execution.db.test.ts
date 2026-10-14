@@ -30,7 +30,7 @@ function scoped(userIds: string[]): PrismaClient {
   }) as PrismaClient;
 }
 
-async function createUser(strategy: 'DEFAULT' | 'ML', options: { tradingMode?: 'PAPER' | 'SEMI_AUTO' | 'LIVE'; emergency?: boolean } = {}) {
+async function createUser(strategy: 'DEFAULT' | 'ML', options: { tradingMode?: 'PAPER' | 'SEMI_AUTO' | 'LIVE'; emergency?: boolean; minLaunchScore?: number } = {}) {
   const user = await prisma.user.create({ data: { email: `ml-paper-${randomUUID().slice(0, 8)}@soltrader.test` } });
   createdUsers.push(user.id);
   await prisma.paperAccount.create({ data: { userId: user.id, initialBalance: 1_000, cashBalance: 1_000, equity: 1_000 } });
@@ -39,7 +39,7 @@ async function createUser(strategy: 'DEFAULT' | 'ML', options: { tradingMode?: '
     userId: user.id, maxPositionPercent: 5, maxTotalExposurePercent: 25, maxConcurrentPositions: 4, dailyLossLimitPercent: 8, maxSlippagePercent: 3,
     minSignalScore: 0, cooldownSeconds: 0, riskPolicy: 'EXPLORATORY', lowRiskMax: 30, moderateRiskMax: 50, highRiskMax: 90, veryHighRiskMax: 100,
   } });
-  await prisma.newLaunchConfig.create({ data: { userId: user.id, enabled: true, minScore: 0 } });
+  await prisma.newLaunchConfig.create({ data: { userId: user.id, enabled: true, minScore: options.minLaunchScore ?? 0 } });
   await prisma.mlPaperSettings.create({ data: { userId: user.id, strategyMode: strategy, modelVersion: strategy === 'ML' ? MODEL : null } });
   return user.id;
 }
@@ -51,7 +51,7 @@ async function decisionRow(userId: string, mint: string) {
   } });
 }
 
-async function launchSignal(userId: string, mint: string, entryStrategy: 'DEFAULT' | 'ML', decisionId?: string) {
+async function launchSignal(userId: string, mint: string, entryStrategy: 'DEFAULT' | 'ML', decisionId?: string, options: { qualityGate?: Record<string, unknown> | null; probability?: number } = {}) {
   const token = await prisma.token.upsert({ where: { address: mint }, update: {}, create: { address: mint, symbol: 'MLP', name: 'ML paper test' } });
   if (!createdTokens.includes(token.id)) createdTokens.push(token.id);
   const now = Date.now();
@@ -60,8 +60,8 @@ async function launchSignal(userId: string, mint: string, entryStrategy: 'DEFAUL
     reasons: ['ML_BUY'], entryConditions: [], invalidationConditions: [],
     metadata: {
       decisionSource: 'NEW_LAUNCH', primaryStrategy: 'NewLaunchStrategy', riskClassification: 'MODERATE', hardBlocked: false, hardBlockReasons: [], riskPolicy: 'EXPLORATORY', riskWarnings: [], riskFactors: {},
-      entryStrategy, ml: entryStrategy === 'ML' ? { decisionId, modelVersion: MODEL, probability: 0.91, threshold: 0.7, snapshotKind: 'AGE_30S' } : null,
-      launch: { source: 'PUMP_FUN', mint, detectedAt: new Date(now - 31_000).toISOString(), decisionAt: new Date(now - 500).toISOString(), ageSeconds: 31, score: 40, liquidityUsd: 30_000, reasons: [], warnings: [], qualityGate: null },
+      entryStrategy, ml: entryStrategy === 'ML' ? { decisionId, modelVersion: MODEL, probability: options.probability ?? 0.91, threshold: 0.7, snapshotKind: 'AGE_30S' } : null,
+      launch: { source: 'PUMP_FUN', mint, detectedAt: new Date(now - 31_000).toISOString(), decisionAt: new Date(now - 500).toISOString(), ageSeconds: 31, score: 40, liquidityUsd: 30_000, reasons: [], warnings: [], qualityGate: options.qualityGate ?? null },
     },
   } });
 }
@@ -155,6 +155,34 @@ describe('ML PAPER entries in the PAPER Execution Engine', () => {
     const reasons = await prisma.auditLog.findMany({ where: { userId: { in: [mlUser, defaultUser] }, action: 'TRADE_REJECTED' } });
     expect(reasons.map((row) => (row.details as any).decisionReasons[0]).sort()).toEqual(['ENTRY_STRATEGY_NOT_ACTIVE', 'ENTRY_STRATEGY_NOT_ACTIVE']);
     expect(await prisma.mlPaperDecision.findUniqueOrThrow({ where: { id: decision.id } })).toMatchObject({ outcome: 'EXECUTION_REJECTED' });
+  });
+
+  it('1 / 5 / 8. ML-only: a failed DEFAULT quality gate and a Launch Score below the DEFAULT minimum do not veto an ML entry; DEFAULT is unchanged', async () => {
+    const failedGate = { mode: 'ENFORCE_PAPER', evaluated: true, wouldPass: false, reasons: ['LAUNCH_SCORE_BELOW_GATE'], blocksEntry: true };
+    const mlUser = await createUser('ML', { minLaunchScore: 90 });
+    const defaultUser = await createUser('DEFAULT', { minLaunchScore: 0 });
+    const lowScoreUser = await createUser('DEFAULT', { minLaunchScore: 90 });
+    const [a, b, c] = [mint(), mint(), mint()];
+    const decision = await decisionRow(mlUser, a);
+    await launchSignal(mlUser, a, 'ML', decision.id, { qualityGate: { ...failedGate, appliesToEntry: false } });
+    await launchSignal(defaultUser, b, 'DEFAULT', undefined, { qualityGate: failedGate });
+    await launchSignal(lowScoreUser, c, 'DEFAULT');
+    const summary = await coordinator([mlUser, defaultUser, lowScoreUser], new Map([[a, 0.000005], [b, 0.000005], [c, 0.000005]])).runCycle({ aborted: false });
+    expect(summary.executed).toBe(1);
+    expect(await prisma.trade.findFirstOrThrow({ where: { userId: mlUser } })).toMatchObject({ entryStrategy: 'ML', mode: 'PAPER' });
+    const rejected = await prisma.auditLog.findMany({ where: { userId: { in: [defaultUser, lowScoreUser] }, action: 'TRADE_REJECTED' } });
+    expect(rejected.map((row) => (row.details as any).decisionReasons[0]).sort()).toEqual(['QUALITY_GATE_FAILED', 'SIGNAL_SCORE_BELOW_MINIMUM']);
+  });
+
+  it('an ML signal below its own approved threshold is rejected at execution (ML conviction, defence in depth)', async () => {
+    const userId = await createUser('ML');
+    const address = mint();
+    const decision = await decisionRow(userId, address);
+    await launchSignal(userId, address, 'ML', decision.id, { probability: 0.5 });
+    const summary = await coordinator([userId], new Map([[address, 0.000005]])).runCycle({ aborted: false });
+    expect(summary.executed).toBe(0);
+    const rejected = await prisma.auditLog.findFirstOrThrow({ where: { userId, action: 'TRADE_REJECTED' } });
+    expect((rejected.details as any).decisionReasons).toContain('SIGNAL_SCORE_BELOW_MINIMUM');
   });
 
   it('2 / 9. a revoked or no longer selected model cannot buy', async () => {

@@ -207,3 +207,6 @@ input:focus, select:focus, textarea:focus { border-color: var(--brand-fill) !imp
 .settings-message { border-color: transparent; background: var(--brand-soft); }
 .decision-mode-banner.ai { background: var(--info-soft); }
 .primary-button:hover:not(:disabled), .login-button:hover:not(:disabled) { transform: none; box-shadow: none; }
+
+/* Section headings inside a tab (e.g. ML PAPER layers). */
+.section-title { margin: 22px 0 10px; color: var(--text); font-size: 15px; font-weight: 750; letter-spacing: -0.01em; }

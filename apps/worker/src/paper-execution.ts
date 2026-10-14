@@ -9,7 +9,7 @@ import {
   type RiskPolicyName,
 } from '@soltrader/risk-engine';
 import type { RealtimeEventType } from '@soltrader/shared';
-import { newLaunchEntryConfig, newLaunchExitConfig } from '@soltrader/strategy-engine';
+import { mlRiskConviction, newLaunchEntryConfig, newLaunchExitConfig } from '@soltrader/strategy-engine';
 import {
   debitPaperCash,
   effectiveDailyLossLimit,
@@ -445,9 +445,10 @@ export class PaperExecutionCoordinator {
         if (tradedBefore) return this.rejectCandidate(candidate, 'NEW_LAUNCH_ALREADY_TRADED', policy);
         const openLaunches = await this.deps.prisma.trade.count({ where: { userId: candidate.userId, decisionSource: 'NEW_LAUNCH', status: 'OPEN' } });
         if (openLaunches >= newLaunch.maxConcurrentPositions) return this.rejectCandidate(candidate, 'NEW_LAUNCH_MAX_CONCURRENT_POSITIONS', policy);
-        // Quality gate in ENFORCE_PAPER mode removes the entry; MONITOR_ONLY only records wouldPass.
+        // Quality gate in ENFORCE_PAPER mode removes a DEFAULT entry; MONITOR_ONLY only records wouldPass. It is a DEFAULT
+        // strategy preference: an ML entry (ML-only mode) is never vetoed by it (stored on the signal for comparison).
         const gate = (candidate.launch?.qualityGate ?? null) as { blocksEntry?: boolean } | null;
-        if (gate?.blocksEntry) return this.rejectCandidate(candidate, 'QUALITY_GATE_FAILED', policy);
+        if (candidate.entryStrategy === 'DEFAULT' && gate?.blocksEntry) return this.rejectCandidate(candidate, 'QUALITY_GATE_FAILED', policy);
       }
       // The retired AI trader can never open a position (its signals are not executed either).
       if (candidate.decisionSource === 'AI') return this.rejectCandidate(candidate, 'AI_TRADER_RETIRED', user.risk?.riskPolicy ?? candidate.riskPolicy);
@@ -523,6 +524,11 @@ export class PaperExecutionCoordinator {
         ? Object.fromEntries(Object.entries(riskMultipliers).map(([key, value]) => [key, value > 0 ? 1 : 0])) as unknown as typeof riskMultipliers
         : riskMultipliers;
 
+      // ML entries: the strategic conviction is the model probability vs. the approved threshold, not the DEFAULT Launch
+      // Score (risk-policy conviction rules for HIGH / VERY_HIGH risk are applied to it unchanged).
+      const mlConviction = newLaunch && candidate.entryStrategy === 'ML'
+        ? mlRiskConviction(typeof candidate.ml?.probability === 'number' ? candidate.ml.probability : null, typeof candidate.ml?.threshold === 'number' ? candidate.ml.threshold : null)
+        : null;
       const decision = decideFinalTrade({
         tradingMode: user.tradingMode as 'PAPER' | 'SEMI_AUTO' | 'LIVE' | 'SCANNER',
         classification: candidate.riskClassification,
@@ -530,9 +536,10 @@ export class PaperExecutionCoordinator {
         hardBlocked: candidate.hardBlocked,
         hardBlockReasons: candidate.hardBlockReasons,
         riskScore: candidate.riskScore,
-        signalScore: candidate.score,
-        // NewLaunch has its own Launch Score threshold (the strategy/composite minimum does not apply to it).
-        minimumSignalScore: candidate.manualPaper ? 0 : newLaunch ? newLaunch.minScore : minSignalScore,
+        signalScore: mlConviction ? mlConviction.signalScore : candidate.score,
+        // NewLaunch has its own Launch Score threshold (the strategy/composite minimum does not apply to it); ML entries use
+        // the approved ML threshold instead.
+        minimumSignalScore: candidate.manualPaper ? 0 : mlConviction ? mlConviction.minimumSignalScore : newLaunch ? newLaunch.minScore : minSignalScore,
         normalPositionSize,
         positionMultipliers: multipliers,
         // AI decisions are made upstream (AI mode); the risk engine's old AI-confirmation hook stays off.

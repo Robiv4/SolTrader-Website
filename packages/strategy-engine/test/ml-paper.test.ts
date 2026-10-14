@@ -5,7 +5,7 @@ import { describe, expect, it } from 'vitest';
 
 import {
   buildMlDataset, buildMlFeatureSnapshot, classifyMlProbability, computeCandidateOutcome, DEFAULT_NEW_LAUNCH_SETTINGS, evaluateNewLaunch, ML_PAPER_POINT_TOLERANCE_MS,
-  ML_PERMANENT_BLOCKERS, ML_STRATEGY_ONLY_REASONS, mlBuyWindowOpen, mlDecisionTiming, mlEntrySafetyBlockers, newOutcomePath, recordPathPoint,
+  ML_IGNORED_DEFAULT_FILTERS, ML_PERMANENT_BLOCKERS, ML_STRATEGY_ONLY_REASONS, mlBuyWindowOpen, mlRiskConviction, mlDecisionTiming, mlEntrySafetyBlockers, newOutcomePath, recordPathPoint,
   type LaunchObservation, type LaunchSecurity, type MlDatasetSourceRow,
 } from '../src/index.js';
 
@@ -45,10 +45,11 @@ describe('ML PAPER timing: one decision at the trained snapshot point', () => {
     expect(mlBuyWindowOpen(T, 600, T + 31_000)).toBe(false);
   });
 
-  it('ML BUY / ML SKIP at the threshold, threshold clamped to 0.50-0.90, invalid probabilities never buy', () => {
+  it('ML BUY / ML SKIP at the threshold, threshold clamped to 0.05-0.90, invalid probabilities never buy', () => {
     expect(classifyMlProbability(0.72, 0.7)).toBe('ML_BUY');
     expect(classifyMlProbability(0.69, 0.7)).toBe('ML_SKIP');
-    expect(classifyMlProbability(0.45, 0.1)).toBe('ML_SKIP');
+    expect(classifyMlProbability(0.04, 0.01)).toBe('ML_SKIP');
+    expect(classifyMlProbability(0.05, 0.01)).toBe('ML_BUY');
     expect(classifyMlProbability(0.95, 0.99)).toBe('ML_BUY');
     expect(classifyMlProbability(Number.NaN, 0.5)).toBe('ML_SKIP');
   });
@@ -74,7 +75,7 @@ describe('ML BUY cannot bypass mandatory safety (test 4)', () => {
     ['risk above the launch maximum', () => blockersFor(safe, 95).blockers, 'RISK_SCORE_ABOVE_LAUNCH_MAXIMUM'],
     ['price impact too high', () => blockersFor(safe, 40, weakButSafeLaunch(), { maxPriceImpactPercent: 0.5 }).blockers, 'PRICE_IMPACT_TOO_HIGH'],
     ['creator dumping (rug pull)', () => blockersFor(safe, 40, { ...weakButSafeLaunch(), creatorSoldRatio: 0.8 }).blockers, 'CREATOR_SELLING'],
-    ['launch window over', () => blockersFor(safe, 40, weakButSafeLaunch(), { maxAgeSeconds: 20 }).blockers, 'LAUNCH_WINDOW_EXPIRED'],
+    ['no market price', () => blockersFor(safe, 40, weakButSafeLaunch({ priceUsd: null })).blockers, 'MARKET_PRICE_UNKNOWN'],
   ];
   for (const [name, run, expected] of cases) {
     it(`${name} -> ${expected}`, () => {
@@ -86,6 +87,36 @@ describe('ML BUY cannot bypass mandatory safety (test 4)', () => {
     expect(ML_PERMANENT_BLOCKERS.has('SELLABILITY_FAILED')).toBe(true);
     expect(ML_PERMANENT_BLOCKERS.has('CREATOR_SELLING')).toBe(true);
     expect(ML_PERMANENT_BLOCKERS.has('SELLABILITY_NOT_VERIFIED')).toBe(false);
+  });
+});
+
+describe('ML-only mode: DEFAULT strategy preferences never veto an ML BUY', () => {
+  it('5. a low DEFAULT Launch Score / weak activity is not a blocker (only safety facts are read)', () => {
+    const { result, blockers } = blockersFor(safe, 40, weakButSafeLaunch(), { minScore: 100, minTransactions: 10_000, minUniqueBuyers: 10_000, minBuySellRatio: 50 });
+    expect(result.decision).not.toBe('BUY');
+    expect(blockers).toEqual([]);
+  });
+
+  it('DEFAULT timing window and max. liquidity preference are ignored; their reason codes are documented as ignored', () => {
+    expect(blockersFor(safe, 40, weakButSafeLaunch(), { minAgeSeconds: 600, observationSeconds: 600, maxAgeSeconds: 5, maxLiquidityUsd: 1_000 }).blockers).toEqual([]);
+    for (const code of ['LAUNCH_TOO_YOUNG', 'OBSERVATION_IN_PROGRESS', 'LAUNCH_WINDOW_EXPIRED', 'LIQUIDITY_ABOVE_MAXIMUM', 'QUALITY_GATE_FAILED', 'SOCIAL_AVOID', 'LAUNCH_SCORE_BELOW_MINIMUM']) {
+      expect(ML_IGNORED_DEFAULT_FILTERS as readonly string[]).toContain(code);
+    }
+  });
+
+  it('safety codes are never in the ignored list', () => {
+    for (const code of ['SELLABILITY_NOT_VERIFIED', 'SELLABILITY_FAILED', 'FREEZE_AUTHORITY_ACTIVE', 'MINT_AUTHORITY_ACTIVE', 'LIQUIDITY_BELOW_MINIMUM', 'PRICE_IMPACT_TOO_HIGH', 'RISK_NOT_ASSESSED', 'CREATOR_SELLING', 'CRITICAL_LIQUIDITY']) {
+      expect(ML_IGNORED_DEFAULT_FILTERS as readonly string[]).not.toContain(code);
+    }
+  });
+
+  it('risk-decision conviction comes from the ML probability vs. its threshold (not the DEFAULT score)', () => {
+    expect(mlRiskConviction(0.83, 0.3)).toEqual({ signalScore: 83, minimumSignalScore: 30 });
+    // CONSERVATIVE + HIGH risk needs >= 80: a 0.5 probability does not satisfy it, 0.85 does.
+    expect(mlRiskConviction(0.5, 0.3).signalScore).toBeLessThan(80);
+    // Missing / invalid probability never passes (NaN fails every minimum).
+    expect(Number.isNaN(mlRiskConviction(null, 0.3).signalScore)).toBe(true);
+    expect(mlRiskConviction(0.9, 2).minimumSignalScore).toBe(90);
   });
 });
 
