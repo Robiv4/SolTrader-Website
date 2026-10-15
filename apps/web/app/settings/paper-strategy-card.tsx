@@ -15,6 +15,8 @@ const BLOCKER_LABELS: Record<string, string> = {
 
 const pct = (value: number | null | undefined, digits = 3) => (value == null ? '—' : fmt(value, digits));
 
+export const TOKEN_SAFETY_OFF_WARNING = 'Figyelem! Az ML BUY olyan tokeneknél is PAPER pozíciót nyithat, amelyeket a normál biztonsági ellenőrzések elutasítanának. Ez kizárólag szimulált kereskedésre használható, és a teljesítmény nem tükrözi feltétlenül a valós piacon végrehajtható eredményeket.';
+
 /** "Aktív PAPER stratégia": DEFAULT (rule-based) or an admin-approved ML model. PAPER only; LIVE is never reachable. */
 export function PaperStrategyCard() {
   const { data, error, loading, refresh } = useApi<{ data: any }>('/api/settings/ml-paper');
@@ -23,6 +25,7 @@ export function PaperStrategyCard() {
   const [modelVersion, setModelVersion] = useState<string>('');
   const [threshold, setThreshold] = useState(0.7);
   const [windowSeconds, setWindowSeconds] = useState(10);
+  const [tokenSafety, setTokenSafety] = useState(true);
   const [message, setMessage] = useState<{ text: string; tone: 'info' | 'error' | 'success' } | null>(null);
   const [busy, setBusy] = useState(false);
 
@@ -38,6 +41,7 @@ export function PaperStrategyCard() {
     );
     setThreshold(settings.buyThreshold);
     setWindowSeconds(settings.decisionWindowSeconds);
+    setTokenSafety(settings.tokenSafetyChecksEnabled !== false);
   }, [settings]);
 
   if (loading && !settings) return <p className="sfield-help">Betöltés…</p>;
@@ -68,6 +72,7 @@ export function PaperStrategyCard() {
     <div className="status-list">
       <div className="status-row"><span>Aktív PAPER stratégia</span><Status tone={active ? 'info' : 'positive'}>{active ? `ML-MODELL · ${settings.modelVersion}` : 'ALAPSTRATÉGIA'}</Status></div>
       {active ? <div className="status-row"><span>Kereskedési mód</span><Status tone="info">ML BELÉPÉS + SZABÁLYALAPÚ KILÉPÉS</Status></div> : null}
+      {active ? <div className="status-row"><span>Tokenbiztonsági ellenőrzések</span>{settings.tokenSafetyChecksEnabled === false ? <Status tone="warning">KI – KÍSÉRLETI ML-ONLY PAPER</Status> : <Status tone="positive">BE</Status>}</div> : null}
       {active ? <div className="status-row"><span>Modell állapota</span>{settings.selectedModel?.usable ? <Status tone={health?.status === 'LOADED' ? 'positive' : 'warning'}>{health?.status === 'LOADED' ? 'BETÖLTVE' : health ? 'NEM ELÉRHETŐ' : 'NINCS JELENTÉS'}</Status> : <Status tone="danger">VISSZAVONVA – NINCS ML BELÉPÉS</Status>}</div> : null}
       {active && health?.error ? <p className="settings-warning">Modellhiba: {health.error}. Amíg fennáll, az ML nem nyit pozíciót, és nem vált át automatikusan az alapstratégiára.</p> : null}
       {active && settings.selectedModel && !settings.selectedModel.usable ? <p className="settings-warning">A kiválasztott modell PAPER-jóváhagyását visszavonták. Új ML belépés nem történik; válts modellt vagy térj vissza az alapstratégiára.</p> : null}
@@ -99,6 +104,12 @@ export function PaperStrategyCard() {
           <span className="sfield-help">Az ML BUY ennyi ideig várhat a kötelező biztonsági feltételekre (pl. eladhatóság igazolása), utána lejár.</span>
         </label>
       </div>
+      <fieldset className="strategy-choice sgrid-spaced">
+        <legend className="sfield-label">Tokenbiztonsági ellenőrzések az ML BUY előtt</legend>
+        <label className={`choice${tokenSafety ? ' selected' : ''}`}><input type="radio" name="ml-token-safety" checked={tokenSafety} onChange={() => setTokenSafety(true)} /><span><strong>BE</strong><small>Biztonságosabb PAPER kereskedés (alapértelmezett): eladhatóság, mint / freeze authority, Token-2022 és rug-pull szűrők megakadályozhatják az ML BUY-t.</small></span></label>
+        <label className={`choice${!tokenSafety ? ' selected' : ''}`}><input type="radio" name="ml-token-safety" checked={!tokenSafety} onChange={() => setTokenSafety(false)} /><span><strong>KI</strong><small>Kísérleti ML-only PAPER mód: a tokenbiztonsági szűrők csak figyelmeztetésként naplózódnak. A piaci ár, likviditás, árhatás, kockázati és számlalimitek, a vészleállítás, a modell-jóváhagyás és az Exit Engine továbbra is kötelező.</small></span></label>
+      </fieldset>
+      {!tokenSafety ? <p className="settings-warning" role="alert">{TOKEN_SAFETY_OFF_WARNING}</p> : null}
       {model ? <div className="status-list sgrid-spaced">
         <div className="status-row"><span>Állapot / készültség</span><span><Status tone="info">{model.status}</Status> <Status tone={model.readiness === 'SHADOW_READY' ? 'positive' : 'warning'}>{model.readiness}</Status></span></div>
         <div className="status-row"><span>Döntési pont (snapshot)</span><span>{model.snapshotKind ?? '—'} – a modell csak ennél az időpontnál dönt, a belépés ezután történhet</span></div>
@@ -114,7 +125,14 @@ export function PaperStrategyCard() {
       <p className="sfield-help">Csak PAPER: ezzel a funkcióval LIVE kereskedés semmilyen módon nem kapcsolható be. A kilépéseket mindkét módban a közös Exit Engine kezeli; modellhiba esetén is. Részletes összehasonlítás: <Link className="table-link" href="/machine-learning">Machine Learning → PAPER stratégiák</Link>.</p>
       <div className="header-actions">
         {active ? <button type="button" className="secondary-button" disabled={busy} onClick={() => void save({ strategyMode: 'DEFAULT' }, 'Visszaváltva az alapstratégiára. Az ML SHADOW adatgyűjtés tovább fut.')}>Visszaváltás az alapstratégiára</button> : null}
-        {mode === 'ML' ? <button type="button" className="primary-button" disabled={busy || !modelVersion || !thresholdValid || (!active && !settings.canEnable)} onClick={() => void save({ strategyMode: 'ML', modelVersion, buyThreshold: threshold, decisionWindowSeconds: windowSeconds }, active ? 'ML PAPER beállítások elmentve.' : 'ML PAPER stratégia bekapcsolva.')}>{active ? 'ML beállítások mentése' : 'ML PAPER engedélyezése'}</button> : null}
+        {mode === 'ML' ? <button type="button" className="primary-button" disabled={busy || !modelVersion || !thresholdValid || (!active && !settings.canEnable)} onClick={() => {
+          // Switching the token-security checks OFF needs a separate, explicit confirmation.
+          const turningOff = !tokenSafety && settings.tokenSafetyChecksEnabled !== false;
+          if (turningOff && !globalThis.confirm(`${TOKEN_SAFETY_OFF_WARNING}
+
+Biztosan kikapcsolod a tokenbiztonsági ellenőrzéseket az ML BUY előtt?`)) return;
+          void save({ strategyMode: 'ML', modelVersion, buyThreshold: threshold, decisionWindowSeconds: windowSeconds, tokenSafetyChecksEnabled: tokenSafety, ...(turningOff ? { acknowledgeExperimentalMode: true } : {}) }, active ? 'ML PAPER beállítások elmentve.' : 'ML PAPER stratégia bekapcsolva.');
+        }}>{active ? 'ML beállítások mentése' : 'ML PAPER engedélyezése'}</button> : null}
         {mode === 'DEFAULT' && !active ? <span className="sfield-help">Az alapstratégia aktív.</span> : null}
       </div>
     </div>

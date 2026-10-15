@@ -30,7 +30,7 @@ function scoped(userIds: string[]): PrismaClient {
   }) as PrismaClient;
 }
 
-async function createUser(strategy: 'DEFAULT' | 'ML', options: { tradingMode?: 'PAPER' | 'SEMI_AUTO' | 'LIVE'; emergency?: boolean; minLaunchScore?: number } = {}) {
+async function createUser(strategy: 'DEFAULT' | 'ML', options: { tradingMode?: 'PAPER' | 'SEMI_AUTO' | 'LIVE'; emergency?: boolean; minLaunchScore?: number; tokenSafety?: boolean } = {}) {
   const user = await prisma.user.create({ data: { email: `ml-paper-${randomUUID().slice(0, 8)}@soltrader.test` } });
   createdUsers.push(user.id);
   await prisma.paperAccount.create({ data: { userId: user.id, initialBalance: 1_000, cashBalance: 1_000, equity: 1_000 } });
@@ -40,7 +40,7 @@ async function createUser(strategy: 'DEFAULT' | 'ML', options: { tradingMode?: '
     minSignalScore: 0, cooldownSeconds: 0, riskPolicy: 'EXPLORATORY', lowRiskMax: 30, moderateRiskMax: 50, highRiskMax: 90, veryHighRiskMax: 100,
   } });
   await prisma.newLaunchConfig.create({ data: { userId: user.id, enabled: true, minScore: options.minLaunchScore ?? 0 } });
-  await prisma.mlPaperSettings.create({ data: { userId: user.id, strategyMode: strategy, modelVersion: strategy === 'ML' ? MODEL : null } });
+  await prisma.mlPaperSettings.create({ data: { userId: user.id, strategyMode: strategy, modelVersion: strategy === 'ML' ? MODEL : null, tokenSafetyChecksEnabled: options.tokenSafety ?? true } });
   return user.id;
 }
 
@@ -51,7 +51,7 @@ async function decisionRow(userId: string, mint: string) {
   } });
 }
 
-async function launchSignal(userId: string, mint: string, entryStrategy: 'DEFAULT' | 'ML', decisionId?: string, options: { qualityGate?: Record<string, unknown> | null; probability?: number } = {}) {
+async function launchSignal(userId: string, mint: string, entryStrategy: 'DEFAULT' | 'ML', decisionId?: string, options: { qualityGate?: Record<string, unknown> | null; probability?: number; experimental?: boolean } = {}) {
   const token = await prisma.token.upsert({ where: { address: mint }, update: {}, create: { address: mint, symbol: 'MLP', name: 'ML paper test' } });
   if (!createdTokens.includes(token.id)) createdTokens.push(token.id);
   const now = Date.now();
@@ -60,7 +60,7 @@ async function launchSignal(userId: string, mint: string, entryStrategy: 'DEFAUL
     reasons: ['ML_BUY'], entryConditions: [], invalidationConditions: [],
     metadata: {
       decisionSource: 'NEW_LAUNCH', primaryStrategy: 'NewLaunchStrategy', riskClassification: 'MODERATE', hardBlocked: false, hardBlockReasons: [], riskPolicy: 'EXPLORATORY', riskWarnings: [], riskFactors: {},
-      entryStrategy, ml: entryStrategy === 'ML' ? { decisionId, modelVersion: MODEL, probability: options.probability ?? 0.91, threshold: 0.7, snapshotKind: 'AGE_30S' } : null,
+      entryStrategy, ml: entryStrategy === 'ML' ? { decisionId, modelVersion: MODEL, probability: options.probability ?? 0.91, threshold: 0.7, snapshotKind: 'AGE_30S', ...(options.experimental ? { tokenSafetyChecksEnabled: false, ignoredSafetyBlockers: ['FREEZE_AUTHORITY_ACTIVE', 'SELLABILITY_NOT_VERIFIED'], experimental: true } : { tokenSafetyChecksEnabled: true, ignoredSafetyBlockers: [] }) } : null,
       launch: { source: 'PUMP_FUN', mint, detectedAt: new Date(now - 31_000).toISOString(), decisionAt: new Date(now - 500).toISOString(), ageSeconds: 31, score: 40, liquidityUsd: 30_000, reasons: [], warnings: [], qualityGate: options.qualityGate ?? null },
     },
   } });
@@ -216,6 +216,84 @@ describe('ML PAPER entries in the PAPER Execution Engine', () => {
     const summary = await coordinator([userId], new Map([[address, 0.000005]])).runCycle({ aborted: false });
     expect(summary.executed).toBe(0);
     expect(await prisma.position.count({ where: { userId } })).toBe(0);
+  });
+
+  describe('token-security checks OFF (experimental ML-only PAPER mode)', () => {
+    it('2 / 10 / 12. an ML BUY signalled without token-security vetoes opens a PAPER position marked experimental; the Exit Engine still protects it; the audit log records the setting and the ignored checks', async () => {
+      const userId = await createUser('ML', { tokenSafety: false });
+      const address = mint();
+      const decision = await decisionRow(userId, address);
+      await launchSignal(userId, address, 'ML', decision.id, { experimental: true });
+      const summary = await coordinator([userId], new Map([[address, 0.000005]])).runCycle({ aborted: false });
+      expect(summary.executed).toBe(1);
+      const trade = await prisma.trade.findFirstOrThrow({ where: { userId } });
+      expect(trade).toMatchObject({ entryStrategy: 'ML', mode: 'PAPER', mlTokenSafetyChecks: false });
+      const approved = await prisma.auditLog.findFirstOrThrow({ where: { userId, action: { in: ['TRADE_APPROVED', 'TRADE_APPROVED_REDUCED_SIZE'] } } });
+      expect(approved.details).toMatchObject({ entryStrategy: 'ML', mlTokenSafetyChecks: false, ignoredSafetyBlockers: ['FREEZE_AUTHORITY_ACTIVE', 'SELLABILITY_NOT_VERIFIED'] });
+      const manager = new PositionManager(createPrismaPositionStore(prisma, { userId, publishEvent: async () => undefined }));
+      const closed = await manager.reconcileMarket({ [address]: { price: 0.000005 * 0.6, liquidityUsd: 30_000, timestamp: new Date() } });
+      expect(closed.map((item) => item.exitReason)).toEqual(['STOP_LOSS']);
+    });
+
+    it('4. invalid or missing price -> no entry (the switch cannot override execution checks)', async () => {
+      const userId = await createUser('ML', { tokenSafety: false });
+      const [a, b] = [mint(), mint()];
+      await launchSignal(userId, a, 'ML', (await decisionRow(userId, a)).id, { experimental: true });
+      await launchSignal(userId, b, 'ML', (await decisionRow(userId, b)).id, { experimental: true });
+      // a: no quote at all; b: non-positive price.
+      const summary = await coordinator([userId], new Map([[b, 0]])).runCycle({ aborted: false });
+      expect(summary.executed).toBe(0);
+      expect(await prisma.position.count({ where: { userId } })).toBe(0);
+    });
+
+    it('5. daily loss limit reached -> no entry', async () => {
+      const userId = await createUser('ML', { tokenSafety: false });
+      const lossMint = mint();
+      const token = await prisma.token.create({ data: { address: lossMint, symbol: 'LOSS' } });
+      createdTokens.push(token.id);
+      await prisma.trade.create({ data: { userId, tokenId: token.id, side: 'BUY', tokenAddress: lossMint, symbol: 'LOSS', entry: new Prisma.Decimal(1), size: new Prisma.Decimal(300), quantity: new Prisma.Decimal(300), netPnl: new Prisma.Decimal(-200), status: 'CLOSED', mode: 'PAPER', entryAt: new Date(), exitAt: new Date() } });
+      const address = mint();
+      await launchSignal(userId, address, 'ML', (await decisionRow(userId, address)).id, { experimental: true });
+      const summary = await coordinator([userId], new Map([[address, 0.000005]])).runCycle({ aborted: false });
+      expect(summary.executed).toBe(0);
+      const rejected = await prisma.auditLog.findFirstOrThrow({ where: { userId, action: 'TRADE_REJECTED' } });
+      expect((rejected.details as any).decisionReasons).toContain('DAILY_LOSS_LIMIT');
+    });
+
+    it('6 / 9. emergency stop and non-PAPER accounts -> no entry with the checks OFF either', async () => {
+      const emergency = await createUser('ML', { tokenSafety: false, emergency: true });
+      const live = await createUser('ML', { tokenSafety: false, tradingMode: 'LIVE' });
+      const [a, b] = [mint(), mint()];
+      await launchSignal(emergency, a, 'ML', (await decisionRow(emergency, a)).id, { experimental: true });
+      await launchSignal(live, b, 'ML', (await decisionRow(live, b)).id, { experimental: true });
+      const summary = await coordinator([emergency, live], new Map([[a, 0.000005], [b, 0.000005]])).runCycle({ aborted: false });
+      expect(summary.executed).toBe(0);
+      expect(await prisma.position.count({ where: { userId: { in: [emergency, live] } } })).toBe(0);
+      expect(await prisma.trade.count({ where: { mlTokenSafetyChecks: false, mode: { not: 'PAPER' } } })).toBe(0);
+    });
+
+    it('checks switched back ON before execution -> the experimental signal is rejected', async () => {
+      const userId = await createUser('ML', { tokenSafety: true });
+      const address = mint();
+      await launchSignal(userId, address, 'ML', (await decisionRow(userId, address)).id, { experimental: true });
+      const summary = await coordinator([userId], new Map([[address, 0.000005]])).runCycle({ aborted: false });
+      expect(summary.executed).toBe(0);
+      const rejected = await prisma.auditLog.findFirstOrThrow({ where: { userId, action: 'TRADE_REJECTED' } });
+      expect((rejected.details as any).decisionReasons).toContain('TOKEN_SAFETY_CHECKS_REENABLED');
+    });
+
+    it('7. revoked model -> no entry with the checks OFF', async () => {
+      const userId = await createUser('ML', { tokenSafety: false });
+      const address = mint();
+      await launchSignal(userId, address, 'ML', (await decisionRow(userId, address)).id, { experimental: true });
+      await prisma.mlModelVersion.update({ where: { version: MODEL }, data: { paperApproved: false } });
+      try {
+        const summary = await coordinator([userId], new Map([[address, 0.000005]])).runCycle({ aborted: false });
+        expect(summary.executed).toBe(0);
+      } finally {
+        await prisma.mlModelVersion.update({ where: { version: MODEL }, data: { paperApproved: true } });
+      }
+    });
   });
 
   it('11. never outside PAPER: SEMI_AUTO / LIVE accounts get no ML entry, every ML trade is mode PAPER', async () => {

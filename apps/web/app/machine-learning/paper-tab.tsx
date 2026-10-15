@@ -41,6 +41,11 @@ export function PaperTab() {
       <StrategyStats title="Alapstratégia (DEFAULT) PAPER" stats={d.strategies?.DEFAULT} />
       <StrategyStats title="ML belépések PAPER (csak ML-eredetű tradek)" stats={d.strategies?.ML} />
     </div>
+    <p className="sfield-help">Az ML belépések a tokenbiztonsági beállítás szerint külön is: a kikapcsolt ellenőrzésekkel nyitott (kísérleti) pozíciók más kockázatú tokeneket engednek meg, ezért nem keverjük őket.</p>
+    <div className="dash-grid-2">
+      <StrategyStats title="ML PAPER – tokenbiztonsági ellenőrzésekkel" stats={d.mlBySafetyMode?.WITH_TOKEN_SAFETY} />
+      <StrategyStats title="ML PAPER – ellenőrzések nélkül (kísérleti)" stats={d.mlBySafetyMode?.WITHOUT_TOKEN_SAFETY} />
+    </div>
     <h3 className="section-title">2. ML PAPER döntések</h3>
     <Panel title="ML vételi döntések" description="Egy döntés jelöltenként, a modell snapshot-időpontjában. Az ML BUY csak akkor lesz belépés, ha minden kötelező biztonsági feltétel teljesül.">
       <div className="metric-grid">
@@ -58,7 +63,7 @@ export function PaperTab() {
       </DataTable>}
     </Panel>
     <Panel title="Legutóbbi ML PAPER döntések">
-      {(d.recentDecisions ?? []).length === 0 ? <EmptyState message="Még nincs ML PAPER döntés (az ML stratégia alapból kikapcsolt)." /> : <DataTable wide headers={['Idő', 'Token', 'Modell', 'Valószínűség / küszöb', 'ML döntés', 'Alapstratégia (összehasonlítás)', 'Eredmény', 'Akadályozó kötelező szabály']}>
+      {(d.recentDecisions ?? []).length === 0 ? <EmptyState message="Még nincs ML PAPER döntés (az ML stratégia alapból kikapcsolt)." /> : <DataTable wide headers={['Idő', 'Token', 'Modell', 'Valószínűség / küszöb', 'ML döntés', 'Tokenbiztonság', 'Alapstratégia (összehasonlítás)', 'Eredmény', 'PAPER pozíció', 'Akadályozó szabály']}>
         {d.recentDecisions.map((row: any) => {
           const outcome = OUTCOME_LABELS[row.outcome] ?? { text: row.outcome, tone: 'neutral' };
           return <tr key={row.id}>
@@ -67,9 +72,11 @@ export function PaperTab() {
             <td>{row.modelVersion}</td>
             <td>{row.probability == null ? '—' : `${row.probability.toFixed(3)} / ${row.threshold?.toFixed(2)}`}</td>
             <td><Status tone={row.mlDecision === 'ML_BUY' ? 'positive' : row.mlDecision === 'ML_ERROR' ? 'danger' : 'neutral'}>{row.mlDecision}</Status>{row.errorReason ? <small className="sfield-help" style={{ display: 'block' }}>{row.errorReason}</small> : null}</td>
+            <td>{row.tokenSafetyChecksEnabled === false ? <Status tone="warning">KI</Status> : <Status tone="positive">BE</Status>}{(row.ignoredSafetyBlockers ?? []).length ? <small className="sfield-help" style={{ display: 'block' }}>Figyelmen kívül hagyva: {launchReasons(row.ignoredSafetyBlockers).join(', ')}</small> : null}</td>
             <td>{row.baseDecision ?? '—'}{launchReasons((row.baseReasons ?? []).filter((reason: string) => reason.startsWith('COMPARE_'))).map((text) => <small key={text} className="sfield-help" style={{ display: 'block' }}>{text}</small>)}</td>
             <td><Status tone={outcome.tone}>{outcome.text}</Status>{row.executionReason && !(row.safetyBlockers ?? []).length ? <small className="sfield-help" style={{ display: 'block' }}>{row.executionReason}</small> : null}</td>
-            <td>{(row.safetyBlockers ?? []).length ? launchReasons(row.safetyBlockers).join(', ') : '—'}</td>
+            <td>{row.positionId ? <Status tone={row.tokenSafetyChecksEnabled === false ? 'warning' : 'positive'}>{row.tokenSafetyChecksEnabled === false ? 'IGEN · KÍSÉRLETI' : 'IGEN'}</Status> : 'nem'}</td>
+            <td>{(row.safetyBlockers ?? []).length ? launchReasons(row.safetyBlockers).join(', ') : row.outcome === 'EXECUTION_REJECTED' || row.outcome === 'EXPIRED' ? row.executionReason ?? '—' : '—'}</td>
           </tr>;
         })}
       </DataTable>}

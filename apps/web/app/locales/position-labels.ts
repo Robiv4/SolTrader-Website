@@ -99,6 +99,8 @@ export const LAUNCH_REASON_LABELS: Record<string, string> = {
   MARKET_PRICE_UNKNOWN: 'nincs érvényes piaci ár',
   RISK_NOT_CLASSIFIED: 'kockázati besorolás hiányzik',
   RPC_SECURITY_DATA_UNAVAILABLE: 'biztonsági adat nem elérhető (RPC)',
+  SELL_BLOCKED: 'eladás blokkolva (honeypot)',
+  TOKEN_SAFETY_CHECKS_REENABLED: 'a tokenbiztonsági ellenőrzéseket közben visszakapcsolták',
   COMPARE_QUALITY_GATE_WOULD_BLOCK: 'minőségi szűrő tiltaná (csak összehasonlítás)',
   COMPARE_SOCIAL_WOULD_AVOID: 'közösségi szűrő kerülné (csak összehasonlítás)',
 };

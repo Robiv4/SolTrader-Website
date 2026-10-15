@@ -88,7 +88,7 @@ async function snapshotKindOf(prisma: PrismaClient, datasetVersion: string) {
   return typeof kind === 'string' ? kind : null;
 }
 
-interface ClosedTrade { netPnl: number; fees: number; slippage: number; exitAt: Date | null; entryStrategy: string; mlModelVersion: string | null }
+interface ClosedTrade { netPnl: number; fees: number; slippage: number; exitAt: Date | null; entryStrategy: string; mlModelVersion: string | null; mlTokenSafetyChecks?: boolean | null }
 
 /** PAPER trade statistics of one group (real closed trades only; never SHADOW labels). */
 export function paperStats(rows: ClosedTrade[]) {
@@ -195,6 +195,8 @@ export function createMlPaperRouter(deps: MlPaperDeps) {
       modelVersion: row?.modelVersion ?? null,
       buyThreshold: row ? Number(row.buyThreshold) : 0.7,
       decisionWindowSeconds: row?.decisionWindowSeconds ?? 10,
+      /** Token-security vetoes before an ML BUY (default ON). OFF = experimental ML-only PAPER mode. */
+      tokenSafetyChecksEnabled: row?.tokenSafetyChecksEnabled !== false,
       enabledAt: row?.enabledAt ?? null,
       enabledBy: row?.enabledBy ?? null,
       limits: { thresholdMin: ML_PAPER_THRESHOLD_MIN, thresholdMax: ML_PAPER_THRESHOLD_MAX, windowMaxSeconds: ML_PAPER_WINDOW_MAX_SECONDS },
@@ -223,6 +225,9 @@ export function createMlPaperRouter(deps: MlPaperDeps) {
     modelVersion: z.string().min(1).max(120).nullable().optional(),
     buyThreshold: z.number().min(ML_PAPER_THRESHOLD_MIN).max(ML_PAPER_THRESHOLD_MAX).optional(),
     decisionWindowSeconds: z.number().int().min(2).max(ML_PAPER_WINDOW_MAX_SECONDS).optional(),
+    tokenSafetyChecksEnabled: z.boolean().optional(),
+    /** Required (true) to switch the token-security checks OFF: explicit acknowledgement of the experimental PAPER mode. */
+    acknowledgeExperimentalMode: z.boolean().optional(),
   }).strict();
 
   router.put('/settings/ml-paper', async (req: Request, res: Response) => {
@@ -249,14 +254,22 @@ export function createMlPaperRouter(deps: MlPaperDeps) {
       if (bot?.tradingMode !== 'PAPER' || bot?.isLiveEnabled || deps.serverTradingMode() !== 'PAPER') return fail(res, 409, 'ML PAPER csak PAPER kereskedési módban (LIVE kikapcsolva) használható.');
       const threshold = data.buyThreshold ?? (current ? Number(current.buyThreshold) : 0.7);
       const window = data.decisionWindowSeconds ?? current?.decisionWindowSeconds ?? 10;
+      const tokenSafety = data.tokenSafetyChecksEnabled ?? current?.tokenSafetyChecksEnabled ?? true;
+      // Switching the token-security checks OFF needs an explicit acknowledgement (PAPER only; LIVE is refused above).
+      if (!tokenSafety && current?.tokenSafetyChecksEnabled !== false && data.acknowledgeExperimentalMode !== true) {
+        return fail(res, 400, 'A tokenbiztonsági ellenőrzések kikapcsolásához erősítsd meg a kísérleti PAPER módot.');
+      }
       const switching = current?.strategyMode !== 'ML' || current?.modelVersion !== modelVersion;
       // Turning ML on or changing the model needs an e-mail confirmed administrator action; threshold tuning while ML runs does not.
       if (switching && !await deps.stepUp(req, res, 'ml_paper_enable', { modelVersion, buyThreshold: threshold, decisionWindowSeconds: window })) return;
       await prisma.mlPaperSettings.upsert({
         where: { userId },
-        update: { strategyMode: 'ML', modelVersion, buyThreshold: new Prisma.Decimal(threshold.toFixed(3)), decisionWindowSeconds: window, ...(switching ? { enabledAt: new Date(), enabledBy: req.user!.email } : {}) },
-        create: { userId, strategyMode: 'ML', modelVersion, buyThreshold: new Prisma.Decimal(threshold.toFixed(3)), decisionWindowSeconds: window, enabledAt: new Date(), enabledBy: req.user!.email },
+        update: { strategyMode: 'ML', modelVersion, buyThreshold: new Prisma.Decimal(threshold.toFixed(3)), decisionWindowSeconds: window, tokenSafetyChecksEnabled: tokenSafety, ...(switching ? { enabledAt: new Date(), enabledBy: req.user!.email } : {}) },
+        create: { userId, strategyMode: 'ML', modelVersion, buyThreshold: new Prisma.Decimal(threshold.toFixed(3)), decisionWindowSeconds: window, tokenSafetyChecksEnabled: tokenSafety, enabledAt: new Date(), enabledBy: req.user!.email },
       });
+      if (tokenSafety !== (current?.tokenSafetyChecksEnabled ?? true)) {
+        await deps.logAuditEvent(tokenSafety ? 'ml_paper_token_safety_enabled' : 'ml_paper_token_safety_disabled', userId, { modelVersion, experimentalPaperOnly: !tokenSafety, acknowledged: data.acknowledgeExperimentalMode === true });
+      }
       await deps.logAuditEvent(switching ? 'ml_paper_strategy_enabled' : 'ml_paper_settings_update', userId, { modelVersion, buyThreshold: threshold, decisionWindowSeconds: window, previous: current ? { mode: current.strategyMode, modelVersion: current.modelVersion } : null });
       return res.json({ ok: true, data: await settingsView(userId, true) });
     } catch (error) {
@@ -273,9 +286,9 @@ export function createMlPaperRouter(deps: MlPaperDeps) {
       const since = new Date(Date.now() - sinceDays * 86_400_000);
       const trades = await prisma.trade.findMany({
         where: { userId, decisionSource: 'NEW_LAUNCH', status: 'CLOSED', mode: 'PAPER', exitAt: { gte: since } },
-        select: { netPnl: true, fees: true, slippage: true, exitAt: true, entryStrategy: true, mlModelVersion: true },
+        select: { netPnl: true, fees: true, slippage: true, exitAt: true, entryStrategy: true, mlModelVersion: true, mlTokenSafetyChecks: true },
       });
-      const closed: ClosedTrade[] = trades.map((trade) => ({ netPnl: Number(trade.netPnl ?? 0), fees: Number(trade.fees ?? 0), slippage: Number(trade.slippage ?? 0), exitAt: trade.exitAt, entryStrategy: trade.entryStrategy ?? 'DEFAULT', mlModelVersion: trade.mlModelVersion }));
+      const closed: ClosedTrade[] = trades.map((trade) => ({ netPnl: Number(trade.netPnl ?? 0), fees: Number(trade.fees ?? 0), slippage: Number(trade.slippage ?? 0), exitAt: trade.exitAt, entryStrategy: trade.entryStrategy ?? 'DEFAULT', mlModelVersion: trade.mlModelVersion, mlTokenSafetyChecks: trade.mlTokenSafetyChecks }));
       const mlTrades = closed.filter((trade) => trade.entryStrategy === 'ML');
       const byModel = [...new Set(mlTrades.map((trade) => trade.mlModelVersion ?? 'ismeretlen'))].map((version) => ({ modelVersion: version, ...paperStats(mlTrades.filter((trade) => (trade.mlModelVersion ?? 'ismeretlen') === version)) }));
       // SHADOW predictions (every candidate, no trading) - kept apart from ML PAPER decisions and closed PAPER trades.
@@ -287,7 +300,7 @@ export function createMlPaperRouter(deps: MlPaperDeps) {
       ]);
       const recentDecisions = await prisma.mlPaperDecision.findMany({
         where: { userId, decidedAt: { gte: since } }, orderBy: { decidedAt: 'desc' }, take: 50,
-        select: { id: true, mint: true, modelVersion: true, decidedAt: true, snapshotKind: true, probability: true, threshold: true, mlDecision: true, errorReason: true, baseDecision: true, baseReasons: true, outcome: true, executionReason: true, safetyBlockers: true, positionId: true },
+        select: { id: true, mint: true, modelVersion: true, decidedAt: true, snapshotKind: true, probability: true, threshold: true, mlDecision: true, errorReason: true, baseDecision: true, baseReasons: true, outcome: true, tokenSafetyChecksEnabled: true, ignoredSafetyBlockers: true, tradeId: true, executionReason: true, safetyBlockers: true, positionId: true },
       });
 
       // Training data (SHADOW collection; all candidates, independent of the active strategy).
@@ -314,6 +327,11 @@ export function createMlPaperRouter(deps: MlPaperDeps) {
         label: 'PAPER RESULTS (real closed PAPER trades) - separate from SHADOW labels',
         periodDays: sinceDays,
         strategies: { DEFAULT: paperStats(closed.filter((trade) => trade.entryStrategy !== 'ML')), ML: paperStats(mlTrades) },
+        /** ML PAPER split by the token-security setting at entry (different risk: never pooled; old ML trades = checks ON). */
+        mlBySafetyMode: {
+          WITH_TOKEN_SAFETY: paperStats(mlTrades.filter((trade) => trade.mlTokenSafetyChecks !== false)),
+          WITHOUT_TOKEN_SAFETY: paperStats(mlTrades.filter((trade) => trade.mlTokenSafetyChecks === false)),
+        },
         byModel,
         openMlPositions: openMl,
         /** The ML strategy decides entries only; exits are made by the common rule-based Exit Engine (no ML SELL model). */

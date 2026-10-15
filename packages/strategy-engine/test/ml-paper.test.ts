@@ -5,7 +5,7 @@ import { describe, expect, it } from 'vitest';
 
 import {
   buildMlDataset, buildMlFeatureSnapshot, classifyMlProbability, computeCandidateOutcome, DEFAULT_NEW_LAUNCH_SETTINGS, evaluateNewLaunch, ML_PAPER_POINT_TOLERANCE_MS,
-  ML_IGNORED_DEFAULT_FILTERS, ML_PERMANENT_BLOCKERS, ML_STRATEGY_ONLY_REASONS, mlBuyWindowOpen, mlRiskConviction, mlDecisionTiming, mlEntrySafetyBlockers, newOutcomePath, recordPathPoint,
+  ML_IGNORED_DEFAULT_FILTERS, ML_PERMANENT_BLOCKERS, ML_STRATEGY_ONLY_REASONS, mlBuyWindowOpen, mlRiskConviction, applyTokenSafetySetting, ML_TOKEN_SAFETY_BLOCKERS, mlDecisionTiming, mlEntrySafetyBlockers, newOutcomePath, recordPathPoint,
   type LaunchObservation, type LaunchSecurity, type MlDatasetSourceRow,
 } from '../src/index.js';
 
@@ -117,6 +117,26 @@ describe('ML-only mode: DEFAULT strategy preferences never veto an ML BUY', () =
     // Missing / invalid probability never passes (NaN fails every minimum).
     expect(Number.isNaN(mlRiskConviction(null, 0.3).signalScore)).toBe(true);
     expect(mlRiskConviction(0.9, 2).minimumSignalScore).toBe(90);
+  });
+});
+
+describe('Optional token-security vetoes (experimental ML PAPER mode)', () => {
+  const all = ['SELLABILITY_NOT_VERIFIED', 'FREEZE_AUTHORITY_ACTIVE', 'MINT_AUTHORITY_ACTIVE', 'CRITICAL_TOKEN_EXTENSION', 'CREATOR_SELLING', 'CRITICAL_LIQUIDITY', 'HONEYPOT_SUSPECTED', 'LIQUIDITY_BELOW_MINIMUM', 'PRICE_IMPACT_TOO_HIGH', 'MARKET_PRICE_UNKNOWN', 'RISK_NOT_ASSESSED', 'MARKET_DATA_STALE'];
+
+  it('checks ON: everything is enforced (unchanged)', () => {
+    expect(applyTokenSafetySetting(all, true, ['HONEYPOT_SUSPECTED'])).toEqual({ enforced: all, ignored: [] });
+  });
+
+  it('checks OFF: only token-security blockers (incl. hard blocks of the security lookup) become ignored warnings', () => {
+    const { enforced, ignored } = applyTokenSafetySetting(all, false, ['HONEYPOT_SUSPECTED']);
+    expect(ignored).toEqual(['SELLABILITY_NOT_VERIFIED', 'FREEZE_AUTHORITY_ACTIVE', 'MINT_AUTHORITY_ACTIVE', 'CRITICAL_TOKEN_EXTENSION', 'CREATOR_SELLING', 'CRITICAL_LIQUIDITY', 'HONEYPOT_SUSPECTED']);
+    expect(enforced).toEqual(['LIQUIDITY_BELOW_MINIMUM', 'PRICE_IMPACT_TOO_HIGH', 'MARKET_PRICE_UNKNOWN', 'RISK_NOT_ASSESSED', 'MARKET_DATA_STALE']);
+  });
+
+  it('market, liquidity, price impact and risk codes are never token-security codes', () => {
+    for (const code of ['LIQUIDITY_BELOW_MINIMUM', 'PRICE_IMPACT_TOO_HIGH', 'PRICE_IMPACT_UNKNOWN', 'MARKET_PRICE_UNKNOWN', 'RISK_NOT_ASSESSED', 'RISK_NOT_CLASSIFIED', 'RISK_SCORE_ABOVE_LAUNCH_MAXIMUM', 'MARKET_DATA_STALE', 'UNPRICED_EXECUTION']) {
+      expect(ML_TOKEN_SAFETY_BLOCKERS.has(code)).toBe(false);
+    }
   });
 });
 

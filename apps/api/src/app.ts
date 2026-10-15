@@ -1526,7 +1526,7 @@ app.patch('/api/settings/notifications', async (req, res) => {
 app.get('/api/positions', async (req, res) => {
   try {
     const query = paginationSchema.extend({ status: z.enum(['OPEN', 'CLOSED']).optional() }).parse(req.query);
-    const include = { token: { select: { address: true, symbol: true } }, pathMetric: { select: { lastLiquidityUsd: true } }, trades: { orderBy: { createdAt: 'asc' as const }, take: 1, select: { decisionSource: true, strategyName: true, riskClassification: true, riskScore: true, size: true, netPnl: true } } };
+    const include = { token: { select: { address: true, symbol: true } }, pathMetric: { select: { lastLiquidityUsd: true } }, trades: { orderBy: { createdAt: 'asc' as const }, take: 1, select: { decisionSource: true, strategyName: true, riskClassification: true, riskScore: true, size: true, netPnl: true, mlTokenSafetyChecks: true } } };
     // Every OPEN position is always returned (an old open position must never fall off the list because of newer
     // closed ones); limit / offset page through the closed history.
     const [open, closed] = await Promise.all([
@@ -1542,6 +1542,8 @@ app.get('/api/positions', async (req, res) => {
         ...(position.status === 'OPEN' ? closeNowEstimate(position, toNumber(pathMetric?.lastLiquidityUsd)) : {}),
         decisionSource: positionDecisionSource(trades[0]), strategyName: trades[0]?.strategyName ?? null,
         riskClassification: trades[0]?.riskClassification ?? null, riskScore: toNumber(trades[0]?.riskScore), invested: toNumber(trades[0]?.size),
+        // ML entry opened without token-security vetoes (experimental PAPER position).
+        experimental: trades[0]?.mlTokenSafetyChecks === false,
         exitSummary: {
           stopLossPercent: levels.stopLoss?.percentFromEntry ?? null, takeProfitPercent: levels.takeProfit?.percentFromEntry ?? null,
           trailingStatus: levels.trailing.status, trailingTriggerPrice: levels.trailing.triggerPrice, trailingActivationPercent: levels.trailing.activationPercent,

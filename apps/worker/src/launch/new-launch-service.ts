@@ -1,7 +1,7 @@
 import { Prisma, type PrismaClient } from '@prisma/client';
 import type { TokenDataProvider } from '@soltrader/market-data';
 import { assessRisk, type RiskFactorInput } from '@soltrader/risk-engine';
-import { buyerTrendFromObservations, evaluateNewLaunch, mlEntrySafetyBlockers, socialBlocksEntry, evaluateQualityGate, socialSummary, type LaunchSecurity, type LaunchState, type NewLaunchStrategyResult, type QualityGateResult, type SocialSnapshotResult } from '@soltrader/strategy-engine';
+import { applyTokenSafetySetting, buyerTrendFromObservations, evaluateNewLaunch, mlEntrySafetyBlockers, socialBlocksEntry, evaluateQualityGate, socialSummary, type LaunchSecurity, type LaunchState, type NewLaunchStrategyResult, type QualityGateResult, type SocialSnapshotResult } from '@soltrader/strategy-engine';
 import { toRiskEngineConfig } from '@soltrader/token-discovery';
 
 import { buildLaunchMlSnapshot, ML_REFERENCE_ORDER_USD } from '../ml/launch-snapshot.js';
@@ -22,6 +22,9 @@ export const NEW_LAUNCH_STRATEGY = 'NewLaunchStrategy';
 /** Risk-engine hard blocks that the launch policy handles as "wait" while the launch window is open. */
 const LAUNCH_WAITABLE_BLOCKS = new Set(['LIQUIDITY_BELOW_ABSOLUTE_MINIMUM', 'EXTREME_PRICE_IMPACT', 'MARKET_DATA_UNAVAILABLE']);
 /** Reasons after which a candidate is not re-evaluated for that user. */
+/** Token facts without the token-security findings: input of the market-only risk assessment (experimental ML PAPER mode). */
+const WITHOUT_TOKEN_SECURITY = (security: LaunchSecurity): LaunchSecurity => ({ ...security, sellability: 'VERIFIED', mintAuthorityRevoked: true, freezeAuthorityRevoked: true, hardBlockReasons: [], warnings: [] });
+
 /** Latest ML prediction point (AGE_60S) + tolerance + max. decision window, with margin. */
 const ML_EVALUATION_WINDOW_MS = 120_000;
 
@@ -547,6 +550,9 @@ export class NewLaunchService {
     // Same builder and inputs as the SHADOW collection at this moment (the risk score and social assessment of this
     // evaluation, both computed at `now`): identical features in both pipelines.
     let built: ReturnType<typeof buildLaunchMlSnapshot> | null = null;
+    let market: ReturnType<NewLaunchService['riskFor']> | null = null;
+    const f = result.features;
+    const marketRisk = () => (market ??= this.riskFor(launch, { liquidityUsd: f.liquidityUsd, ageSeconds: f.ageSeconds, volumeUsd: f.volumeUsd, transactionCount: f.transactionCount, impact: f.estimatedPriceImpact, largestHolder: f.largestHolderSupplyShare, largestBuyer: f.largestBuyerShare, volatility: f.launchVolatility, priceUsd: f.priceUsd }, WITHOUT_TOKEN_SECURITY(security.security), user));
     const build = () => (built ??= buildLaunchMlSnapshot({ at: now, launch, state: this.tracker.state(launch.mint, ML_REFERENCE_ORDER_USD), security, riskScore: risk.riskScore, riskObservedAt: now, social }));
     const step = await engine.step({
       userId: user.userId, mint: launch.mint, detectedAt: launch.detectedAt, now, config: user.strategy,
@@ -555,10 +561,13 @@ export class NewLaunchService {
       eligible: () => build().eligible,
       // Mandatory safety only: the DEFAULT strategy's decision, thresholds, timing window, quality gate and social AVOID
       // never veto an ML BUY (ML-only mode, see ML_IGNORED_DEFAULT_FILTERS).
-      safetyBlockers: () => {
-        const blockers = mlEntrySafetyBlockers({ result, security: security.security, riskScore: risk.riskScore, riskHardBlockReasons: risk.hardBlockReasons, settings: user.settings, detectedAt: launch.detectedAt, now });
-        if (risk.classification === null) blockers.push('RISK_NOT_CLASSIFIED');
-        return blockers;
+      safetyBlockers: (tokenSafetyChecksEnabled) => {
+        // Checks OFF (experimental PAPER mode): the risk assessment without token-security factors decides the risk limits;
+        // token-security blockers are returned as ignored warnings. Market / price / liquidity / impact / risk stay enforced.
+        const assessed = tokenSafetyChecksEnabled ? risk : marketRisk();
+        const blockers = mlEntrySafetyBlockers({ result, security: security.security, riskScore: assessed.riskScore, riskHardBlockReasons: assessed.hardBlockReasons, settings: user.settings, detectedAt: launch.detectedAt, now });
+        if (assessed.classification === null) blockers.push('RISK_NOT_CLASSIFIED');
+        return applyTokenSafetySetting(blockers, tokenSafetyChecksEnabled, security.security.hardBlockReasons);
       },
       // Comparison only (stored with the ML decision): what the DEFAULT strategy and its optional filters said at this moment.
       base: { decision: result.decision, reasons: [...result.reasons, ...defaultFilterComparison(this.qualityGateFor(result, state, user), user, social)] },
@@ -568,9 +577,15 @@ export class NewLaunchService {
     const decisionRow = await this.deps.prisma.launchDecision.findFirst({ where: { userId: user.userId, candidateId }, orderBy: { decisionAt: 'desc' }, select: { id: true } }).catch(() => null);
     // Stored for comparison only; PAPER execution never applies the DEFAULT quality gate to an ML entry.
     const gate = { ...this.qualityGateFor(result, state, user), appliesToEntry: false };
-    const signalId = await this.createBuySignal(launch, user, result, risk, decisionRow?.id ?? null, security.completedAt, now, state, security.security, gate, social, {
+    // Experimental mode: the signal carries the market-only risk (what execution limits apply to) and keeps the real,
+    // security-inclusive assessment + every ignored token-security blocker as warnings.
+    const experimental = !step.tokenSafetyChecksEnabled;
+    const entryRisk = experimental ? { ...marketRisk(), warnings: [...new Set([...marketRisk().warnings, ...risk.warnings, ...step.ignoredSafetyBlockers.map((reason) => `IGNORED_TOKEN_SAFETY:${reason}`)])] } : risk;
+    const signalId = await this.createBuySignal(launch, user, result, entryRisk, decisionRow?.id ?? null, security.completedAt, now, state, security.security, gate, social, {
       entryStrategy: 'ML', decisionId: step.decisionId, modelVersion: step.modelVersion, probability: step.probability, threshold: step.threshold,
       snapshotKind: step.snapshotKind, snapshotAt: new Date(step.snapshotAt).toISOString(), featureHash: step.featureHash,
+      tokenSafetyChecksEnabled: step.tokenSafetyChecksEnabled, ignoredSafetyBlockers: step.ignoredSafetyBlockers,
+      ...(experimental ? { experimental: true, securityRisk: { riskScore: risk.riskScore, classification: risk.classification, hardBlockReasons: risk.hardBlockReasons }, security: security.security } : {}),
     });
     await engine.markSignaled(user.userId, launch.mint, signalId, now);
     if (signalId) this.deps.logger.info({ event: 'ml_paper_buy_signal', userId: user.userId, mint: launch.mint, modelVersion: step.modelVersion, probability: step.probability, threshold: step.threshold }, 'ml_paper_buy_signal');

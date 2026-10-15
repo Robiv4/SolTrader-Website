@@ -21,6 +21,8 @@ interface PositionRow {
   id: string;
   status: 'OPEN' | 'CLOSED' | string;
   symbol: string | null;
+  /** ML entry opened without token-security vetoes (experimental PAPER position). */
+  experimental?: boolean;
   tokenAddress: string;
   decisionSource: string | null;
   strategyName: string | null;
@@ -141,7 +143,7 @@ export default function PositionsPage() {
   </th>;
   const tokenCell = (row: PositionRow) => <Link className="nl-token" href={`/positions/${row.id}`} onClick={(event) => event.stopPropagation()} title={row.tokenAddress}>
     <TokenAvatar address={row.tokenAddress} symbol={row.symbol ?? row.tokenAddress} size={26} />
-    <span className="nl-token-text"><strong>{row.symbol ?? shortAddress(row.tokenAddress)}</strong><small>{decisionBadge(row.decisionSource, row.strategyName)} · {shortAddress(row.tokenAddress)}</small></span>
+    <span className="nl-token-text"><strong>{row.symbol ?? shortAddress(row.tokenAddress)}{row.experimental ? <span className="exp-badge" title="Tokenbiztonsági ellenőrzések nélkül nyitott ML PAPER pozíció">KÍSÉRLETI</span> : null}</strong><small>{decisionBadge(row.decisionSource, row.strategyName)} · {shortAddress(row.tokenAddress)}</small></span>
   </Link>;
 
   const header = <PageHeader eyebrow="Kereskedés" title="Pozíciók" subtitle="Nyitott és lezárt pozíciók – kattints egy sorra a grafikonhoz és a kilépési szintekhez" />;
@@ -207,7 +209,7 @@ export default function PositionsPage() {
             const pnl = pnlOf(row);
             return <button type="button" key={row.id} className="nl-mobile" onClick={() => router.push(`/positions/${row.id}`)}>
               <span className="nl-mobile-head">
-                <span className="nl-token"><TokenAvatar address={row.tokenAddress} symbol={row.symbol ?? row.tokenAddress} size={26} /><span className="nl-token-text"><strong>{row.symbol ?? shortAddress(row.tokenAddress)}</strong><small>{decisionBadge(row.decisionSource, row.strategyName)} · {holdingTime(row.openedAt, row.closedAt)}</small></span></span>
+                <span className="nl-token"><TokenAvatar address={row.tokenAddress} symbol={row.symbol ?? row.tokenAddress} size={26} /><span className="nl-token-text"><strong>{row.symbol ?? shortAddress(row.tokenAddress)}{row.experimental ? <span className="exp-badge" title="Tokenbiztonsági ellenőrzések nélkül nyitott ML PAPER pozíció">KÍSÉRLETI</span> : null}</strong><small>{decisionBadge(row.decisionSource, row.strategyName)} · {holdingTime(row.openedAt, row.closedAt)}</small></span></span>
                 <StatusBadge tone={pnl === null || pnl === 0 ? 'neutral' : pnl > 0 ? 'positive' : 'negative'}>{formatSignedPercent(pnlPercentOf(row), 1)}</StatusBadge>
               </span>
               <span className="nl-mobile-grid">

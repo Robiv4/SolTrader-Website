@@ -1100,6 +1100,8 @@ model Trade {
   mlModelVersion      String?
   /// MlPaperDecision row of the entry (entryStrategy = ML only).
   mlPaperDecisionId   String?
+  /// ML entries only: token-security checks were in force (false = experimental PAPER trade opened without token-security vetoes)
+  mlTokenSafetyChecks Boolean?
   entryAt             DateTime?
   exitAt              DateTime?
   mode                TradingMode    @default(PAPER)
@@ -1463,6 +1465,8 @@ model MlPaperSettings {
   buyThreshold          Decimal  @default(0.7) @db.Decimal(4, 3)
   /// How long an ML BUY may wait for the mandatory safety checks before it expires (seconds)
   decisionWindowSeconds Int      @default(10)
+  /// Token-security vetoes before an ML BUY (PAPER only). false = experimental ML-only PAPER mode (explicitly confirmed).
+  tokenSafetyChecksEnabled Boolean @default(true)
   enabledAt             DateTime?
   enabledBy             String?
   createdAt             DateTime @default(now())
@@ -1500,6 +1504,10 @@ model MlPaperDecision {
   baseReasons      Json?
   safetyPassed     Boolean?
   safetyBlockers   Json?
+  /// Token-security checks in force for this decision (false = experimental PAPER entry without token-security vetoes)
+  tokenSafetyChecksEnabled Boolean @default(true)
+  /// Token-security blockers that were present but ignored (experimental mode; warnings only)
+  ignoredSafetyBlockers Json?
   /// PENDING | SIGNALED | EXECUTED | EXECUTION_REJECTED | SAFETY_BLOCKED | EXPIRED | SKIPPED | ERROR
   outcome          String
   signalId         String?

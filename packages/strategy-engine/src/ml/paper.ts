@@ -100,6 +100,29 @@ export function mlEntrySafetyBlockers(input: MlEntrySafetyInput): string[] {
   return [...blockers];
 }
 
+/**
+ * Token-security blockers (token contract / authority / sellability / rug-pull facts). Only these may be switched off by
+ * the user's experimental "token-security checks OFF" ML PAPER mode. Market data, price, liquidity, price impact, risk and
+ * every account / execution limit stay mandatory in every mode.
+ */
+export const ML_TOKEN_SAFETY_BLOCKERS = new Set([
+  'SELLABILITY_FAILED', 'SELLABILITY_NOT_VERIFIED', 'SECURITY_CHECK_PENDING', 'RPC_SECURITY_DATA_UNAVAILABLE',
+  'MINT_AUTHORITY_ACTIVE', 'FREEZE_AUTHORITY_ACTIVE', 'CRITICAL_TOKEN_EXTENSION', 'UNSUPPORTED_TRANSFER_RESTRICTION',
+  'CREATOR_SELLING', 'CRITICAL_LIQUIDITY', 'SELL_BLOCKED',
+]);
+
+/**
+ * Splits ML BUY blockers by the user's token-security setting. With checks ON everything is enforced (unchanged). With
+ * checks OFF the token-security blockers (incl. any hard block reported by the token security lookup itself) are only
+ * returned as `ignored` warnings; everything else stays enforced.
+ */
+export function applyTokenSafetySetting(blockers: string[], tokenSafetyChecksEnabled: boolean, securityHardBlocks: string[] = []) {
+  if (tokenSafetyChecksEnabled) return { enforced: blockers, ignored: [] as string[] };
+  const securityOrigin = new Set(securityHardBlocks);
+  const isTokenSafety = (reason: string) => ML_TOKEN_SAFETY_BLOCKERS.has(reason) || securityOrigin.has(reason);
+  return { enforced: blockers.filter((reason) => !isTokenSafety(reason)), ignored: blockers.filter(isTokenSafety) };
+}
+
 /** Blockers that can never clear later for this candidate (the ML BUY is resolved as SAFETY_BLOCKED at once). */
 export const ML_PERMANENT_BLOCKERS = new Set(['SELLABILITY_FAILED', 'CRITICAL_LIQUIDITY', 'CREATOR_SELLING', 'FREEZE_AUTHORITY_ACTIVE', 'CRITICAL_TOKEN_EXTENSION', 'UNSUPPORTED_TRANSFER_RESTRICTION']);
 
