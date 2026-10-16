@@ -22,20 +22,20 @@ const logger = { info: () => undefined, warn: (payload: unknown, message?: strin
 
 const constantArtifact = (version: string, p: number): MlModelArtifact => ({ ...fixture.LR.artifact, modelVersion: version, calibration: null, logistic: { coef: fixture.LR.artifact.columns.map(() => 0), intercept: Math.log(p / (1 - p)) } });
 
-interface Strategy { mode: 'DEFAULT' | 'ML'; probability?: number; approved?: boolean; engine?: 'real' | 'throwing' | 'none'; /** New Launch config overrides of the user (e.g. thresholds, quality gate). */ config?: Record<string, unknown>; /** Token security (default: authorities revoked, classic SPL). */ mint?: { mintAuthority: string | null; freezeAuthority: string | null; tokenProgram: string; extensions: string[] } }
+interface Strategy { mode: 'DEFAULT' | 'ML'; probability?: number; approved?: boolean; engine?: 'real' | 'throwing' | 'none'; /** New Launch config overrides of the user (e.g. thresholds, quality gate). */ config?: Record<string, unknown>; /** Token security (default: authorities revoked, classic SPL). */ mint?: { mintAuthority: string | null; freezeAuthority: string | null; tokenProgram: string; extensions: string[] }; /** Saved ML PAPER minimum liquidity (default: not set). */ mlMinLiquidity?: number | null; /** Bot-level minimum liquidity (risk-engine liquidity reference). */ botMinLiquidity?: number }
 
 function fakePrisma(record: { decisions: any[]; signals: any[]; signalMetadata: any[]; ml: Record<string, any[]> }, strategy: Strategy) {
   let id = 0;
   const overrides: Record<string, Record<string, (args: any) => any>> = {
     newLaunchConfig: { findMany: () => [{ userId: 'u1', enabled: true, ...strategy.config }] },
     botConfig: {
-      findMany: () => [{ userId: 'u1', minLiquidityUsd: null, minVolumeUsd: null, maxTokenAgeHours: 168, user: { riskConfigs: [{ riskPolicy: 'EXPLORATORY', maxSlippagePercent: 50, lowRiskMax: 30, moderateRiskMax: 50, highRiskMax: 90, veryHighRiskMax: 100, lowPositionMultiplier: 1, moderatePositionMultiplier: 1, highPositionMultiplier: 1, veryHighPositionMultiplier: 1 }] } }],
+      findMany: () => [{ userId: 'u1', minLiquidityUsd: strategy.botMinLiquidity ?? null, minVolumeUsd: null, maxTokenAgeHours: 168, user: { riskConfigs: [{ riskPolicy: 'EXPLORATORY', maxSlippagePercent: 50, lowRiskMax: 30, moderateRiskMax: 50, highRiskMax: 90, veryHighRiskMax: 100, lowPositionMultiplier: 1, moderatePositionMultiplier: 1, highPositionMultiplier: 1, veryHighPositionMultiplier: 1 }] } }],
       findUnique: () => ({ tradingMode: 'PAPER' }),
     },
     paperAccount: { findUnique: () => ({ equity: 1_000 }) },
     launchDecision: { create: ({ data }: any) => { record.decisions.push({ decision: data.decision, status: data.status, reasons: data.reasons, score: data.score }); return { id: `d${++id}` }; } },
     signal: { create: ({ data }: any) => { record.signals.push({ strategyName: data.strategyName, direction: data.direction, entryStrategy: data.metadata.entryStrategy, ml: data.metadata.ml }); record.signalMetadata.push(data.metadata); return { id: `s${++id}` }; } },
-    mlPaperSettings: { findMany: () => (strategy.mode === 'ML' ? [{ userId: 'u1', strategyMode: 'ML', modelVersion: 'M1', buyThreshold: 0.7, decisionWindowSeconds: 30 }] : [{ userId: 'u1', strategyMode: 'DEFAULT', modelVersion: null, buyThreshold: 0.7, decisionWindowSeconds: 10 }]) },
+    mlPaperSettings: { findMany: () => (strategy.mode === 'ML' ? [{ userId: 'u1', strategyMode: 'ML', modelVersion: 'M1', buyThreshold: 0.7, decisionWindowSeconds: 30, minLiquidityUsd: strategy.mlMinLiquidity ?? null }] : [{ userId: 'u1', strategyMode: 'DEFAULT', modelVersion: null, buyThreshold: 0.7, decisionWindowSeconds: 10 }]) },
   };
   const shadowTable = (model: string) => ({
     create: async ({ data }: any) => { (record.ml[model] ??= []).push(data); return { id: `${model}-${++id}` }; },

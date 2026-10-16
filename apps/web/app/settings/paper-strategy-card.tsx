@@ -23,6 +23,8 @@ export function PaperStrategyCard() {
   const [modelVersion, setModelVersion] = useState<string>('');
   const [threshold, setThreshold] = useState(0.7);
   const [windowSeconds, setWindowSeconds] = useState(10);
+  /** ML PAPER minimum liquidity input ('' = not set: the DEFAULT minimum applies). */
+  const [minLiquidity, setMinLiquidity] = useState<string>('');
   const [message, setMessage] = useState<{ text: string; tone: 'info' | 'error' | 'success' } | null>(null);
   const [busy, setBusy] = useState(false);
 
@@ -38,6 +40,7 @@ export function PaperStrategyCard() {
     );
     setThreshold(settings.buyThreshold);
     setWindowSeconds(settings.decisionWindowSeconds);
+    setMinLiquidity(settings.minLiquidity?.savedUsd == null ? '' : String(settings.minLiquidity.savedUsd));
   }, [settings]);
 
   if (loading && !settings) return <p className="sfield-help">Betöltés…</p>;
@@ -48,6 +51,10 @@ export function PaperStrategyCard() {
   const active = settings.strategyMode === 'ML';
   const thresholdValid = threshold >= settings.limits.thresholdMin && threshold <= settings.limits.thresholdMax;
   const health = settings.health?.model;
+  const liquidity = settings.minLiquidity ?? { savedUsd: null, effectiveUsd: null, defaultStrategyUsd: null, suggestedUsd: 3000, floorUsd: 1250, maxUsd: 1_000_000 };
+  const minLiquidityValue = minLiquidity.trim() === '' ? null : Number(minLiquidity);
+  const minLiquidityValid = minLiquidityValue === null || (Number.isFinite(minLiquidityValue) && minLiquidityValue >= liquidity.floorUsd && minLiquidityValue <= liquidity.maxUsd);
+  const usdText = (value: number | null | undefined) => (value == null ? '—' : `${fmt(value, 0)} USD`);
 
   const save = async (body: Record<string, unknown>, done: string) => {
     setBusy(true);
@@ -68,6 +75,7 @@ export function PaperStrategyCard() {
     <div className="status-list">
       <div className="status-row"><span>Aktív PAPER stratégia</span><Status tone={active ? 'info' : 'positive'}>{active ? `ML-MODELL · ${settings.modelVersion}` : 'ALAPSTRATÉGIA'}</Status></div>
       {active ? <div className="status-row"><span>Kereskedési mód</span><Status tone="info">ML BELÉPÉS + SZABÁLYALAPÚ KILÉPÉS</Status></div> : null}
+      {active ? <div className="status-row"><span>ML minimális likviditás</span><span>{usdText(liquidity.effectiveUsd)}{liquidity.savedUsd == null ? ' (az alapstratégia minimuma – nincs külön ML érték mentve)' : ''}</span></div> : null}
       {active ? <div className="status-row"><span>Modell állapota</span>{settings.selectedModel?.usable ? <Status tone={health?.status === 'LOADED' ? 'positive' : 'warning'}>{health?.status === 'LOADED' ? 'BETÖLTVE' : health ? 'NEM ELÉRHETŐ' : 'NINCS JELENTÉS'}</Status> : <Status tone="danger">VISSZAVONVA – NINCS ML BELÉPÉS</Status>}</div> : null}
       {active && health?.error ? <p className="settings-warning">Modellhiba: {health.error}. Amíg fennáll, az ML nem nyit pozíciót, és nem vált át automatikusan az alapstratégiára.</p> : null}
       {active && settings.selectedModel && !settings.selectedModel.usable ? <p className="settings-warning">A kiválasztott modell PAPER-jóváhagyását visszavonták. Új ML belépés nem történik; válts modellt vagy térj vissza az alapstratégiára.</p> : null}
@@ -94,6 +102,13 @@ export function PaperStrategyCard() {
           <input type="number" min={settings.limits.thresholdMin} max={settings.limits.thresholdMax} step={0.01} value={threshold} onChange={(event) => setThreshold(Number(event.target.value))} aria-invalid={!thresholdValid} />
           <span className={thresholdValid ? 'sfield-help' : 'sfield-error'}>{thresholdValid ? 'ML BUY, ha a kalibrált valószínűség ≥ küszöb. Magasabb küszöb = kevesebb, szigorúbb belépés.' : 'A küszöb a megengedett tartományon kívül esik.'}</span>
         </label>
+        <label className="sfield"><span className="sfield-label">ML PAPER – Minimális likviditás (USD)</span>
+          <input type="number" min={liquidity.floorUsd} max={liquidity.maxUsd} step={100} value={minLiquidity} placeholder={`nincs megadva – az alapstratégia minimuma (${usdText(liquidity.defaultStrategyUsd)}) érvényes`} onChange={(event) => setMinLiquidity(event.target.value)} aria-invalid={!minLiquidityValid} />
+          <span className={minLiquidityValid ? 'sfield-help' : 'sfield-error'}>{minLiquidityValid
+            ? <>Csak az ML belépésekre vonatkozik; az alapstratégia minimuma ({usdText(liquidity.defaultStrategyUsd)}) változatlan. Most érvényes: <strong>{usdText(liquidity.effectiveUsd)}</strong>. Legalább {usdText(liquidity.floorUsd)} (végrehajtási alsó határ). Alacsonyabb likviditásnál nő az árhatás: a max. árhatás, a pozícióméret-, kitettség- és exit-capacity korlát, valamint a csalás- és honeypotvédelem változatlanul érvényes.</>
+            : `${usdText(liquidity.floorUsd)} és ${usdText(liquidity.maxUsd)} közötti érték adható meg (vagy hagyd üresen).`}</span>
+          {settings.minLiquidity?.savedUsd == null ? <button type="button" className="link-button" onClick={() => setMinLiquidity(String(liquidity.suggestedUsd))}>Javasolt kísérleti érték: {usdText(liquidity.suggestedUsd)} (mentés után érvényes)</button> : null}
+        </label>
         <label className="sfield"><span className="sfield-label">Belépési ablak a döntés után (mp)</span>
           <input type="number" min={2} max={settings.limits.windowMaxSeconds} step={1} value={windowSeconds} onChange={(event) => setWindowSeconds(Math.round(Number(event.target.value)))} />
           <span className="sfield-help">Az ML BUY ennyi ideig várhat a kötelező biztonsági feltételekre (pl. eladhatóság igazolása), utána lejár.</span>
@@ -114,7 +129,7 @@ export function PaperStrategyCard() {
       <p className="sfield-help">Csak PAPER: ezzel a funkcióval LIVE kereskedés semmilyen módon nem kapcsolható be. A kilépéseket mindkét módban a közös Exit Engine kezeli; modellhiba esetén is. Részletes összehasonlítás: <Link className="table-link" href="/machine-learning">Machine Learning → PAPER stratégiák</Link>.</p>
       <div className="header-actions">
         {active ? <button type="button" className="secondary-button" disabled={busy} onClick={() => void save({ strategyMode: 'DEFAULT' }, 'Visszaváltva az alapstratégiára. Az ML SHADOW adatgyűjtés tovább fut.')}>Visszaváltás az alapstratégiára</button> : null}
-        {mode === 'ML' ? <button type="button" className="primary-button" disabled={busy || !modelVersion || !thresholdValid || (!active && !settings.canEnable)} onClick={() => void save({ strategyMode: 'ML', modelVersion, buyThreshold: threshold, decisionWindowSeconds: windowSeconds }, active ? 'ML PAPER beállítások elmentve.' : 'ML PAPER stratégia bekapcsolva.')}>{active ? 'ML beállítások mentése' : 'ML PAPER engedélyezése'}</button> : null}
+        {mode === 'ML' ? <button type="button" className="primary-button" disabled={busy || !modelVersion || !thresholdValid || !minLiquidityValid || (!active && !settings.canEnable)} onClick={() => void save({ strategyMode: 'ML', modelVersion, buyThreshold: threshold, decisionWindowSeconds: windowSeconds, minLiquidityUsd: minLiquidityValue }, active ? 'ML PAPER beállítások elmentve.' : 'ML PAPER stratégia bekapcsolva.')}>{active ? 'ML beállítások mentése' : 'ML PAPER engedélyezése'}</button> : null}
         {mode === 'DEFAULT' && !active ? <span className="sfield-help">Az alapstratégia aktív.</span> : null}
       </div>
     </div>

@@ -1100,6 +1100,8 @@ model Trade {
   mlModelVersion      String?
   /// MlPaperDecision row of the entry (entryStrategy = ML only).
   mlPaperDecisionId   String?
+  /// ML entries only: ML PAPER minimum liquidity (USD) applied at entry
+  mlMinLiquidityUsd   Decimal?       @db.Decimal(14, 2)
   entryAt             DateTime?
   exitAt              DateTime?
   mode                TradingMode    @default(PAPER)
@@ -1463,6 +1465,9 @@ model MlPaperSettings {
   buyThreshold          Decimal  @default(0.7) @db.Decimal(4, 3)
   /// How long an ML BUY may wait for the mandatory safety checks before it expires (seconds)
   decisionWindowSeconds Int      @default(10)
+  /// ML PAPER minimum liquidity (USD), independent of the DEFAULT New Launch minimum. null = not set yet: the DEFAULT
+  /// minimum stays in force (no looser limit without an explicit save).
+  minLiquidityUsd       Decimal? @db.Decimal(14, 2)
   enabledAt             DateTime?
   enabledBy             String?
   createdAt             DateTime @default(now())
@@ -1500,6 +1505,12 @@ model MlPaperDecision {
   baseReasons      Json?
   safetyPassed     Boolean?
   safetyBlockers   Json?
+  /// ML PAPER minimum liquidity applied to this decision (USD)
+  minLiquidityUsd  Decimal?  @db.Decimal(14, 2)
+  /// Token liquidity (USD) at the last mandatory check of this decision
+  liquidityUsd     Decimal?  @db.Decimal(18, 2)
+  /// Sellability state at the last mandatory check (VERIFIED / NOT_VERIFIED / FAILED)
+  sellability      String?
   /// PENDING | SIGNALED | EXECUTED | EXECUTION_REJECTED | SAFETY_BLOCKED | EXPIRED | SKIPPED | ERROR
   outcome          String
   signalId         String?

@@ -6,6 +6,29 @@ import Link from 'next/link';
 import { DataTable, date, EmptyState, ErrorState, fmt, LoadingState, Metric, Panel, Status, useApi } from '../components';
 import { launchReasons } from '../locales/position-labels';
 
+const SELLABILITY_LABELS: Record<string, string> = { VERIFIED: 'igazolt', NOT_VERIFIED: 'nem igazolt', FAILED: 'sikertelen' };
+
+/** Analysis-only table: other minimum-liquidity levels over the same past ML BUYs (no trade results). */
+function LiquidityComparison({ data, trades }: { data: any; trades: any[] }) {
+  if (!data) return null;
+  return <Panel title="Likviditási minimumok összehasonlítása (csak elemzés)" description="Ugyanazokra a múltbeli ML BUY döntésekre: hány felelt volna meg az adott minimumnak, hányat akadályozott volna más rögzített kötelező ellenőrzés, és hány lehetett volna végrehajtásra alkalmas. Ezek jogosultsági számok, nem végrehajtott kereskedések.">
+    <DataTable wide headers={['Minimum', 'Megfelelt volna', 'Más ellenőrzés tiltotta volna', 'Végrehajtásra alkalmas lehetett', 'Későbbi ármozgás (SHADOW)']}>
+      {data.levels.map((level: any) => <tr key={level.minimumUsd}>
+        <td>{fmt(level.minimumUsd, 0)} USD</td>
+        <td>{fmt(level.meetsMinimum, 0)}</td>
+        <td>{fmt(level.blockedByOtherChecks, 0)}</td>
+        <td>{fmt(level.potentiallyExecutable, 0)}</td>
+        <td>{level.laterPriceMovement.labelled ? <>{pct(level.laterPriceMovement.hitRate)} érte el előbb a +20%-ot, mint a –10%-ot<small className="sfield-help" style={{ display: 'block' }}>{fmt(level.laterPriceMovement.labelled, 0)} címkézett · medián 30 p hozam: {level.laterPriceMovement.median30mReturnPct == null ? '—' : `${fmt(level.laterPriceMovement.median30mReturnPct, 1)}%`}</small></> : 'nincs címkézett kimenet'}</td>
+      </tr>)}
+    </DataTable>
+    <p className="sfield-help">{fmt(data.mlBuyDecisions, 0)} ML BUY döntés · ténylegesen végrehajtva: {fmt(data.actuallyExecuted, 0)} · likviditás ismeretlen: {fmt(data.unknownLiquidity, 0)} · a döntés előtti utolsó launch-snapshotból: {fmt(data.liquidityFromSnapshot, 0)}. A későbbi ármozgás időhelyes SHADOW-kimenet a snapshot-ponttól (a jogosultsághoz nem használjuk), díjak, slippage és Exit Engine nélkül.</p>
+    <ul className="analysis-list">{(data.missingData ?? []).map((item: string) => <li key={item} className="sfield-help">Hiányzó adat: {item}</li>)}</ul>
+    {trades.length ? <DataTable headers={['Alkalmazott ML minimum', 'Lezárt ML trade', 'Nettó P&L']}>
+      {trades.map((row: any) => <tr key={String(row.minLiquidityUsd)}><td>{row.minLiquidityUsd == null ? 'nincs rögzítve (korábbi)' : `${fmt(row.minLiquidityUsd, 0)} USD`}</td><td>{fmt(row.trades, 0)}</td><td>{usd(row.netPnl)}</td></tr>)}
+    </DataTable> : null}
+  </Panel>;
+}
+
 const SECURITY_LABELS: Record<string, { text: string; tone: string }> = {
   PASSED: { text: 'RENDBEN', tone: 'positive' }, BLOCKED: { text: 'TILTVA', tone: 'danger' }, PENDING: { text: 'NEM IGAZOLT', tone: 'warning' }, NOT_CHECKED: { text: 'NEM KELLETT', tone: 'neutral' },
 };
@@ -56,21 +79,25 @@ export function PaperTab() {
       </div>
       <h4 className="section-title">ML BUY tölcsér (utolsó {d.periodDays} nap)</h4>
       <div className="metric-grid">
-        <Metric label="ML BUY jelzés" value={fmt(d.mlFunnel?.mlBuy ?? 0, 0)} />
-        <Metric label="Tokenbiztonság (csalás / honeypot) tiltotta" value={fmt(d.mlFunnel?.blockedByTokenSecurity ?? 0, 0)} note={`ebből igazolt honeypot-jel: ${fmt(d.mlFunnel?.honeypotBlocked ?? 0, 0)}`} />
-        <Metric label="Piac / kockázat / lejárat" value={fmt(d.mlFunnel?.blockedByMarketOrRisk ?? 0, 0)} />
+        <Metric label="Összes ML BUY" value={fmt(d.mlFunnel?.mlBuy ?? 0, 0)} note={`tiltva: ${fmt(d.mlFunnel?.blocked ?? 0, 0)}`} />
+        <Metric label="Likviditási minimum miatt" value={fmt(d.mlFunnel?.blockedByLiquidityMinimum ?? 0, 0)} note={`csak emiatt: ${fmt(d.mlFunnel?.onlyLiquidityMinimum ?? 0, 0)}`} />
+        <Metric label="Honeypot / tokenbiztonság miatt" value={fmt(d.mlFunnel?.blockedByTokenSecurity ?? 0, 0)} note={`ebből igazolt honeypot-jel: ${fmt(d.mlFunnel?.honeypotBlocked ?? 0, 0)}`} />
+        <Metric label="Kritikus likviditáscsökkenés miatt" value={fmt(d.mlFunnel?.blockedByCriticalLiquidity ?? 0, 0)} />
+        <Metric label="Árhatás miatt" value={fmt(d.mlFunnel?.blockedByPriceImpact ?? 0, 0)} />
+        <Metric label="Egyéb kockázat / lejárat miatt" value={fmt(d.mlFunnel?.blockedByOtherRiskOrExpiry ?? 0, 0)} />
         <Metric label="Végrehajtás elutasította" value={fmt(d.mlFunnel?.executionRejected ?? 0, 0)} note="limitek, ár, vészleállítás" />
-        <Metric label="Megnyitott PAPER pozíció" value={fmt(d.mlFunnel?.positionsOpened ?? 0, 0)} />
-        <Metric label="Függőben" value={fmt(d.mlFunnel?.pending ?? 0, 0)} />
+        <Metric label="Megnyitott PAPER pozíció" value={fmt(d.mlFunnel?.positionsOpened ?? 0, 0)} note={`függőben: ${fmt(d.mlFunnel?.pending ?? 0, 0)}`} />
       </div>
+      <p className="sfield-help">Egy ML BUY-nak több tiltási oka is lehet, ezért a tiltási csoportok összege meghaladhatja a tiltott döntések számát („csak emiatt” = kizárólag ez az ok).</p>
     </Panel>
+    <LiquidityComparison data={d.liquidityComparison} trades={d.mlTradesByMinLiquidity ?? []} />
     <Panel title="Modellverziónkénti PAPER teljesítmény">
       {(d.byModel ?? []).length === 0 ? <EmptyState message="Még nincs lezárt ML PAPER trade." /> : <DataTable headers={['Modell', 'Trade', 'Nettó P&L', 'PF', 'Találati arány', 'Max. visszaesés']}>
         {d.byModel.map((row: any) => <tr key={row.modelVersion}><td>{row.modelVersion}</td><td>{row.trades}</td><td>{usd(row.netPnl)}</td><td>{row.profitFactor == null ? '—' : fmt(row.profitFactor, 2)}</td><td>{pct(row.winRate)}</td><td>{usd(row.maxDrawdownUsd)}</td></tr>)}
       </DataTable>}
     </Panel>
     <Panel title="Legutóbbi ML PAPER döntések">
-      {(d.recentDecisions ?? []).length === 0 ? <EmptyState message="Még nincs ML PAPER döntés (az ML stratégia alapból kikapcsolt)." /> : <DataTable wide headers={['Idő', 'Token', 'Modell', 'Valószínűség / küszöb', 'ML döntés', 'Alapstratégia (összehasonlítás)', 'Tokenbiztonság', 'Eredmény / ok', 'PAPER pozíció']}>
+      {(d.recentDecisions ?? []).length === 0 ? <EmptyState message="Még nincs ML PAPER döntés (az ML stratégia alapból kikapcsolt)." /> : <DataTable wide headers={['Idő', 'Token', 'Modell', 'Valószínűség / küszöb', 'ML döntés', 'Likviditás / ML minimum', 'Alapstratégia (összehasonlítás)', 'Tokenbiztonság', 'Eredmény / ok', 'PAPER pozíció']}>
         {d.recentDecisions.map((row: any) => {
           const outcome = OUTCOME_LABELS[row.outcome] ?? { text: row.outcome, tone: 'neutral' };
           return <tr key={row.id}>
@@ -80,7 +107,8 @@ export function PaperTab() {
             <td>{row.probability == null ? '—' : `${row.probability.toFixed(3)} / ${row.threshold?.toFixed(2)}`}</td>
             <td><Status tone={row.mlDecision === 'ML_BUY' ? 'positive' : row.mlDecision === 'ML_ERROR' ? 'danger' : 'neutral'}>{row.mlDecision}</Status>{row.errorReason ? <small className="sfield-help" style={{ display: 'block' }}>{row.errorReason}</small> : null}</td>
             <td>{row.baseDecision ?? '—'}{launchReasons((row.baseReasons ?? []).filter((reason: string) => reason.startsWith('COMPARE_'))).map((text) => <small key={text} className="sfield-help" style={{ display: 'block' }}>{text}</small>)}</td>
-            <td>{SECURITY_LABELS[row.tokenSecurity?.status] ? <Status tone={SECURITY_LABELS[row.tokenSecurity.status].tone}>{row.tokenSecurity.honeypot ? 'HONEYPOT-GYANÚ' : SECURITY_LABELS[row.tokenSecurity.status].text}</Status> : '—'}{(row.tokenSecurity?.blockers ?? []).length ? <small className="sfield-help" style={{ display: 'block' }}>{launchReasons(row.tokenSecurity.blockers).join(', ')}</small> : null}</td>
+            <td>{row.liquidityUsd == null ? '—' : `${fmt(row.liquidityUsd, 0)} USD`}<small className="sfield-help" style={{ display: 'block' }}>min. {row.minLiquidityUsd == null ? 'nincs rögzítve' : `${fmt(row.minLiquidityUsd, 0)} USD`}</small></td>
+            <td>{SECURITY_LABELS[row.tokenSecurity?.status] ? <Status tone={SECURITY_LABELS[row.tokenSecurity.status].tone}>{row.tokenSecurity.honeypot ? 'HONEYPOT-GYANÚ' : SECURITY_LABELS[row.tokenSecurity.status].text}</Status> : '—'}{(row.tokenSecurity?.blockers ?? []).length ? <small className="sfield-help" style={{ display: 'block' }}>{launchReasons(row.tokenSecurity.blockers).join(', ')}</small> : null}{row.sellability ? <small className="sfield-help" style={{ display: 'block' }}>eladhatóság: {SELLABILITY_LABELS[row.sellability] ?? row.sellability}</small> : null}</td>
             <td><Status tone={outcome.tone}>{outcome.text}</Status>{(row.safetyBlockers ?? []).length ? <small className="sfield-help" style={{ display: 'block' }}>{launchReasons(row.safetyBlockers).join(', ')}</small> : row.executionReason ? <small className="sfield-help" style={{ display: 'block' }}>{launchReasons(String(row.executionReason).split(/[,:]\s*/).filter(Boolean)).join(', ')}</small> : null}</td>
             <td>{row.trade ? <><Link className="table-link" href={`/positions/${row.trade.positionId}`}>{row.trade.status === 'OPEN' ? 'nyitott' : 'lezárt'}</Link>{row.trade.netPnl != null ? <small className={row.trade.netPnl >= 0 ? 'positive-value' : 'negative-value'} style={{ display: 'block' }}>{usd(row.trade.netPnl)}</small> : null}<small className="sfield-help" style={{ display: 'block' }}>{row.trade.modelVersion}</small></> : 'nincs'}</td>
           </tr>;

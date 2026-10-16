@@ -132,6 +132,32 @@ describe('ML PAPER strategy API', () => {
     expect(view.body.data).not.toHaveProperty('tokenSafetyChecksEnabled');
   });
 
+  it('ML PAPER minimum liquidity: not set = DEFAULT minimum; explicit save, validation, audit, reset; LIVE stays refused (10 / 11 / 12)', async () => {
+    const admin = await login(adminEmail);
+    const before = (await admin.get('/api/settings/ml-paper')).body.data.minLiquidity;
+    // Existing users: nothing saved -> the DEFAULT minimum is the effective one (no looser limit without a save).
+    expect(before).toMatchObject({ savedUsd: null, suggestedUsd: 3_000, floorUsd: 1_250 });
+    expect(before.effectiveUsd).toBe(before.defaultStrategyUsd);
+    // Below the execution floor / above the maximum -> refused.
+    expect((await admin.put('/api/settings/ml-paper').send({ strategyMode: 'ML', modelVersion: READY, minLiquidityUsd: 500 })).status).toBe(400);
+    expect((await admin.put('/api/settings/ml-paper').send({ strategyMode: 'ML', modelVersion: READY, minLiquidityUsd: 5_000_000 })).status).toBe(400);
+    // Explicit save of the suggested value: stored (DB column, survives restarts) and audited.
+    expect((await admin.put('/api/settings/ml-paper').send({ strategyMode: 'ML', modelVersion: READY, minLiquidityUsd: 3_000 })).status).toBe(200);
+    expect(Number((await prisma.mlPaperSettings.findUniqueOrThrow({ where: { userId: ids.admin } })).minLiquidityUsd)).toBe(3_000);
+    expect((await admin.get('/api/settings/ml-paper')).body.data.minLiquidity).toMatchObject({ savedUsd: 3_000, effectiveUsd: 3_000 });
+    expect(await prisma.auditLog.count({ where: { userId: ids.admin, action: 'ml_paper_min_liquidity_update' } })).toBe(1);
+    // Other settings saved without the field keep the value; the DEFAULT strategy minimum is untouched.
+    expect((await admin.put('/api/settings/ml-paper').send({ strategyMode: 'ML', modelVersion: READY, buyThreshold: 0.75 })).status).toBe(200);
+    expect(Number((await prisma.mlPaperSettings.findUniqueOrThrow({ where: { userId: ids.admin } })).minLiquidityUsd)).toBe(3_000);
+    expect((await admin.get('/api/settings/ml-paper')).body.data.minLiquidity.defaultStrategyUsd).toBe(before.defaultStrategyUsd);
+    // The lower ML minimum never unlocks LIVE.
+    expect((await admin.post('/api/safety/live/enable').send({ confirmLiveTrading: true })).status).toBe(409);
+    expect(await prisma.botConfig.findUniqueOrThrow({ where: { userId: ids.admin } })).toMatchObject({ tradingMode: 'PAPER', isLiveEnabled: false });
+    // null = back to the DEFAULT minimum.
+    expect((await admin.put('/api/settings/ml-paper').send({ strategyMode: 'ML', modelVersion: READY, minLiquidityUsd: null })).status).toBe(200);
+    expect((await admin.get('/api/settings/ml-paper')).body.data.minLiquidity).toMatchObject({ savedUsd: null, effectiveUsd: before.defaultStrategyUsd });
+  });
+
   it('9. revoking the approval stops ML entries without switching the user to buying with the rule strategy', async () => {
     const admin = await login(adminEmail);
     expect((await admin.delete(`/api/ml/models/${READY}/paper-approval`)).status).toBe(200);
@@ -166,6 +192,11 @@ describe('ML PAPER strategy API', () => {
     expect(response.body.data.strategies.ML).toMatchObject({ trades: 2, netPnl: 1, wins: 1, profitFactor: 1.5, maxDrawdownUsd: 2 });
     // ML strategy = ML entries + the common rule-based exit; SHADOW predictions are reported separately from PAPER results.
     expect(response.body.data.exitMode).toBe('RULE_BASED');
+    // 13. Funnel groups, the liquidity-level comparison (analysis only) and trades per applied ML minimum.
+    expect(response.body.data.mlFunnel).toMatchObject({ blockedByLiquidityMinimum: expect.any(Number), blockedByCriticalLiquidity: expect.any(Number), blockedByPriceImpact: expect.any(Number), overlappingReasons: true });
+    expect(response.body.data.liquidityComparison.levels.map((level: { minimumUsd: number }) => level.minimumUsd)).toEqual([10_000, 5_000, 3_000, 1_000]);
+    expect(response.body.data.liquidityComparison.label).toMatch(/ANALYSIS ONLY/);
+    expect(Array.isArray(response.body.data.mlTradesByMinLiquidity)).toBe(true);
     // ML BUY funnel: signals, fraud / honeypot blocks, market / risk blocks and opened positions are counted separately.
     expect(response.body.data.mlFunnel).toMatchObject({ mlBuy: expect.any(Number), blockedByTokenSecurity: expect.any(Number), honeypotBlocked: expect.any(Number), positionsOpened: expect.any(Number) });
     expect(Array.isArray(response.body.data.shadowPredictions)).toBe(true);

@@ -51,7 +51,7 @@ async function decisionRow(userId: string, mint: string) {
   } });
 }
 
-async function launchSignal(userId: string, mint: string, entryStrategy: 'DEFAULT' | 'ML', decisionId?: string, options: { qualityGate?: Record<string, unknown> | null; probability?: number } = {}) {
+async function launchSignal(userId: string, mint: string, entryStrategy: 'DEFAULT' | 'ML', decisionId?: string, options: { qualityGate?: Record<string, unknown> | null; probability?: number; minLiquidityUsd?: number } = {}) {
   const token = await prisma.token.upsert({ where: { address: mint }, update: {}, create: { address: mint, symbol: 'MLP', name: 'ML paper test' } });
   if (!createdTokens.includes(token.id)) createdTokens.push(token.id);
   const now = Date.now();
@@ -60,16 +60,16 @@ async function launchSignal(userId: string, mint: string, entryStrategy: 'DEFAUL
     reasons: ['ML_BUY'], entryConditions: [], invalidationConditions: [],
     metadata: {
       decisionSource: 'NEW_LAUNCH', primaryStrategy: 'NewLaunchStrategy', riskClassification: 'MODERATE', hardBlocked: false, hardBlockReasons: [], riskPolicy: 'EXPLORATORY', riskWarnings: [], riskFactors: {},
-      entryStrategy, ml: entryStrategy === 'ML' ? { decisionId, modelVersion: MODEL, probability: options.probability ?? 0.91, threshold: 0.7, snapshotKind: 'AGE_30S' } : null,
+      entryStrategy, ml: entryStrategy === 'ML' ? { decisionId, modelVersion: MODEL, probability: options.probability ?? 0.91, threshold: 0.7, snapshotKind: 'AGE_30S', ...(options.minLiquidityUsd !== undefined ? { minLiquidityUsd: options.minLiquidityUsd } : {}) } : null,
       launch: { source: 'PUMP_FUN', mint, detectedAt: new Date(now - 31_000).toISOString(), decisionAt: new Date(now - 500).toISOString(), ageSeconds: 31, score: 40, liquidityUsd: 30_000, reasons: [], warnings: [], qualityGate: options.qualityGate ?? null },
     },
   } });
 }
 
-function coordinator(userIds: string[], quotes: Map<string, number>) {
+function coordinator(userIds: string[], quotes: Map<string, number>, liquidityUsd = 30_000) {
   return new PaperExecutionCoordinator({
     prisma: scoped(userIds), provider: { getTokenMetrics: async () => null } as any, logger, publishEvent: async () => undefined,
-    getLaunchQuote: (mint: string) => (quotes.has(mint) ? { priceUsd: quotes.get(mint)!, liquidityUsd: 30_000, timestamp: new Date(), impactPercentFor: () => 0.8 } : null),
+    getLaunchQuote: (mint: string) => (quotes.has(mint) ? { priceUsd: quotes.get(mint)!, liquidityUsd, timestamp: new Date(), impactPercentFor: () => 0.8 } : null),
     publishLaunchEvent: async () => undefined,
   } as any);
 }
@@ -241,6 +241,30 @@ describe('ML PAPER entries in the PAPER Execution Engine', () => {
     expect(summary.executed).toBe(0);
     const rejected = await prisma.auditLog.findFirstOrThrow({ where: { userId, action: 'TRADE_REJECTED' } });
     expect((rejected.details as any).decisionReasons).toContain('DAILY_LOSS_LIMIT');
+  });
+
+  it('13. the ML PAPER minimum liquidity applied at entry is recorded on the trade; a 5 000 USD quote is executable', async () => {
+    const userId = await createUser('ML');
+    const address = mint();
+    await launchSignal(userId, address, 'ML', (await decisionRow(userId, address)).id, { minLiquidityUsd: 3_000 });
+    const summary = await coordinator([userId], new Map([[address, 0.000005]]), 5_000).runCycle({ aborted: false });
+    expect(summary.executed).toBe(1);
+    const trade = await prisma.trade.findFirstOrThrow({ where: { userId } });
+    expect(Number(trade.mlMinLiquidityUsd)).toBe(3_000);
+    expect(trade).toMatchObject({ entryStrategy: 'ML', mode: 'PAPER' });
+  });
+
+  it('the execution floor (1 250 USD) still applies to ML entries whatever the ML minimum', async () => {
+    const userId = await createUser('ML');
+    const address = mint();
+    const decision = await decisionRow(userId, address);
+    await launchSignal(userId, address, 'ML', decision.id, { minLiquidityUsd: 1_250 });
+    const summary = await coordinator([userId], new Map([[address, 0.000005]]), 1_000).runCycle({ aborted: false });
+    expect(summary.executed).toBe(0);
+    expect(await prisma.position.count({ where: { userId } })).toBe(0);
+    const resolved = await prisma.mlPaperDecision.findUniqueOrThrow({ where: { id: decision.id } });
+    expect(resolved.outcome).toBe('EXECUTION_REJECTED');
+    expect(resolved.executionReason).toContain('LIQUIDITY_BELOW_ABSOLUTE_MINIMUM');
   });
 
   it('11. never outside PAPER: SEMI_AUTO / LIVE accounts get no ML entry, every ML trade is mode PAPER', async () => {
