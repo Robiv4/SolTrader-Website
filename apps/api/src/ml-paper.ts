@@ -15,11 +15,15 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { Prisma, type PrismaClient } from '@prisma/client';
-import { ML_FEATURE_VERSION, ML_HONEYPOT_CODES, ML_PAPER_SNAPSHOT_POINTS, ML_PAPER_THRESHOLD_MAX, ML_PAPER_THRESHOLD_MIN, ML_PAPER_WINDOW_MAX_SECONDS, mlBlockerCategory } from '@soltrader/strategy-engine';
+import {
+  effectiveMlMinLiquidityUsd, ML_FEATURE_VERSION, ML_HONEYPOT_CODES, ML_MIN_LIQUIDITY_FLOOR_USD, ML_MIN_LIQUIDITY_MAX_USD, ML_MIN_LIQUIDITY_SUGGESTED_USD, ML_PAPER_SNAPSHOT_POINTS,
+  ML_PAPER_THRESHOLD_MAX, ML_PAPER_THRESHOLD_MIN, ML_PAPER_WINDOW_MAX_SECONDS, mlBlockerCategory, mlBlockerGroup, resolveNewLaunchSettings,
+} from '@soltrader/strategy-engine';
 import { type Request, type Response, Router } from 'express';
 import { z } from 'zod';
 
 import type { StepUpGate } from './email-verification.js';
+import { loadLiquidityAnalysisRows, summarizeLiquidityLevels } from './ml-liquidity-analysis.js';
 
 /** Minimum number of stored SHADOW predictions before a model may be PAPER-approved. */
 export const MIN_SHADOW_PREDICTIONS_FOR_PAPER = 100;
@@ -173,14 +177,17 @@ export function createMlPaperRouter(deps: MlPaperDeps) {
 
   // ---------------------------------------------------------------- per-user strategy selection
   async function settingsView(userId: string, isAdmin: boolean) {
-    const [row, bot, approved, decisions, lastPrediction, health] = await Promise.all([
+    const [row, bot, approved, decisions, lastPrediction, health, newLaunch] = await Promise.all([
       prisma.mlPaperSettings.findUnique({ where: { userId } }),
       prisma.botConfig.findUnique({ where: { userId }, select: { tradingMode: true, isLiveEnabled: true } }),
       prisma.mlModelVersion.findMany({ where: { paperApproved: true, status: { not: 'RETIRED' } }, orderBy: { trainedAt: 'desc' } }),
       prisma.mlPaperDecision.groupBy({ by: ['mlDecision'], where: { userId, decidedAt: { gte: new Date(Date.now() - 86_400_000) } }, _count: { _all: true } }),
       prisma.mlPaperDecision.findFirst({ where: { userId, probability: { not: null } }, orderBy: { decidedAt: 'desc' }, select: { decidedAt: true, modelVersion: true, probability: true, mlDecision: true, mint: true, outcome: true } }),
       deps.readJson('ml:paper:health').catch(() => null),
+      prisma.newLaunchConfig.findUnique({ where: { userId } }).catch(() => null),
     ]);
+    const defaultMinLiquidityUsd = resolveNewLaunchSettings(newLaunch as unknown as Record<string, unknown> | null).minLiquidityUsd;
+    const savedMinLiquidity = row?.minLiquidityUsd === null || row?.minLiquidityUsd === undefined ? null : Number(row.minLiquidityUsd);
     const selected = row?.modelVersion ? await prisma.mlModelVersion.findUnique({ where: { version: row.modelVersion } }) : null;
     const models = await Promise.all(approved.map(async (model) => modelSummary(model, await snapshotKindOf(prisma, model.datasetVersion))));
     const mode = row?.strategyMode === 'ML' ? 'ML' : 'DEFAULT';
@@ -195,6 +202,15 @@ export function createMlPaperRouter(deps: MlPaperDeps) {
       modelVersion: row?.modelVersion ?? null,
       buyThreshold: row ? Number(row.buyThreshold) : 0.7,
       decisionWindowSeconds: row?.decisionWindowSeconds ?? 10,
+      /** ML PAPER minimum liquidity: saved value (null = not set) and the minimum actually applied to ML entries. */
+      minLiquidity: {
+        savedUsd: savedMinLiquidity,
+        effectiveUsd: effectiveMlMinLiquidityUsd(savedMinLiquidity, defaultMinLiquidityUsd),
+        defaultStrategyUsd: defaultMinLiquidityUsd,
+        suggestedUsd: ML_MIN_LIQUIDITY_SUGGESTED_USD,
+        floorUsd: ML_MIN_LIQUIDITY_FLOOR_USD,
+        maxUsd: ML_MIN_LIQUIDITY_MAX_USD,
+      },
       enabledAt: row?.enabledAt ?? null,
       enabledBy: row?.enabledBy ?? null,
       limits: { thresholdMin: ML_PAPER_THRESHOLD_MIN, thresholdMax: ML_PAPER_THRESHOLD_MAX, windowMaxSeconds: ML_PAPER_WINDOW_MAX_SECONDS },
@@ -223,6 +239,8 @@ export function createMlPaperRouter(deps: MlPaperDeps) {
     modelVersion: z.string().min(1).max(120).nullable().optional(),
     buyThreshold: z.number().min(ML_PAPER_THRESHOLD_MIN).max(ML_PAPER_THRESHOLD_MAX).optional(),
     decisionWindowSeconds: z.number().int().min(2).max(ML_PAPER_WINDOW_MAX_SECONDS).optional(),
+    /** ML PAPER minimum liquidity (USD); null = back to the DEFAULT minimum. Never below the execution floor. */
+    minLiquidityUsd: z.number().min(ML_MIN_LIQUIDITY_FLOOR_USD).max(ML_MIN_LIQUIDITY_MAX_USD).nullable().optional(),
   }).strict();
 
   router.put('/settings/ml-paper', async (req: Request, res: Response) => {
@@ -249,14 +267,17 @@ export function createMlPaperRouter(deps: MlPaperDeps) {
       if (bot?.tradingMode !== 'PAPER' || bot?.isLiveEnabled || deps.serverTradingMode() !== 'PAPER') return fail(res, 409, 'ML PAPER csak PAPER kereskedési módban (LIVE kikapcsolva) használható.');
       const threshold = data.buyThreshold ?? (current ? Number(current.buyThreshold) : 0.7);
       const window = data.decisionWindowSeconds ?? current?.decisionWindowSeconds ?? 10;
+      const previousMinLiquidity = current?.minLiquidityUsd === null || current?.minLiquidityUsd === undefined ? null : Number(current.minLiquidityUsd);
+      const minLiquidity = data.minLiquidityUsd === undefined ? previousMinLiquidity : data.minLiquidityUsd === null ? null : Math.round(data.minLiquidityUsd * 100) / 100;
       const switching = current?.strategyMode !== 'ML' || current?.modelVersion !== modelVersion;
       // Turning ML on or changing the model needs an e-mail confirmed administrator action; threshold tuning while ML runs does not.
       if (switching && !await deps.stepUp(req, res, 'ml_paper_enable', { modelVersion, buyThreshold: threshold, decisionWindowSeconds: window })) return;
       await prisma.mlPaperSettings.upsert({
         where: { userId },
-        update: { strategyMode: 'ML', modelVersion, buyThreshold: new Prisma.Decimal(threshold.toFixed(3)), decisionWindowSeconds: window, ...(switching ? { enabledAt: new Date(), enabledBy: req.user!.email } : {}) },
-        create: { userId, strategyMode: 'ML', modelVersion, buyThreshold: new Prisma.Decimal(threshold.toFixed(3)), decisionWindowSeconds: window, enabledAt: new Date(), enabledBy: req.user!.email },
+        update: { strategyMode: 'ML', modelVersion, buyThreshold: new Prisma.Decimal(threshold.toFixed(3)), decisionWindowSeconds: window, minLiquidityUsd: minLiquidity === null ? null : new Prisma.Decimal(minLiquidity.toFixed(2)), ...(switching ? { enabledAt: new Date(), enabledBy: req.user!.email } : {}) },
+        create: { userId, strategyMode: 'ML', modelVersion, buyThreshold: new Prisma.Decimal(threshold.toFixed(3)), decisionWindowSeconds: window, minLiquidityUsd: minLiquidity === null ? null : new Prisma.Decimal(minLiquidity.toFixed(2)), enabledAt: new Date(), enabledBy: req.user!.email },
       });
+      if (minLiquidity !== previousMinLiquidity) await deps.logAuditEvent('ml_paper_min_liquidity_update', userId, { previousUsd: previousMinLiquidity, newUsd: minLiquidity, modelVersion });
       await deps.logAuditEvent(switching ? 'ml_paper_strategy_enabled' : 'ml_paper_settings_update', userId, { modelVersion, buyThreshold: threshold, decisionWindowSeconds: window, previous: current ? { mode: current.strategyMode, modelVersion: current.modelVersion } : null });
       return res.json({ ok: true, data: await settingsView(userId, true) });
     } catch (error) {
@@ -287,23 +308,41 @@ export function createMlPaperRouter(deps: MlPaperDeps) {
       ]);
       const recentDecisions = await prisma.mlPaperDecision.findMany({
         where: { userId, decidedAt: { gte: since } }, orderBy: { decidedAt: 'desc' }, take: 50,
-        select: { id: true, mint: true, modelVersion: true, decidedAt: true, snapshotKind: true, probability: true, threshold: true, mlDecision: true, errorReason: true, baseDecision: true, baseReasons: true, outcome: true, executionReason: true, safetyBlockers: true, positionId: true },
+        select: { id: true, mint: true, modelVersion: true, decidedAt: true, snapshotKind: true, probability: true, threshold: true, mlDecision: true, errorReason: true, baseDecision: true, baseReasons: true, outcome: true, executionReason: true, safetyBlockers: true, positionId: true, minLiquidityUsd: true, liquidityUsd: true, sellability: true },
       });
 
       // ML BUY funnel: signals -> blocked by fraud / honeypot protection -> blocked by market / risk / execution -> opened.
       const mlBuys = await prisma.mlPaperDecision.findMany({ where: { userId, decidedAt: { gte: since }, mlDecision: 'ML_BUY' }, select: { outcome: true, safetyBlockers: true, executionReason: true } });
       const blockersOf = (row: { safetyBlockers: unknown }) => (Array.isArray(row.safetyBlockers) ? row.safetyBlockers.map(String) : []);
       const unresolvedByToken = (row: { outcome: string; safetyBlockers: unknown }) => (row.outcome === 'SAFETY_BLOCKED' || row.outcome === 'EXPIRED') && blockersOf(row).some((code) => mlBlockerCategory(code) === 'TOKEN_SECURITY');
+      // Blocker groups are NOT exclusive (one ML BUY can have several reasons): the groups can add up to more than the
+      // number of blocked decisions. "only*" counts the decisions blocked by that group alone.
+      const unresolved = mlBuys.filter((row) => row.outcome === 'SAFETY_BLOCKED' || row.outcome === 'EXPIRED');
+      const groupsOf = (row: { safetyBlockers: unknown }) => new Set(blockersOf(row).map((code) => mlBlockerGroup(code)));
+      const inGroup = (group: ReturnType<typeof mlBlockerGroup>) => unresolved.filter((row) => groupsOf(row).has(group)).length;
+      const onlyGroup = (group: ReturnType<typeof mlBlockerGroup>) => unresolved.filter((row) => { const groups = groupsOf(row); return groups.size === 1 && groups.has(group); }).length;
       const funnel = {
         mlBuy: mlBuys.length,
         signaled: mlBuys.filter((row) => ['SIGNALED', 'EXECUTED', 'EXECUTION_REJECTED'].includes(row.outcome)).length,
+        blocked: unresolved.length,
+        blockedByLiquidityMinimum: inGroup('LIQUIDITY_MINIMUM'),
+        onlyLiquidityMinimum: onlyGroup('LIQUIDITY_MINIMUM'),
         blockedByTokenSecurity: mlBuys.filter(unresolvedByToken).length,
         honeypotBlocked: mlBuys.filter((row) => blockersOf(row).some((code) => ML_HONEYPOT_CODES.has(code))).length,
-        blockedByMarketOrRisk: mlBuys.filter((row) => (row.outcome === 'SAFETY_BLOCKED' || row.outcome === 'EXPIRED') && !unresolvedByToken(row)).length,
+        blockedByCriticalLiquidity: inGroup('CRITICAL_LIQUIDITY'),
+        blockedByPriceImpact: inGroup('PRICE_IMPACT'),
+        blockedByOtherRiskOrExpiry: unresolved.filter((row) => { const groups = groupsOf(row); return groups.size === 0 || groups.has('OTHER'); }).length,
+        // Kept for older clients: blocked without any fraud / honeypot reason.
+        blockedByMarketOrRisk: unresolved.filter((row) => !unresolvedByToken(row)).length,
         executionRejected: mlBuys.filter((row) => row.outcome === 'EXECUTION_REJECTED').length,
         positionsOpened: mlBuys.filter((row) => row.outcome === 'EXECUTED').length,
         pending: mlBuys.filter((row) => row.outcome === 'PENDING').length,
+        overlappingReasons: true,
       };
+      // Analysis only: how other minimum-liquidity levels would have filtered the same ML BUYs (no trade results).
+      const liquidityComparison = summarizeLiquidityLevels(await loadLiquidityAnalysisRows(prisma, userId, since).catch(() => []));
+      // Applied ML minimum of closed ML trades (statistics per minimum; older ML trades = not recorded).
+      const appliedMinimum = await prisma.trade.groupBy({ by: ['mlMinLiquidityUsd'], where: { userId, entryStrategy: 'ML', mode: 'PAPER', exitAt: { gte: since } }, _count: { _all: true }, _sum: { netPnl: true } }).catch(() => []);
       // Position / P&L of executed ML decisions (model version recorded on the trade).
       const decisionTrades = await prisma.trade.findMany({ where: { userId, mlPaperDecisionId: { in: recentDecisions.map((item) => item.id) } }, select: { id: true, mlPaperDecisionId: true, mlModelVersion: true, positionId: true, status: true, netPnl: true, exitReason: true } });
       const tradeByDecision = new Map(decisionTrades.map((trade) => [trade.mlPaperDecisionId, { id: trade.id, positionId: trade.positionId, modelVersion: trade.mlModelVersion, status: trade.status, netPnl: num(trade.netPnl), exitReason: trade.exitReason }]));
@@ -345,7 +384,9 @@ export function createMlPaperRouter(deps: MlPaperDeps) {
         shadowPredictions: shadowGroups.map((item) => ({ modelVersion: item.modelVersion, predictedClass: item.predictedClass, count: item._count._all })),
         decisions: decisionGroups.map((item) => ({ modelVersion: item.modelVersion, mlDecision: item.mlDecision, count: item._count._all })),
         mlBuyOutcomes: Object.fromEntries(outcomeGroups.map((item) => [item.outcome, item._count._all])),
-        recentDecisions: recentDecisions.map((item) => ({ ...item, probability: num(item.probability), threshold: num(item.threshold), tokenSecurity: tokenSecurityOf(item), trade: tradeByDecision.get(item.id) ?? null })),
+        liquidityComparison,
+        mlTradesByMinLiquidity: appliedMinimum.map((item) => ({ minLiquidityUsd: num(item.mlMinLiquidityUsd), trades: item._count._all, netPnl: num(item._sum.netPnl) })),
+        recentDecisions: recentDecisions.map((item) => ({ ...item, probability: num(item.probability), threshold: num(item.threshold), minLiquidityUsd: num(item.minLiquidityUsd), liquidityUsd: num(item.liquidityUsd), tokenSecurity: tokenSecurityOf(item), trade: tradeByDecision.get(item.id) ?? null })),
         mlFunnel: funnel,
         training: {
           label: 'SHADOW TRAINING DATA (all New Launch candidates, independent of the active strategy)',

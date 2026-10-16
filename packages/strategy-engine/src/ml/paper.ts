@@ -37,6 +37,34 @@ export const ML_IGNORED_DEFAULT_FILTERS = [
   'QUALITY_GATE_FAILED', 'SOCIAL_AVOID',
 ] as const;
 
+/**
+ * ML PAPER minimum liquidity (USD). A user strategy preference, separate from the DEFAULT New Launch minimum:
+ *  - suggested experimental value 3 000 USD (only applied once the user saves it);
+ *  - never below the execution floor: 1 250 USD is the absolute liquidity minimum of the risk engine and of PAPER
+ *    execution (LIQUIDITY_BELOW_ABSOLUTE_MINIMUM), a market / execution limit that no strategy setting lowers.
+ * Price impact, exit capacity (liquidity utilisation), position size and exposure limits stay in force at every value.
+ */
+export const ML_MIN_LIQUIDITY_FLOOR_USD = 1_250;
+export const ML_MIN_LIQUIDITY_MAX_USD = 1_000_000;
+export const ML_MIN_LIQUIDITY_SUGGESTED_USD = 3_000;
+
+/** Effective ML minimum: the saved ML value, otherwise the user's DEFAULT minimum (no looser limit without a save). */
+export function effectiveMlMinLiquidityUsd(saved: number | null | undefined, defaultMinLiquidityUsd: number) {
+  // Not saved: the DEFAULT minimum exactly as configured (never capped, so it is never looser than before).
+  if (saved === null || saved === undefined || !Number.isFinite(saved)) return Math.max(ML_MIN_LIQUIDITY_FLOOR_USD, Number.isFinite(defaultMinLiquidityUsd) ? defaultMinLiquidityUsd : ML_MIN_LIQUIDITY_MAX_USD);
+  return Math.min(ML_MIN_LIQUIDITY_MAX_USD, Math.max(ML_MIN_LIQUIDITY_FLOOR_USD, saved));
+}
+
+/** Blocker groups of the ML BUY funnel (one decision can be in several groups). */
+export type MlBlockerGroup = 'LIQUIDITY_MINIMUM' | 'TOKEN_SECURITY' | 'CRITICAL_LIQUIDITY' | 'PRICE_IMPACT' | 'OTHER';
+export function mlBlockerGroup(code: string): MlBlockerGroup {
+  if (code === 'LIQUIDITY_BELOW_MINIMUM') return 'LIQUIDITY_MINIMUM';
+  if (code === 'CRITICAL_LIQUIDITY') return 'CRITICAL_LIQUIDITY';
+  if (code === 'PRICE_IMPACT_TOO_HIGH' || code === 'PRICE_IMPACT_UNKNOWN' || code === 'EXTREME_PRICE_IMPACT') return 'PRICE_IMPACT';
+  if (ML_FRAUD_PROTECTION_CODES.has(code)) return 'TOKEN_SECURITY';
+  return 'OTHER';
+}
+
 export type MlPaperTiming = 'WAIT' | 'DECIDE' | 'MISSED';
 
 /** Where a candidate is relative to the model's prediction point. */
@@ -65,7 +93,12 @@ export interface MlEntrySafetyInput {
   /** Risk-engine hard blocks (already filtered for waitable launch blocks). */
   riskHardBlockReasons: string[];
   /** Safety / risk limits only (no DEFAULT strategy preference is read here). */
-  settings: Pick<NewLaunchSettings, 'liquidityCriticalPercent' | 'maxRiskScore' | 'minLiquidityUsd' | 'maxPriceImpactPercent'>;
+  settings: Pick<NewLaunchSettings, 'liquidityCriticalPercent' | 'maxRiskScore' | 'maxPriceImpactPercent'>;
+  /**
+   * The ML PAPER minimum liquidity (USD) of the user (see effectiveMlMinLiquidityUsd); the DEFAULT New Launch
+   * `minLiquidityUsd` is a strategy preference of the rule-based strategy and is never read here.
+   */
+  mlMinLiquidityUsd: number;
   detectedAt: number;
   now: number;
 }
@@ -142,7 +175,9 @@ export function mlEntrySafetyBlockers(input: MlEntrySafetyInput): string[] {
   else if (input.riskScore > settings.maxRiskScore) blockers.add('RISK_SCORE_ABOVE_LAUNCH_MAXIMUM');
   // (2) Valid market data, liquidity and price impact (fail-closed on unknown values).
   if (f.priceUsd === null || !(f.priceUsd > 0)) blockers.add('MARKET_PRICE_UNKNOWN');
-  if (f.liquidityUsd === null || f.liquidityUsd < settings.minLiquidityUsd) blockers.add('LIQUIDITY_BELOW_MINIMUM');
+  // Fail closed: an unusable minimum counts as the strictest one, never as "no minimum".
+  const minimumLiquidity = Number.isFinite(input.mlMinLiquidityUsd) ? Math.max(ML_MIN_LIQUIDITY_FLOOR_USD, input.mlMinLiquidityUsd) : ML_MIN_LIQUIDITY_MAX_USD;
+  if (f.liquidityUsd === null || f.liquidityUsd < minimumLiquidity) blockers.add('LIQUIDITY_BELOW_MINIMUM');
   if (f.estimatedPriceImpact === null) blockers.add('PRICE_IMPACT_UNKNOWN');
   else if (f.estimatedPriceImpact > settings.maxPriceImpactPercent) blockers.add('PRICE_IMPACT_TOO_HIGH');
   return [...blockers];

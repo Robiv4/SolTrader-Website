@@ -27,18 +27,21 @@ export interface MlPaperUserConfig {
   modelVersion: string | null;
   buyThreshold: number;
   decisionWindowSeconds: number;
+  /** Saved ML PAPER minimum liquidity (USD); null = not set (the DEFAULT minimum stays in force). */
+  minLiquidityUsd: number | null;
 }
 
-export const DEFAULT_ML_PAPER_CONFIG: MlPaperUserConfig = { mode: 'DEFAULT', modelVersion: null, buyThreshold: 0.7, decisionWindowSeconds: 10 };
+export const DEFAULT_ML_PAPER_CONFIG: MlPaperUserConfig = { mode: 'DEFAULT', modelVersion: null, buyThreshold: 0.7, decisionWindowSeconds: 10, minLiquidityUsd: null };
 
 /** Normalises a MlPaperSettings row (missing row = DEFAULT strategy). */
-export function toMlPaperConfig(row: { strategyMode: string; modelVersion: string | null; buyThreshold: unknown; decisionWindowSeconds: number } | null | undefined): MlPaperUserConfig {
+export function toMlPaperConfig(row: { strategyMode: string; modelVersion: string | null; buyThreshold: unknown; decisionWindowSeconds: number; minLiquidityUsd?: unknown } | null | undefined): MlPaperUserConfig {
   if (!row) return DEFAULT_ML_PAPER_CONFIG;
   return {
     mode: row.strategyMode === 'ML' ? 'ML' : 'DEFAULT',
     modelVersion: row.modelVersion,
     buyThreshold: Number(row.buyThreshold),
     decisionWindowSeconds: row.decisionWindowSeconds,
+    minLiquidityUsd: row.minLiquidityUsd === null || row.minLiquidityUsd === undefined || !Number.isFinite(Number(row.minLiquidityUsd)) ? null : Number(row.minLiquidityUsd),
   };
 }
 
@@ -173,11 +176,21 @@ export interface MlPaperStepInput {
   safetyBlockers: () => string[];
   /** Rule-based decision at the same moment (comparison only). */
   base: { decision: string; reasons: string[] };
+  /** Facts recorded with the decision (applied ML minimum liquidity, token liquidity, sellability state). */
+  facts?: () => MlDecisionFacts;
 }
+
+export interface MlDecisionFacts { minLiquidityUsd: number; liquidityUsd: number | null; sellability: string | null }
+
+const factsData = (facts: MlDecisionFacts | null | undefined) => (facts ? {
+  minLiquidityUsd: new Prisma.Decimal(facts.minLiquidityUsd.toFixed(2)),
+  liquidityUsd: facts.liquidityUsd !== null && Number.isFinite(facts.liquidityUsd) ? new Prisma.Decimal(facts.liquidityUsd.toFixed(2)) : null,
+  sellability: facts.sellability,
+} : {});
 
 export type MlPaperStepResult =
   | { action: 'NONE' }
-  | { action: 'SIGNAL'; decisionId: string; modelVersion: string; probability: number; threshold: number; snapshotKind: string; snapshotAt: number; featureHash: string };
+  | { action: 'SIGNAL'; decisionId: string; modelVersion: string; probability: number; threshold: number; snapshotKind: string; snapshotAt: number; featureHash: string; minLiquidityUsd: number | null };
 
 interface DecisionMemory {
   decisionId: string;
@@ -191,6 +204,8 @@ interface DecisionMemory {
   featureHash: string;
   resolved: boolean;
   lastBlockers: string[];
+  /** Facts of the last mandatory check (recorded when the decision resolves). */
+  lastFacts?: MlDecisionFacts | null;
 }
 
 export interface MlPaperEngineDeps {
@@ -224,19 +239,22 @@ export class MlPaperEntryEngine {
       if (memory.resolved) return { action: 'NONE' };
     }
     // ML BUY pending: the model must still be the approved, selected one.
-    if (input.config.mode !== 'ML' || input.config.modelVersion !== memory.modelVersion) return this.resolve(key, memory, 'EXPIRED', 'STRATEGY_OR_MODEL_CHANGED', input.now);
+    const facts = input.facts?.() ?? null;
+    if (input.config.mode !== 'ML' || input.config.modelVersion !== memory.modelVersion) return this.resolve(key, memory, 'EXPIRED', 'STRATEGY_OR_MODEL_CHANGED', input.now, [], facts);
     const lookup = await this.deps.registry.get(memory.modelVersion);
-    if (!lookup.ok) return this.resolve(key, memory, 'EXPIRED', lookup.reason, input.now);
+    if (!lookup.ok) return this.resolve(key, memory, 'EXPIRED', lookup.reason, input.now, [], facts);
     if (!mlBuyWindowOpen(memory.decidedAt, input.config.decisionWindowSeconds, input.now)) {
-      return this.resolve(key, memory, 'EXPIRED', memory.lastBlockers.length ? `WINDOW_EXPIRED: ${memory.lastBlockers.join(',')}` : 'WINDOW_EXPIRED', input.now, memory.lastBlockers);
+      return this.resolve(key, memory, 'EXPIRED', memory.lastBlockers.length ? `WINDOW_EXPIRED: ${memory.lastBlockers.join(',')}` : 'WINDOW_EXPIRED', input.now, memory.lastBlockers, memory.lastFacts ?? facts);
     }
     const blockers = input.safetyBlockers();
-    if (blockers.some((reason) => ML_PERMANENT_BLOCKERS.has(reason))) return this.resolve(key, memory, 'SAFETY_BLOCKED', blockers.join(','), input.now, blockers);
+    if (blockers.some((reason) => ML_PERMANENT_BLOCKERS.has(reason))) return this.resolve(key, memory, 'SAFETY_BLOCKED', blockers.join(','), input.now, blockers, facts);
     if (blockers.length) {
       memory.lastBlockers = blockers;
+      memory.lastFacts = facts;
       return { action: 'NONE' };
     }
-    return { action: 'SIGNAL', decisionId: memory.decisionId, modelVersion: memory.modelVersion, probability: memory.probability ?? 0, threshold: memory.threshold, snapshotKind: memory.snapshotKind, snapshotAt: memory.snapshotAt, featureHash: memory.featureHash };
+    memory.lastFacts = facts;
+    return { action: 'SIGNAL', decisionId: memory.decisionId, modelVersion: memory.modelVersion, probability: memory.probability ?? 0, threshold: memory.threshold, snapshotKind: memory.snapshotKind, snapshotAt: memory.snapshotAt, featureHash: memory.featureHash, minLiquidityUsd: facts?.minLiquidityUsd ?? null };
   }
 
   /** The BUY signal for an ML BUY was created (PAPER execution decides the rest). */
@@ -250,15 +268,15 @@ export class MlPaperEntryEngine {
     }
     memory.resolved = true;
     this.metrics.signaled += 1;
-    await this.write(() => this.deps.prisma.mlPaperDecision.update({ where: { id: memory.decisionId }, data: { outcome: 'SIGNALED', signalId, safetyPassed: true, safetyBlockers: [], resolvedAt: new Date(now) } }));
+    await this.write(() => this.deps.prisma.mlPaperDecision.update({ where: { id: memory.decisionId }, data: { outcome: 'SIGNALED', signalId, safetyPassed: true, safetyBlockers: [], resolvedAt: new Date(now), ...factsData(memory.lastFacts) } }));
   }
 
-  private async resolve(key: string, memory: DecisionMemory, outcome: 'EXPIRED' | 'SAFETY_BLOCKED', reason: string, now: number, blockers: string[] = []): Promise<MlPaperStepResult> {
+  private async resolve(key: string, memory: DecisionMemory, outcome: 'EXPIRED' | 'SAFETY_BLOCKED', reason: string, now: number, blockers: string[] = [], facts: MlDecisionFacts | null = null): Promise<MlPaperStepResult> {
     memory.resolved = true;
     if (outcome === 'EXPIRED') this.metrics.expired += 1;
     else this.metrics.safetyBlocked += 1;
     this.memory.set(key, memory);
-    await this.write(() => this.deps.prisma.mlPaperDecision.update({ where: { id: memory.decisionId }, data: { outcome, executionReason: reason.slice(0, 500), safetyPassed: blockers.length ? false : null, safetyBlockers: blockers as Prisma.InputJsonValue, resolvedAt: new Date(now) } }));
+    await this.write(() => this.deps.prisma.mlPaperDecision.update({ where: { id: memory.decisionId }, data: { outcome, executionReason: reason.slice(0, 500), safetyPassed: blockers.length ? false : null, safetyBlockers: blockers as Prisma.InputJsonValue, resolvedAt: new Date(now), ...factsData(facts) } }));
     return { action: 'NONE' };
   }
 
@@ -288,6 +306,13 @@ export class MlPaperEntryEngine {
       userId: input.userId, candidateId: await input.candidateId().catch(() => null), mint: input.mint, modelVersion: model?.version ?? input.config.modelVersion ?? 'NONE',
       featureVersion: ML_FEATURE_VERSION, snapshotKind: model?.snapshotKind ?? 'AGE_30S', detectedAt: new Date(input.detectedAt), decidedAt: new Date(input.now),
       threshold: new Prisma.Decimal(threshold.toFixed(3)), ...base,
+      ...factsData((() => {
+        try {
+          return input.facts?.() ?? null;
+        } catch {
+          return null;
+        }
+      })()),
     };
     if (!model) {
       row = { ...common, ...empty, snapshotAt: new Date(input.now), mlDecision: 'ML_ERROR', errorReason: lookup.ok ? 'UNKNOWN' : lookup.reason, outcome: 'ERROR', resolvedAt: new Date(input.now) };

@@ -1,7 +1,7 @@
 import { Prisma, type PrismaClient } from '@prisma/client';
 import type { TokenDataProvider } from '@soltrader/market-data';
-import { assessRisk, type RiskFactorInput } from '@soltrader/risk-engine';
-import { buyerTrendFromObservations, evaluateNewLaunch, mlEntrySafetyBlockers, socialBlocksEntry, evaluateQualityGate, socialSummary, type LaunchSecurity, type LaunchState, type NewLaunchStrategyResult, type QualityGateResult, type SocialSnapshotResult } from '@soltrader/strategy-engine';
+import { assessRisk, DEFAULT_RISK_THRESHOLDS, type RiskFactorInput } from '@soltrader/risk-engine';
+import { buyerTrendFromObservations, effectiveMlMinLiquidityUsd, evaluateNewLaunch, mlEntrySafetyBlockers, socialBlocksEntry, evaluateQualityGate, socialSummary, type LaunchSecurity, type LaunchState, type NewLaunchStrategyResult, type QualityGateResult, type SocialSnapshotResult } from '@soltrader/strategy-engine';
 import { toRiskEngineConfig } from '@soltrader/token-discovery';
 
 import { buildLaunchMlSnapshot, ML_REFERENCE_ORDER_USD } from '../ml/launch-snapshot.js';
@@ -548,16 +548,27 @@ export class NewLaunchService {
     // evaluation, both computed at `now`): identical features in both pipelines.
     let built: ReturnType<typeof buildLaunchMlSnapshot> | null = null;
     const build = () => (built ??= buildLaunchMlSnapshot({ at: now, launch, state: this.tracker.state(launch.mint, ML_REFERENCE_ORDER_USD), security, riskScore: risk.riskScore, riskObservedAt: now, social }));
+    // ML PAPER minimum liquidity: the user's saved ML value (else the DEFAULT minimum: no looser limit without a save).
+    // The ML risk assessment uses it as the risk engine's liquidity reference too, so the DEFAULT / bot minimum cannot
+    // re-enter through the risk score. The SHADOW features above keep the unchanged DEFAULT risk score (same as training).
+    const mlMinLiquidityUsd = effectiveMlMinLiquidityUsd(user.strategy.minLiquidityUsd, user.settings.minLiquidityUsd);
+    const f = result.features;
+    let mlRiskMemo: ReturnType<NewLaunchService['riskFor']> | null = null;
+    const mlRisk = () => (mlRiskMemo ??= this.riskFor(launch, { liquidityUsd: f.liquidityUsd, ageSeconds: f.ageSeconds, volumeUsd: f.volumeUsd, transactionCount: f.transactionCount, impact: f.estimatedPriceImpact, largestHolder: f.largestHolderSupplyShare, largestBuyer: f.largestBuyerShare, volatility: f.launchVolatility, priceUsd: f.priceUsd }, security.security, {
+      ...user, riskConfig: { ...(user.riskConfig ?? { thresholds: DEFAULT_RISK_THRESHOLDS }), thresholds: { ...(user.riskConfig?.thresholds ?? DEFAULT_RISK_THRESHOLDS), minimumLiquidityUsd: mlMinLiquidityUsd } },
+    }));
     const step = await engine.step({
       userId: user.userId, mint: launch.mint, detectedAt: launch.detectedAt, now, config: user.strategy,
+      facts: () => ({ minLiquidityUsd: mlMinLiquidityUsd, liquidityUsd: f.liquidityUsd, sellability: security.security.sellability }),
       candidateId: context.getCandidateId,
       buildFeatures: () => build().snapshot,
       eligible: () => build().eligible,
       // Mandatory safety only: the DEFAULT strategy's decision, thresholds, timing window, quality gate and social AVOID
       // never veto an ML BUY (ML-only mode, see ML_IGNORED_DEFAULT_FILTERS).
       safetyBlockers: () => {
-        const blockers = mlEntrySafetyBlockers({ result, security: security.security, riskScore: risk.riskScore, riskHardBlockReasons: risk.hardBlockReasons, settings: user.settings, detectedAt: launch.detectedAt, now });
-        if (risk.classification === null) blockers.push('RISK_NOT_CLASSIFIED');
+        const assessed = mlRisk();
+        const blockers = mlEntrySafetyBlockers({ result, security: security.security, riskScore: assessed.riskScore, riskHardBlockReasons: assessed.hardBlockReasons, settings: user.settings, mlMinLiquidityUsd, detectedAt: launch.detectedAt, now });
+        if (assessed.classification === null) blockers.push('RISK_NOT_CLASSIFIED');
         return blockers;
       },
       // Comparison only (stored with the ML decision): what the DEFAULT strategy and its optional filters said at this moment.
@@ -568,9 +579,10 @@ export class NewLaunchService {
     const decisionRow = await this.deps.prisma.launchDecision.findFirst({ where: { userId: user.userId, candidateId }, orderBy: { decisionAt: 'desc' }, select: { id: true } }).catch(() => null);
     // Stored for comparison only; PAPER execution never applies the DEFAULT quality gate to an ML entry.
     const gate = { ...this.qualityGateFor(result, state, user), appliesToEntry: false };
-    const signalId = await this.createBuySignal(launch, user, result, risk, decisionRow?.id ?? null, security.completedAt, now, state, security.security, gate, social, {
+    const signalId = await this.createBuySignal(launch, user, result, mlRisk(), decisionRow?.id ?? null, security.completedAt, now, state, security.security, gate, social, {
       entryStrategy: 'ML', decisionId: step.decisionId, modelVersion: step.modelVersion, probability: step.probability, threshold: step.threshold,
       snapshotKind: step.snapshotKind, snapshotAt: new Date(step.snapshotAt).toISOString(), featureHash: step.featureHash,
+      minLiquidityUsd: mlMinLiquidityUsd, liquidityUsd: f.liquidityUsd,
     });
     await engine.markSignaled(user.userId, launch.mint, signalId, now);
     if (signalId) this.deps.logger.info({ event: 'ml_paper_buy_signal', userId: user.userId, mint: launch.mint, modelVersion: step.modelVersion, probability: step.probability, threshold: step.threshold }, 'ml_paper_buy_signal');

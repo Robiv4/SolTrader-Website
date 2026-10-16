@@ -5,7 +5,7 @@ import { describe, expect, it } from 'vitest';
 
 import {
   buildMlDataset, buildMlFeatureSnapshot, classifyMlProbability, computeCandidateOutcome, DEFAULT_NEW_LAUNCH_SETTINGS, evaluateNewLaunch, ML_PAPER_POINT_TOLERANCE_MS,
-  ML_IGNORED_DEFAULT_FILTERS, ML_PERMANENT_BLOCKERS, ML_STRATEGY_ONLY_REASONS, mlBuyWindowOpen, mlRiskConviction, ML_FRAUD_PROTECTION_CODES, ML_PAPER_THRESHOLD_MIN, mlBlockerCategory, mlTokenSecurityCheck, mlDecisionTiming, mlEntrySafetyBlockers, newOutcomePath, recordPathPoint,
+  ML_IGNORED_DEFAULT_FILTERS, ML_PERMANENT_BLOCKERS, ML_STRATEGY_ONLY_REASONS, mlBuyWindowOpen, mlRiskConviction, effectiveMlMinLiquidityUsd, ML_MIN_LIQUIDITY_FLOOR_USD, mlBlockerGroup, ML_FRAUD_PROTECTION_CODES, ML_PAPER_THRESHOLD_MIN, mlBlockerCategory, mlTokenSecurityCheck, mlDecisionTiming, mlEntrySafetyBlockers, newOutcomePath, recordPathPoint,
   type LaunchObservation, type LaunchSecurity, type MlDatasetSourceRow,
 } from '../src/index.js';
 
@@ -22,10 +22,11 @@ function weakButSafeLaunch(overrides: Partial<LaunchObservation> = {}) {
   return { mint: 'M', detectedAt: T - 30_000, createdAt: T - 31_000, observations, largestBuyerShare: 0.1, buysPerBuyer: 1.2, creatorSoldRatio: 0, largestHolderSupplyShare: 0.04, priceImpactPercent: 1, observedSellers: 3 };
 }
 
-function blockersFor(security: LaunchSecurity, riskScore: number | null, state = weakButSafeLaunch(), extra: Partial<typeof settings> = {}) {
+function blockersFor(security: LaunchSecurity, riskScore: number | null, state = weakButSafeLaunch(), extra: Partial<typeof settings> = {}, mlMinLiquidityUsd?: number) {
   const config = { ...settings, ...extra };
   const result = evaluateNewLaunch(state, security, { riskScore, classification: riskScore === null ? null : 'MODERATE', hardBlockReasons: [] }, config, T);
-  return { result, blockers: mlEntrySafetyBlockers({ result, security, riskScore, riskHardBlockReasons: [], settings: config, detectedAt: T - 30_000, now: T }) };
+  // Unless given, the ML minimum equals the user's DEFAULT minimum (the effective value before an ML value is saved).
+  return { result, blockers: mlEntrySafetyBlockers({ result, security, riskScore, riskHardBlockReasons: [], settings: config, mlMinLiquidityUsd: mlMinLiquidityUsd ?? config.minLiquidityUsd, detectedAt: T - 30_000, now: T }) };
 }
 
 describe('ML PAPER timing: one decision at the trained snapshot point', () => {
@@ -163,6 +164,51 @@ describe('Fraud / honeypot protection: a separate, mandatory security decision',
     expect(mlBlockerCategory('MARKET_PRICE_UNKNOWN')).toBe('MARKET_EXECUTION');
     expect(mlBlockerCategory('RISK_SCORE_ABOVE_LAUNCH_MAXIMUM')).toBe('RISK');
     for (const code of ML_IGNORED_DEFAULT_FILTERS) expect(ML_FRAUD_PROTECTION_CODES.has(code)).toBe(false);
+  });
+});
+
+describe('ML PAPER minimum liquidity (separate from the DEFAULT minimum)', () => {
+  const at = (liquidityUsd: number) => weakButSafeLaunch({ liquidityUsd });
+
+  it('1. DEFAULT 10 000, ML 3 000, token 5 000 -> no liquidity blocker for the ML entry', () => {
+    const { result, blockers } = blockersFor(safe, 40, at(5_000), { minLiquidityUsd: 10_000 }, 3_000);
+    expect(result.reasons).toContain('LIQUIDITY_BELOW_MINIMUM'); // the DEFAULT strategy still sees it below its minimum
+    expect(blockers).not.toContain('LIQUIDITY_BELOW_MINIMUM');
+  });
+
+  it('3. token 2 000 below the ML minimum 3 000 -> blocked', () => {
+    expect(blockersFor(safe, 40, at(2_000), { minLiquidityUsd: 10_000 }, 3_000).blockers).toContain('LIQUIDITY_BELOW_MINIMUM');
+  });
+
+  it('the execution floor (1 250 USD) cannot be lowered; an unusable minimum fails closed', () => {
+    expect(blockersFor(safe, 40, at(1_200), {}, 500).blockers).toContain('LIQUIDITY_BELOW_MINIMUM');
+    expect(blockersFor(safe, 40, at(1_300), {}, 500).blockers).not.toContain('LIQUIDITY_BELOW_MINIMUM');
+    expect(blockersFor(safe, 40, at(900_000), {}, Number.NaN).blockers).toContain('LIQUIDITY_BELOW_MINIMUM');
+  });
+
+  it('effective minimum: saved ML value, else the DEFAULT minimum (no looser limit without a save), clamped to the floor', () => {
+    expect(effectiveMlMinLiquidityUsd(null, 10_000)).toBe(10_000);
+    expect(effectiveMlMinLiquidityUsd(undefined, 10_000)).toBe(10_000);
+    expect(effectiveMlMinLiquidityUsd(3_000, 10_000)).toBe(3_000);
+    expect(effectiveMlMinLiquidityUsd(100, 10_000)).toBe(ML_MIN_LIQUIDITY_FLOOR_USD);
+    // A very high DEFAULT minimum is kept as is when no ML value is saved (never capped / loosened).
+    expect(effectiveMlMinLiquidityUsd(null, 50_000_000)).toBe(50_000_000);
+  });
+
+  it('4 / 5 / 6. a lower minimum never relaxes honeypot, critical liquidity drain or price impact', () => {
+    expect(blockersFor({ ...safe, sellability: 'FAILED' }, 40, at(5_000), {}, 3_000).blockers).toContain('SELLABILITY_FAILED');
+    expect(mlEntrySafetyBlockers({ result: blockersFor(safe, 40, at(5_000), {}, 3_000).result, security: safe, riskScore: 40, riskHardBlockReasons: ['SELL_BLOCKED'], settings: { ...settings }, mlMinLiquidityUsd: 3_000, detectedAt: T - 30_000, now: T })).toContain('SELL_BLOCKED');
+    const draining = { ...weakButSafeLaunch(), observations: weakButSafeLaunch().observations.map((row, index) => ({ ...row, liquidityUsd: 20_000 - index * 1_100 })) };
+    expect(blockersFor(safe, 40, draining, { liquidityCriticalPercent: 40 }, 3_000).blockers).toContain('CRITICAL_LIQUIDITY');
+    expect(blockersFor(safe, 40, at(5_000), { maxPriceImpactPercent: 0.5 }, 3_000).blockers).toContain('PRICE_IMPACT_TOO_HIGH');
+  });
+
+  it('funnel groups', () => {
+    expect(mlBlockerGroup('LIQUIDITY_BELOW_MINIMUM')).toBe('LIQUIDITY_MINIMUM');
+    expect(mlBlockerGroup('CRITICAL_LIQUIDITY')).toBe('CRITICAL_LIQUIDITY');
+    expect(mlBlockerGroup('PRICE_IMPACT_TOO_HIGH')).toBe('PRICE_IMPACT');
+    expect(mlBlockerGroup('SELLABILITY_FAILED')).toBe('TOKEN_SECURITY');
+    expect(mlBlockerGroup('RISK_SCORE_ABOVE_LAUNCH_MAXIMUM')).toBe('OTHER');
   });
 });
 
