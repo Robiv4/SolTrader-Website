@@ -218,6 +218,31 @@ describe('ML PAPER entries in the PAPER Execution Engine', () => {
     expect(await prisma.position.count({ where: { userId } })).toBe(0);
   });
 
+  it('ML BUY + invalid or missing execution price -> no PAPER position', async () => {
+    const userId = await createUser('ML');
+    const [a, b] = [mint(), mint()];
+    await launchSignal(userId, a, 'ML', (await decisionRow(userId, a)).id);
+    await launchSignal(userId, b, 'ML', (await decisionRow(userId, b)).id);
+    // a: no quote at all; b: non-positive price.
+    const summary = await coordinator([userId], new Map([[b, 0]])).runCycle({ aborted: false });
+    expect(summary.executed).toBe(0);
+    expect(await prisma.position.count({ where: { userId } })).toBe(0);
+  });
+
+  it('ML BUY + daily loss limit reached -> no PAPER position', async () => {
+    const userId = await createUser('ML');
+    const lossMint = mint();
+    const token = await prisma.token.create({ data: { address: lossMint, symbol: 'LOSS' } });
+    createdTokens.push(token.id);
+    await prisma.trade.create({ data: { userId, tokenId: token.id, side: 'BUY', tokenAddress: lossMint, symbol: 'LOSS', entry: new Prisma.Decimal(1), size: new Prisma.Decimal(300), quantity: new Prisma.Decimal(300), netPnl: new Prisma.Decimal(-200), status: 'CLOSED', mode: 'PAPER', entryAt: new Date(), exitAt: new Date() } });
+    const address = mint();
+    await launchSignal(userId, address, 'ML', (await decisionRow(userId, address)).id);
+    const summary = await coordinator([userId], new Map([[address, 0.000005]])).runCycle({ aborted: false });
+    expect(summary.executed).toBe(0);
+    const rejected = await prisma.auditLog.findFirstOrThrow({ where: { userId, action: 'TRADE_REJECTED' } });
+    expect((rejected.details as any).decisionReasons).toContain('DAILY_LOSS_LIMIT');
+  });
+
   it('11. never outside PAPER: SEMI_AUTO / LIVE accounts get no ML entry, every ML trade is mode PAPER', async () => {
     const semi = await createUser('ML', { tradingMode: 'SEMI_AUTO' });
     const live = await createUser('ML', { tradingMode: 'LIVE' });

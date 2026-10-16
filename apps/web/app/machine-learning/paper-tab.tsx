@@ -1,8 +1,14 @@
 'use client';
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
+import Link from 'next/link';
+
 import { DataTable, date, EmptyState, ErrorState, fmt, LoadingState, Metric, Panel, Status, useApi } from '../components';
 import { launchReasons } from '../locales/position-labels';
+
+const SECURITY_LABELS: Record<string, { text: string; tone: string }> = {
+  PASSED: { text: 'RENDBEN', tone: 'positive' }, BLOCKED: { text: 'TILTVA', tone: 'danger' }, PENDING: { text: 'NEM IGAZOLT', tone: 'warning' }, NOT_CHECKED: { text: 'NEM KELLETT', tone: 'neutral' },
+};
 
 const pct = (value: number | null | undefined) => (value == null ? '—' : `${(value * 100).toFixed(1)}%`);
 const usd = (value: number | null | undefined) => (value == null ? '—' : `${fmt(value, 2)} USDC`);
@@ -42,14 +48,20 @@ export function PaperTab() {
       <StrategyStats title="ML belépések PAPER (csak ML-eredetű tradek)" stats={d.strategies?.ML} />
     </div>
     <h3 className="section-title">2. ML PAPER döntések</h3>
-    <Panel title="ML vételi döntések" description="Egy döntés jelöltenként, a modell snapshot-időpontjában. Az ML BUY csak akkor lesz belépés, ha minden kötelező biztonsági feltétel teljesül.">
+    <Panel title="ML vételi döntések" description="Egy döntés jelöltenként, a modell snapshot-időpontjában. A stratégiai döntést kizárólag az ML hozza (az alapstratégia nem vétózhat); ML BUY után csak a kötelező csalás- és honeypotvédelem, a piaci / végrehajtási feltételek és a kockázati limitek állíthatják meg.">
       <div className="metric-grid">
         <Metric label="ML BUY" value={fmt(decisionTotals.ML_BUY ?? 0, 0)} />
         <Metric label="ML SKIP" value={fmt(decisionTotals.ML_SKIP ?? 0, 0)} />
         <Metric label="ML hiba" value={fmt(decisionTotals.ML_ERROR ?? 0, 0)} />
-        <Metric label="Teljesült (végrehajtott)" value={fmt(d.mlBuyOutcomes?.EXECUTED ?? 0, 0)} />
-        <Metric label="Biztonság / végrehajtás tiltotta" value={fmt((d.mlBuyOutcomes?.SAFETY_BLOCKED ?? 0) + (d.mlBuyOutcomes?.EXECUTION_REJECTED ?? 0), 0)} />
-        <Metric label="Lejárt" value={fmt(d.mlBuyOutcomes?.EXPIRED ?? 0, 0)} />
+      </div>
+      <h4 className="section-title">ML BUY tölcsér (utolsó {d.periodDays} nap)</h4>
+      <div className="metric-grid">
+        <Metric label="ML BUY jelzés" value={fmt(d.mlFunnel?.mlBuy ?? 0, 0)} />
+        <Metric label="Tokenbiztonság (csalás / honeypot) tiltotta" value={fmt(d.mlFunnel?.blockedByTokenSecurity ?? 0, 0)} note={`ebből igazolt honeypot-jel: ${fmt(d.mlFunnel?.honeypotBlocked ?? 0, 0)}`} />
+        <Metric label="Piac / kockázat / lejárat" value={fmt(d.mlFunnel?.blockedByMarketOrRisk ?? 0, 0)} />
+        <Metric label="Végrehajtás elutasította" value={fmt(d.mlFunnel?.executionRejected ?? 0, 0)} note="limitek, ár, vészleállítás" />
+        <Metric label="Megnyitott PAPER pozíció" value={fmt(d.mlFunnel?.positionsOpened ?? 0, 0)} />
+        <Metric label="Függőben" value={fmt(d.mlFunnel?.pending ?? 0, 0)} />
       </div>
     </Panel>
     <Panel title="Modellverziónkénti PAPER teljesítmény">
@@ -58,7 +70,7 @@ export function PaperTab() {
       </DataTable>}
     </Panel>
     <Panel title="Legutóbbi ML PAPER döntések">
-      {(d.recentDecisions ?? []).length === 0 ? <EmptyState message="Még nincs ML PAPER döntés (az ML stratégia alapból kikapcsolt)." /> : <DataTable wide headers={['Idő', 'Token', 'Modell', 'Valószínűség / küszöb', 'ML döntés', 'Alapstratégia (összehasonlítás)', 'Eredmény', 'Akadályozó kötelező szabály']}>
+      {(d.recentDecisions ?? []).length === 0 ? <EmptyState message="Még nincs ML PAPER döntés (az ML stratégia alapból kikapcsolt)." /> : <DataTable wide headers={['Idő', 'Token', 'Modell', 'Valószínűség / küszöb', 'ML döntés', 'Alapstratégia (összehasonlítás)', 'Tokenbiztonság', 'Eredmény / ok', 'PAPER pozíció']}>
         {d.recentDecisions.map((row: any) => {
           const outcome = OUTCOME_LABELS[row.outcome] ?? { text: row.outcome, tone: 'neutral' };
           return <tr key={row.id}>
@@ -68,8 +80,9 @@ export function PaperTab() {
             <td>{row.probability == null ? '—' : `${row.probability.toFixed(3)} / ${row.threshold?.toFixed(2)}`}</td>
             <td><Status tone={row.mlDecision === 'ML_BUY' ? 'positive' : row.mlDecision === 'ML_ERROR' ? 'danger' : 'neutral'}>{row.mlDecision}</Status>{row.errorReason ? <small className="sfield-help" style={{ display: 'block' }}>{row.errorReason}</small> : null}</td>
             <td>{row.baseDecision ?? '—'}{launchReasons((row.baseReasons ?? []).filter((reason: string) => reason.startsWith('COMPARE_'))).map((text) => <small key={text} className="sfield-help" style={{ display: 'block' }}>{text}</small>)}</td>
-            <td><Status tone={outcome.tone}>{outcome.text}</Status>{row.executionReason && !(row.safetyBlockers ?? []).length ? <small className="sfield-help" style={{ display: 'block' }}>{row.executionReason}</small> : null}</td>
-            <td>{(row.safetyBlockers ?? []).length ? launchReasons(row.safetyBlockers).join(', ') : '—'}</td>
+            <td>{SECURITY_LABELS[row.tokenSecurity?.status] ? <Status tone={SECURITY_LABELS[row.tokenSecurity.status].tone}>{row.tokenSecurity.honeypot ? 'HONEYPOT-GYANÚ' : SECURITY_LABELS[row.tokenSecurity.status].text}</Status> : '—'}{(row.tokenSecurity?.blockers ?? []).length ? <small className="sfield-help" style={{ display: 'block' }}>{launchReasons(row.tokenSecurity.blockers).join(', ')}</small> : null}</td>
+            <td><Status tone={outcome.tone}>{outcome.text}</Status>{(row.safetyBlockers ?? []).length ? <small className="sfield-help" style={{ display: 'block' }}>{launchReasons(row.safetyBlockers).join(', ')}</small> : row.executionReason ? <small className="sfield-help" style={{ display: 'block' }}>{launchReasons(String(row.executionReason).split(/[,:]\s*/).filter(Boolean)).join(', ')}</small> : null}</td>
+            <td>{row.trade ? <><Link className="table-link" href={`/positions/${row.trade.positionId}`}>{row.trade.status === 'OPEN' ? 'nyitott' : 'lezárt'}</Link>{row.trade.netPnl != null ? <small className={row.trade.netPnl >= 0 ? 'positive-value' : 'negative-value'} style={{ display: 'block' }}>{usd(row.trade.netPnl)}</small> : null}<small className="sfield-help" style={{ display: 'block' }}>{row.trade.modelVersion}</small></> : 'nincs'}</td>
           </tr>;
         })}
       </DataTable>}

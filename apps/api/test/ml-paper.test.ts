@@ -123,6 +123,15 @@ describe('ML PAPER strategy API', () => {
     await prisma.botConfig.update({ where: { userId: ids.admin }, data: { tradingMode: 'PAPER' } });
   });
 
+  it('there is no setting that switches the fraud / honeypot protection off', async () => {
+    const admin = await login(adminEmail);
+    for (const body of [{ tokenSafetyChecksEnabled: false }, { tokenSafetyChecksEnabled: false, acknowledgeExperimentalMode: true }, { skipFraudProtection: true }]) {
+      expect((await admin.put('/api/settings/ml-paper').send({ strategyMode: 'ML', modelVersion: READY, ...body })).status).toBe(400);
+    }
+    const view = await admin.get('/api/settings/ml-paper');
+    expect(view.body.data).not.toHaveProperty('tokenSafetyChecksEnabled');
+  });
+
   it('9. revoking the approval stops ML entries without switching the user to buying with the rule strategy', async () => {
     const admin = await login(adminEmail);
     expect((await admin.delete(`/api/ml/models/${READY}/paper-approval`)).status).toBe(200);
@@ -157,6 +166,8 @@ describe('ML PAPER strategy API', () => {
     expect(response.body.data.strategies.ML).toMatchObject({ trades: 2, netPnl: 1, wins: 1, profitFactor: 1.5, maxDrawdownUsd: 2 });
     // ML strategy = ML entries + the common rule-based exit; SHADOW predictions are reported separately from PAPER results.
     expect(response.body.data.exitMode).toBe('RULE_BASED');
+    // ML BUY funnel: signals, fraud / honeypot blocks, market / risk blocks and opened positions are counted separately.
+    expect(response.body.data.mlFunnel).toMatchObject({ mlBuy: expect.any(Number), blockedByTokenSecurity: expect.any(Number), honeypotBlocked: expect.any(Number), positionsOpened: expect.any(Number) });
     expect(Array.isArray(response.body.data.shadowPredictions)).toBe(true);
     expect(response.body.data.byModel).toEqual([expect.objectContaining({ modelVersion: READY, trades: 2 })]);
     expect(response.body.data.training.label).toMatch(/SHADOW TRAINING DATA/);

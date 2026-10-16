@@ -5,7 +5,7 @@ import { describe, expect, it } from 'vitest';
 
 import {
   buildMlDataset, buildMlFeatureSnapshot, classifyMlProbability, computeCandidateOutcome, DEFAULT_NEW_LAUNCH_SETTINGS, evaluateNewLaunch, ML_PAPER_POINT_TOLERANCE_MS,
-  ML_IGNORED_DEFAULT_FILTERS, ML_PERMANENT_BLOCKERS, ML_STRATEGY_ONLY_REASONS, mlBuyWindowOpen, mlRiskConviction, mlDecisionTiming, mlEntrySafetyBlockers, newOutcomePath, recordPathPoint,
+  ML_IGNORED_DEFAULT_FILTERS, ML_PERMANENT_BLOCKERS, ML_STRATEGY_ONLY_REASONS, mlBuyWindowOpen, mlRiskConviction, ML_FRAUD_PROTECTION_CODES, ML_PAPER_THRESHOLD_MIN, mlBlockerCategory, mlTokenSecurityCheck, mlDecisionTiming, mlEntrySafetyBlockers, newOutcomePath, recordPathPoint,
   type LaunchObservation, type LaunchSecurity, type MlDatasetSourceRow,
 } from '../src/index.js';
 
@@ -117,6 +117,52 @@ describe('ML-only mode: DEFAULT strategy preferences never veto an ML BUY', () =
     // Missing / invalid probability never passes (NaN fails every minimum).
     expect(Number.isNaN(mlRiskConviction(null, 0.3).signalScore)).toBe(true);
     expect(mlRiskConviction(0.9, 2).minimumSignalScore).toBe(90);
+  });
+});
+
+describe('Fraud / honeypot protection: a separate, mandatory security decision', () => {
+  const quiet = { liquidityChange: 0, creatorSoldRatio: 0 };
+
+  it('a safe token passes', () => {
+    expect(mlTokenSecurityCheck(safe, quiet, 40)).toEqual({ status: 'PASSED', blockers: [], honeypot: false });
+  });
+
+  it('honeypot evidence (sell check failed / risk engine SELL_BLOCKED) blocks and is flagged as honeypot', () => {
+    expect(mlTokenSecurityCheck({ ...safe, sellability: 'FAILED' }, quiet, 40)).toMatchObject({ status: 'BLOCKED', honeypot: true, blockers: expect.arrayContaining(['SELLABILITY_FAILED']) });
+    expect(mlTokenSecurityCheck(safe, quiet, 40, ['SELL_BLOCKED'])).toMatchObject({ status: 'BLOCKED', honeypot: true, blockers: ['SELL_BLOCKED'] });
+  });
+
+  it('unknown sellability is never safe and has its own code (not the failed-check code)', () => {
+    const unknown = mlTokenSecurityCheck({ ...safe, sellability: 'NOT_VERIFIED' }, quiet, 40);
+    expect(unknown).toEqual({ status: 'UNVERIFIED', blockers: ['SELLABILITY_NOT_VERIFIED'], honeypot: false });
+    expect(mlTokenSecurityCheck({ ...safe, mintAuthorityRevoked: null, rpcUnavailable: true }, quiet, 40)).toMatchObject({ status: 'UNVERIFIED', blockers: ['RPC_SECURITY_DATA_UNAVAILABLE'] });
+  });
+
+  it('authorities, Token-2022 restrictions and rug-pull signals block', () => {
+    expect(mlTokenSecurityCheck({ ...safe, freezeAuthorityRevoked: false }, quiet, 40).blockers).toContain('FREEZE_AUTHORITY_ACTIVE');
+    expect(mlTokenSecurityCheck({ ...safe, mintAuthorityRevoked: false }, quiet, 40).blockers).toContain('MINT_AUTHORITY_ACTIVE');
+    expect(mlTokenSecurityCheck({ ...safe, tokenProgram: 'spl-token-2022', extensions: ['permanentDelegate'] }, quiet, 40).blockers).toContain('CRITICAL_TOKEN_EXTENSION');
+    expect(mlTokenSecurityCheck({ ...safe, tokenProgram: 'spl-token-2022', extensions: ['transferFeeConfig'] }, quiet, 40).blockers).toContain('UNSUPPORTED_TRANSFER_RESTRICTION');
+    expect(mlTokenSecurityCheck(safe, { liquidityChange: 0, creatorSoldRatio: 0.7 }, 40).blockers).toContain('CREATOR_SELLING');
+    expect(mlTokenSecurityCheck(safe, { liquidityChange: -55, creatorSoldRatio: 0 }, 40).blockers).toContain('CRITICAL_LIQUIDITY');
+    expect(mlTokenSecurityCheck({ ...safe, hardBlockReasons: ['KNOWN_SCAM_MINT'] }, quiet, 40).blockers).toContain('KNOWN_SCAM_MINT');
+  });
+
+  it('no model score or minimum threshold overrides it: the blockers do not depend on the ML probability', () => {
+    expect(classifyMlProbability(ML_PAPER_THRESHOLD_MIN, ML_PAPER_THRESHOLD_MIN)).toBe('ML_BUY');
+    const { blockers } = blockersFor({ ...safe, sellability: 'FAILED' }, 10);
+    expect(blockers).toEqual(expect.arrayContaining(['SELLABILITY_FAILED']));
+    expect(ML_PERMANENT_BLOCKERS.has('SELLABILITY_FAILED')).toBe(true);
+    expect(ML_PERMANENT_BLOCKERS.has('SELL_BLOCKED')).toBe(true);
+  });
+
+  it('blocker categories: token security vs market / execution vs risk; DEFAULT strategy codes are not ML blockers', () => {
+    expect(mlBlockerCategory('SELLABILITY_FAILED')).toBe('TOKEN_SECURITY');
+    expect(mlBlockerCategory('KNOWN_SCAM_MINT', ['KNOWN_SCAM_MINT'])).toBe('TOKEN_SECURITY');
+    expect(mlBlockerCategory('LIQUIDITY_BELOW_MINIMUM')).toBe('MARKET_EXECUTION');
+    expect(mlBlockerCategory('MARKET_PRICE_UNKNOWN')).toBe('MARKET_EXECUTION');
+    expect(mlBlockerCategory('RISK_SCORE_ABOVE_LAUNCH_MAXIMUM')).toBe('RISK');
+    for (const code of ML_IGNORED_DEFAULT_FILTERS) expect(ML_FRAUD_PROTECTION_CODES.has(code)).toBe(false);
   });
 });
 

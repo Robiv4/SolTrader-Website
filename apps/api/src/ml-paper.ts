@@ -15,7 +15,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { Prisma, type PrismaClient } from '@prisma/client';
-import { ML_FEATURE_VERSION, ML_PAPER_SNAPSHOT_POINTS, ML_PAPER_THRESHOLD_MAX, ML_PAPER_THRESHOLD_MIN, ML_PAPER_WINDOW_MAX_SECONDS } from '@soltrader/strategy-engine';
+import { ML_FEATURE_VERSION, ML_HONEYPOT_CODES, ML_PAPER_SNAPSHOT_POINTS, ML_PAPER_THRESHOLD_MAX, ML_PAPER_THRESHOLD_MIN, ML_PAPER_WINDOW_MAX_SECONDS, mlBlockerCategory } from '@soltrader/strategy-engine';
 import { type Request, type Response, Router } from 'express';
 import { z } from 'zod';
 
@@ -290,6 +290,30 @@ export function createMlPaperRouter(deps: MlPaperDeps) {
         select: { id: true, mint: true, modelVersion: true, decidedAt: true, snapshotKind: true, probability: true, threshold: true, mlDecision: true, errorReason: true, baseDecision: true, baseReasons: true, outcome: true, executionReason: true, safetyBlockers: true, positionId: true },
       });
 
+      // ML BUY funnel: signals -> blocked by fraud / honeypot protection -> blocked by market / risk / execution -> opened.
+      const mlBuys = await prisma.mlPaperDecision.findMany({ where: { userId, decidedAt: { gte: since }, mlDecision: 'ML_BUY' }, select: { outcome: true, safetyBlockers: true, executionReason: true } });
+      const blockersOf = (row: { safetyBlockers: unknown }) => (Array.isArray(row.safetyBlockers) ? row.safetyBlockers.map(String) : []);
+      const unresolvedByToken = (row: { outcome: string; safetyBlockers: unknown }) => (row.outcome === 'SAFETY_BLOCKED' || row.outcome === 'EXPIRED') && blockersOf(row).some((code) => mlBlockerCategory(code) === 'TOKEN_SECURITY');
+      const funnel = {
+        mlBuy: mlBuys.length,
+        signaled: mlBuys.filter((row) => ['SIGNALED', 'EXECUTED', 'EXECUTION_REJECTED'].includes(row.outcome)).length,
+        blockedByTokenSecurity: mlBuys.filter(unresolvedByToken).length,
+        honeypotBlocked: mlBuys.filter((row) => blockersOf(row).some((code) => ML_HONEYPOT_CODES.has(code))).length,
+        blockedByMarketOrRisk: mlBuys.filter((row) => (row.outcome === 'SAFETY_BLOCKED' || row.outcome === 'EXPIRED') && !unresolvedByToken(row)).length,
+        executionRejected: mlBuys.filter((row) => row.outcome === 'EXECUTION_REJECTED').length,
+        positionsOpened: mlBuys.filter((row) => row.outcome === 'EXECUTED').length,
+        pending: mlBuys.filter((row) => row.outcome === 'PENDING').length,
+      };
+      // Position / P&L of executed ML decisions (model version recorded on the trade).
+      const decisionTrades = await prisma.trade.findMany({ where: { userId, mlPaperDecisionId: { in: recentDecisions.map((item) => item.id) } }, select: { id: true, mlPaperDecisionId: true, mlModelVersion: true, positionId: true, status: true, netPnl: true, exitReason: true } });
+      const tradeByDecision = new Map(decisionTrades.map((trade) => [trade.mlPaperDecisionId, { id: trade.id, positionId: trade.positionId, modelVersion: trade.mlModelVersion, status: trade.status, netPnl: num(trade.netPnl), exitReason: trade.exitReason }]));
+      const tokenSecurityOf = (item: { mlDecision: string; outcome: string; safetyBlockers: unknown }) => {
+        if (item.mlDecision !== 'ML_BUY') return { status: 'NOT_CHECKED', blockers: [] as string[], honeypot: false };
+        const tokenBlockers = blockersOf(item).filter((code) => mlBlockerCategory(code) === 'TOKEN_SECURITY');
+        if (tokenBlockers.length) return { status: 'BLOCKED', blockers: tokenBlockers, honeypot: tokenBlockers.some((code) => ML_HONEYPOT_CODES.has(code)) };
+        return { status: ['SIGNALED', 'EXECUTED', 'EXECUTION_REJECTED'].includes(item.outcome) ? 'PASSED' : 'PENDING', blockers: [] as string[], honeypot: false };
+      };
+
       // Training data (SHADOW collection; all candidates, independent of the active strategy).
       const [snapshotKinds, outcomes, validity, lastDataset, mlTradesClosed] = await Promise.all([
         prisma.mlFeatureSnapshot.groupBy({ by: ['kind'], _count: { _all: true } }),
@@ -321,7 +345,8 @@ export function createMlPaperRouter(deps: MlPaperDeps) {
         shadowPredictions: shadowGroups.map((item) => ({ modelVersion: item.modelVersion, predictedClass: item.predictedClass, count: item._count._all })),
         decisions: decisionGroups.map((item) => ({ modelVersion: item.modelVersion, mlDecision: item.mlDecision, count: item._count._all })),
         mlBuyOutcomes: Object.fromEntries(outcomeGroups.map((item) => [item.outcome, item._count._all])),
-        recentDecisions: recentDecisions.map((item) => ({ ...item, probability: num(item.probability), threshold: num(item.threshold) })),
+        recentDecisions: recentDecisions.map((item) => ({ ...item, probability: num(item.probability), threshold: num(item.threshold), tokenSecurity: tokenSecurityOf(item), trade: tradeByDecision.get(item.id) ?? null })),
+        mlFunnel: funnel,
         training: {
           label: 'SHADOW TRAINING DATA (all New Launch candidates, independent of the active strategy)',
           snapshots: Object.fromEntries(snapshotKinds.map((item) => [item.kind, item._count._all])),
