@@ -23,8 +23,6 @@ interface TradeRow {
   tokenAddress: string | null;
   decisionSource: string | null;
   strategyName: string | null;
-  /** ML entries: false = opened without token-security vetoes (experimental PAPER trade). */
-  mlTokenSafetyChecks?: boolean | null;
   entry: Numeric;
   exit: Numeric;
   size: Numeric;
@@ -166,7 +164,7 @@ export default function TradesPage() {
                 <td>
                   <Link className="nl-token" href={`/trades/${row.id}`} onClick={(event) => event.stopPropagation()} title={row.tokenAddress ?? undefined}>
                     <TokenAvatar address={row.tokenAddress ?? row.id} symbol={row.symbol ?? row.tokenAddress ?? '?'} size={26} />
-                    <span className="nl-token-text"><strong>{symbolOf(row)}{row.mlTokenSafetyChecks === false ? <span className="exp-badge" title="Tokenbiztonsági ellenőrzések nélkül nyitott ML PAPER trade">KÍSÉRLETI</span> : null}</strong><small>{sourceLabel(row)}{row.tokenAddress ? ` · ${shortAddress(row.tokenAddress)}` : ''}</small></span>
+                    <span className="nl-token-text"><strong>{symbolOf(row)}</strong><small>{sourceLabel(row)}{row.tokenAddress ? ` · ${shortAddress(row.tokenAddress)}` : ''}</small></span>
                   </Link>
                 </td>
                 <td className="num mono">{formatTokenPrice(num(row.entry))}</td>
@@ -186,7 +184,7 @@ export default function TradesPage() {
             const pnl = num(row.netPnl);
             return <button type="button" key={row.id} className="nl-mobile" onClick={() => router.push(`/trades/${row.id}`)}>
               <span className="nl-mobile-head">
-                <span className="nl-token"><TokenAvatar address={row.tokenAddress ?? row.id} symbol={row.symbol ?? row.tokenAddress ?? '?'} size={26} /><span className="nl-token-text"><strong>{symbolOf(row)}{row.mlTokenSafetyChecks === false ? <span className="exp-badge" title="Tokenbiztonsági ellenőrzések nélkül nyitott ML PAPER trade">KÍSÉRLETI</span> : null}</strong><small>{sourceLabel(row)} · {new Date(timeOf(row)).toLocaleString('hu-HU', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })}</small></span></span>
+                <span className="nl-token"><TokenAvatar address={row.tokenAddress ?? row.id} symbol={row.symbol ?? row.tokenAddress ?? '?'} size={26} /><span className="nl-token-text"><strong>{symbolOf(row)}</strong><small>{sourceLabel(row)} · {new Date(timeOf(row)).toLocaleString('hu-HU', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })}</small></span></span>
                 {row.status === 'OPEN' ? <StatusBadge tone="info">NYITOTT</StatusBadge> : <StatusBadge tone={pnl === null || pnl === 0 ? 'neutral' : pnl > 0 ? 'positive' : 'negative'}>{formatSignedPercent(pnlPercentOf(row), 1)}</StatusBadge>}
               </span>
               <span className="nl-mobile-grid">

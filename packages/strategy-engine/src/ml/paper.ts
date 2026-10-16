@@ -7,7 +7,7 @@
  * made exactly once, at that point, from the features known at that moment; it is never re-made later with newer data
  * and never back-dated. An entry may follow only after the decision (inside a short window, safety re-checked).
  */
-import type { LaunchSecurity, NewLaunchSettings, NewLaunchStrategyResult } from '../launch/index.js';
+import { evaluateLaunchSecurityBlocks, type LaunchSecurity, type NewLaunchSettings, type NewLaunchStrategyResult } from '../launch/index.js';
 
 /** Snapshot kinds an ML PAPER model may be trained on, with their prediction point (ms after detection). */
 export const ML_PAPER_SNAPSHOT_POINTS: Record<string, number> = { AGE_15S: 15_000, AGE_30S: 30_000, AGE_60S: 60_000 };
@@ -71,28 +71,76 @@ export interface MlEntrySafetyInput {
 }
 
 /**
+ * Fraud / honeypot protection of an ML BUY (mandatory in every mode; no setting, model score or threshold overrides it).
+ *
+ * A separate, documented security decision built only from the existing, verifiable token-security rules - never a
+ * single score, and no single soft indicator is treated as fraud on its own:
+ *  - SELLABILITY_FAILED        the sell check ran and failed (honeypot evidence)
+ *  - SELL_BLOCKED              the risk engine's sell check reported "cannot sell" (honeypot evidence)
+ *  - SELLABILITY_NOT_VERIFIED  sellability not proven yet (unknown is never "safe"; separate code from a failed check)
+ *  - MINT_AUTHORITY_ACTIVE     the creator can still mint (supply dilution / rug)
+ *  - FREEZE_AUTHORITY_ACTIVE   the creator can freeze holder accounts (honeypot mechanism)
+ *  - CRITICAL_TOKEN_EXTENSION / UNSUPPORTED_TRANSFER_RESTRICTION  Token-2022 transfer hooks, permanent delegate,
+ *                              non-transferable / paused tokens, transfer fees (sell can be blocked or taxed)
+ *  - CREATOR_SELLING           the creator dumped >= 50% of its holding (rug pull)
+ *  - CRITICAL_LIQUIDITY        critical liquidity drain (rug pull)
+ *  - SECURITY_CHECK_PENDING / RPC_SECURITY_DATA_UNAVAILABLE  authorities / token program unknown (fail closed)
+ *  - any hard block reported by the token security lookup itself
+ */
+export const ML_FRAUD_PROTECTION_CODES = new Set([
+  'SELLABILITY_FAILED', 'SELL_BLOCKED', 'SELLABILITY_NOT_VERIFIED', 'MINT_AUTHORITY_ACTIVE', 'FREEZE_AUTHORITY_ACTIVE',
+  'CRITICAL_TOKEN_EXTENSION', 'UNSUPPORTED_TRANSFER_RESTRICTION', 'CREATOR_SELLING', 'CRITICAL_LIQUIDITY',
+  'SECURITY_CHECK_PENDING', 'RPC_SECURITY_DATA_UNAVAILABLE',
+]);
+/** Honeypot evidence (a sell check actually failed), shown separately from "not yet verified". */
+export const ML_HONEYPOT_CODES = new Set(['SELLABILITY_FAILED', 'SELL_BLOCKED']);
+
+export type MlTokenSecurityStatus = 'PASSED' | 'BLOCKED' | 'UNVERIFIED';
+export type MlBlockerCategory = 'TOKEN_SECURITY' | 'MARKET_EXECUTION' | 'RISK';
+
+/** Which mandatory layer a blocker belongs to (DEFAULT strategy filters are never ML blockers). */
+export function mlBlockerCategory(code: string, securityHardBlocks: readonly string[] = []): MlBlockerCategory {
+  if (ML_FRAUD_PROTECTION_CODES.has(code) || securityHardBlocks.includes(code)) return 'TOKEN_SECURITY';
+  if (code.startsWith('RISK_') || code === 'RISK_NOT_CLASSIFIED') return 'RISK';
+  return 'MARKET_EXECUTION';
+}
+
+/** Mandatory fraud / honeypot decision for a token (see ML_FRAUD_PROTECTION_CODES). */
+export function mlTokenSecurityCheck(security: LaunchSecurity, features: Pick<NewLaunchStrategyResult['features'], 'liquidityChange' | 'creatorSoldRatio'>, liquidityCriticalPercent: number, riskHardBlocks: readonly string[] = []) {
+  const blockers = new Set<string>(evaluateLaunchSecurityBlocks(security));
+  for (const reason of riskHardBlocks) if (ML_HONEYPOT_CODES.has(reason)) blockers.add(reason);
+  if (security.sellability === 'FAILED') blockers.add('SELLABILITY_FAILED');
+  else if (security.sellability !== 'VERIFIED') blockers.add('SELLABILITY_NOT_VERIFIED');
+  if (security.mintAuthorityRevoked === null || security.freezeAuthorityRevoked === null || security.tokenProgram === null) blockers.add(security.rpcUnavailable ? 'RPC_SECURITY_DATA_UNAVAILABLE' : 'SECURITY_CHECK_PENDING');
+  if (security.mintAuthorityRevoked === false) blockers.add('MINT_AUTHORITY_ACTIVE');
+  if (features.liquidityChange !== null && features.liquidityChange <= -liquidityCriticalPercent) blockers.add('CRITICAL_LIQUIDITY');
+  if (features.creatorSoldRatio !== null && features.creatorSoldRatio >= 0.5) blockers.add('CREATOR_SELLING');
+  const list = [...blockers];
+  // UNVERIFIED: only "not yet known" reasons (may still clear inside the decision window); BLOCKED: real evidence.
+  const pendingOnly = list.length > 0 && list.every((code) => code === 'SELLABILITY_NOT_VERIFIED' || code === 'SECURITY_CHECK_PENDING' || code === 'RPC_SECURITY_DATA_UNAVAILABLE');
+  const status: MlTokenSecurityStatus = list.length === 0 ? 'PASSED' : pendingOnly ? 'UNVERIFIED' : 'BLOCKED';
+  return { status, blockers: list, honeypot: list.some((code) => ML_HONEYPOT_CODES.has(code)) };
+}
+
+/**
  * Mandatory checks for an ML BUY (empty list = may proceed to PAPER execution, which applies position size, open
  * position, daily loss, emergency stop and exit-capacity limits on top). Unknown data never counts as safe.
  *
- * Only security, rug-pull, risk and market-data facts are read from `result` (its features and hard blocks); the
- * DEFAULT strategy's decision, scores and timing settings are never consulted (see ML_IGNORED_DEFAULT_FILTERS).
+ * Three layers, nothing else: (1) fraud / honeypot protection (mlTokenSecurityCheck), (2) market / execution data
+ * (price, liquidity, price impact, risk-engine market hard blocks), (3) risk limits. The DEFAULT strategy's decision,
+ * scores, activity thresholds, timing settings and optional filters are never consulted (see ML_IGNORED_DEFAULT_FILTERS).
  */
 export function mlEntrySafetyBlockers(input: MlEntrySafetyInput): string[] {
   const { result, security, settings } = input;
   const f = result.features;
-  // Security (sellability failed, freeze authority, critical / transfer-fee extensions) + risk-engine hard blocks.
-  const blockers = new Set<string>([...result.hardBlockReasons, ...input.riskHardBlockReasons]);
-  if (security.sellability === 'FAILED') blockers.add('SELLABILITY_FAILED');
-  if (security.sellability !== 'VERIFIED') blockers.add('SELLABILITY_NOT_VERIFIED');
-  if (security.mintAuthorityRevoked === null || security.freezeAuthorityRevoked === null || security.tokenProgram === null) blockers.add(security.rpcUnavailable ? 'RPC_SECURITY_DATA_UNAVAILABLE' : 'SECURITY_CHECK_PENDING');
-  if (security.mintAuthorityRevoked === false) blockers.add('MINT_AUTHORITY_ACTIVE');
-  // Rug-pull signals.
-  if (f.liquidityChange !== null && f.liquidityChange <= -settings.liquidityCriticalPercent) blockers.add('CRITICAL_LIQUIDITY');
-  if (f.creatorSoldRatio !== null && f.creatorSoldRatio >= 0.5) blockers.add('CREATOR_SELLING');
-  // Risk.
+  // (1) Fraud / honeypot protection.
+  const blockers = new Set<string>(mlTokenSecurityCheck(security, f, settings.liquidityCriticalPercent, input.riskHardBlockReasons).blockers);
+  // Hard blocks of the security lookup and the risk engine (market data, pool, route, pricing, extreme impact).
+  for (const reason of [...result.hardBlockReasons, ...input.riskHardBlockReasons]) blockers.add(reason);
+  // (3) Risk.
   if (input.riskScore === null) blockers.add('RISK_NOT_ASSESSED');
   else if (input.riskScore > settings.maxRiskScore) blockers.add('RISK_SCORE_ABOVE_LAUNCH_MAXIMUM');
-  // Valid market data, liquidity and price impact (fail-closed on unknown values).
+  // (2) Valid market data, liquidity and price impact (fail-closed on unknown values).
   if (f.priceUsd === null || !(f.priceUsd > 0)) blockers.add('MARKET_PRICE_UNKNOWN');
   if (f.liquidityUsd === null || f.liquidityUsd < settings.minLiquidityUsd) blockers.add('LIQUIDITY_BELOW_MINIMUM');
   if (f.estimatedPriceImpact === null) blockers.add('PRICE_IMPACT_UNKNOWN');
@@ -100,31 +148,8 @@ export function mlEntrySafetyBlockers(input: MlEntrySafetyInput): string[] {
   return [...blockers];
 }
 
-/**
- * Token-security blockers (token contract / authority / sellability / rug-pull facts). Only these may be switched off by
- * the user's experimental "token-security checks OFF" ML PAPER mode. Market data, price, liquidity, price impact, risk and
- * every account / execution limit stay mandatory in every mode.
- */
-export const ML_TOKEN_SAFETY_BLOCKERS = new Set([
-  'SELLABILITY_FAILED', 'SELLABILITY_NOT_VERIFIED', 'SECURITY_CHECK_PENDING', 'RPC_SECURITY_DATA_UNAVAILABLE',
-  'MINT_AUTHORITY_ACTIVE', 'FREEZE_AUTHORITY_ACTIVE', 'CRITICAL_TOKEN_EXTENSION', 'UNSUPPORTED_TRANSFER_RESTRICTION',
-  'CREATOR_SELLING', 'CRITICAL_LIQUIDITY', 'SELL_BLOCKED',
-]);
-
-/**
- * Splits ML BUY blockers by the user's token-security setting. With checks ON everything is enforced (unchanged). With
- * checks OFF the token-security blockers (incl. any hard block reported by the token security lookup itself) are only
- * returned as `ignored` warnings; everything else stays enforced.
- */
-export function applyTokenSafetySetting(blockers: string[], tokenSafetyChecksEnabled: boolean, securityHardBlocks: string[] = []) {
-  if (tokenSafetyChecksEnabled) return { enforced: blockers, ignored: [] as string[] };
-  const securityOrigin = new Set(securityHardBlocks);
-  const isTokenSafety = (reason: string) => ML_TOKEN_SAFETY_BLOCKERS.has(reason) || securityOrigin.has(reason);
-  return { enforced: blockers.filter((reason) => !isTokenSafety(reason)), ignored: blockers.filter(isTokenSafety) };
-}
-
 /** Blockers that can never clear later for this candidate (the ML BUY is resolved as SAFETY_BLOCKED at once). */
-export const ML_PERMANENT_BLOCKERS = new Set(['SELLABILITY_FAILED', 'CRITICAL_LIQUIDITY', 'CREATOR_SELLING', 'FREEZE_AUTHORITY_ACTIVE', 'CRITICAL_TOKEN_EXTENSION', 'UNSUPPORTED_TRANSFER_RESTRICTION']);
+export const ML_PERMANENT_BLOCKERS = new Set(['SELLABILITY_FAILED', 'SELL_BLOCKED', 'CRITICAL_LIQUIDITY', 'CREATOR_SELLING', 'FREEZE_AUTHORITY_ACTIVE', 'CRITICAL_TOKEN_EXTENSION', 'UNSUPPORTED_TRANSFER_RESTRICTION']);
 
 /**
  * Strategic conviction of an ML entry for the central risk decision: the model probability (0-100) against the approved

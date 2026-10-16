@@ -123,25 +123,13 @@ describe('ML PAPER strategy API', () => {
     await prisma.botConfig.update({ where: { userId: ids.admin }, data: { tradingMode: 'PAPER' } });
   });
 
-  it('token-security checks: default ON, switching OFF needs an explicit acknowledgement, persisted and audited; LIVE stays refused (9 / 11 / 12)', async () => {
+  it('there is no setting that switches the fraud / honeypot protection off', async () => {
     const admin = await login(adminEmail);
+    for (const body of [{ tokenSafetyChecksEnabled: false }, { tokenSafetyChecksEnabled: false, acknowledgeExperimentalMode: true }, { skipFraudProtection: true }]) {
+      expect((await admin.put('/api/settings/ml-paper').send({ strategyMode: 'ML', modelVersion: READY, ...body })).status).toBe(400);
+    }
     const view = await admin.get('/api/settings/ml-paper');
-    expect(view.body.data.tokenSafetyChecksEnabled).toBe(true);
-    // No acknowledgement -> refused, nothing stored.
-    expect((await admin.put('/api/settings/ml-paper').send({ strategyMode: 'ML', modelVersion: READY, tokenSafetyChecksEnabled: false })).status).toBe(400);
-    expect(await prisma.mlPaperSettings.findUniqueOrThrow({ where: { userId: ids.admin } })).toMatchObject({ tokenSafetyChecksEnabled: true });
-    // Explicit acknowledgement -> stored (survives restarts: it is a DB column read by the worker every cycle).
-    expect((await admin.put('/api/settings/ml-paper').send({ strategyMode: 'ML', modelVersion: READY, tokenSafetyChecksEnabled: false, acknowledgeExperimentalMode: true })).status).toBe(200);
-    expect(await prisma.mlPaperSettings.findUniqueOrThrow({ where: { userId: ids.admin } })).toMatchObject({ tokenSafetyChecksEnabled: false });
-    expect((await admin.get('/api/settings/ml-paper')).body.data.tokenSafetyChecksEnabled).toBe(false);
-    expect(await prisma.auditLog.count({ where: { userId: ids.admin, action: 'ml_paper_token_safety_disabled' } })).toBe(1);
-    // The experimental mode never unlocks LIVE trading.
-    expect((await admin.post('/api/safety/live/enable').send({ confirmLiveTrading: true })).status).toBe(409);
-    expect(await prisma.botConfig.findUniqueOrThrow({ where: { userId: ids.admin } })).toMatchObject({ tradingMode: 'PAPER', isLiveEnabled: false });
-    // Switching back ON needs no extra confirmation.
-    expect((await admin.put('/api/settings/ml-paper').send({ strategyMode: 'ML', modelVersion: READY, tokenSafetyChecksEnabled: true })).status).toBe(200);
-    expect(await prisma.mlPaperSettings.findUniqueOrThrow({ where: { userId: ids.admin } })).toMatchObject({ tokenSafetyChecksEnabled: true });
-    expect(await prisma.auditLog.count({ where: { userId: ids.admin, action: 'ml_paper_token_safety_enabled' } })).toBe(1);
+    expect(view.body.data).not.toHaveProperty('tokenSafetyChecksEnabled');
   });
 
   it('9. revoking the approval stops ML entries without switching the user to buying with the rule strategy', async () => {
@@ -178,9 +166,8 @@ describe('ML PAPER strategy API', () => {
     expect(response.body.data.strategies.ML).toMatchObject({ trades: 2, netPnl: 1, wins: 1, profitFactor: 1.5, maxDrawdownUsd: 2 });
     // ML strategy = ML entries + the common rule-based exit; SHADOW predictions are reported separately from PAPER results.
     expect(response.body.data.exitMode).toBe('RULE_BASED');
-    // ML PAPER with and without token-security checks are reported separately (old ML trades count as checks ON).
-    expect(response.body.data.mlBySafetyMode.WITH_TOKEN_SAFETY).toMatchObject({ trades: 2 });
-    expect(response.body.data.mlBySafetyMode.WITHOUT_TOKEN_SAFETY).toMatchObject({ trades: 0 });
+    // ML BUY funnel: signals, fraud / honeypot blocks, market / risk blocks and opened positions are counted separately.
+    expect(response.body.data.mlFunnel).toMatchObject({ mlBuy: expect.any(Number), blockedByTokenSecurity: expect.any(Number), honeypotBlocked: expect.any(Number), positionsOpened: expect.any(Number) });
     expect(Array.isArray(response.body.data.shadowPredictions)).toBe(true);
     expect(response.body.data.byModel).toEqual([expect.objectContaining({ modelVersion: READY, trades: 2 })]);
     expect(response.body.data.training.label).toMatch(/SHADOW TRAINING DATA/);

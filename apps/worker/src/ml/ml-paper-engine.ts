@@ -27,22 +27,18 @@ export interface MlPaperUserConfig {
   modelVersion: string | null;
   buyThreshold: number;
   decisionWindowSeconds: number;
-  /** Token-security vetoes before an ML BUY (default true). false = experimental PAPER-only mode. */
-  tokenSafetyChecksEnabled: boolean;
 }
 
-export const DEFAULT_ML_PAPER_CONFIG: MlPaperUserConfig = { mode: 'DEFAULT', modelVersion: null, buyThreshold: 0.7, decisionWindowSeconds: 10, tokenSafetyChecksEnabled: true };
+export const DEFAULT_ML_PAPER_CONFIG: MlPaperUserConfig = { mode: 'DEFAULT', modelVersion: null, buyThreshold: 0.7, decisionWindowSeconds: 10 };
 
 /** Normalises a MlPaperSettings row (missing row = DEFAULT strategy). */
-export function toMlPaperConfig(row: { strategyMode: string; modelVersion: string | null; buyThreshold: unknown; decisionWindowSeconds: number; tokenSafetyChecksEnabled?: boolean | null } | null | undefined): MlPaperUserConfig {
+export function toMlPaperConfig(row: { strategyMode: string; modelVersion: string | null; buyThreshold: unknown; decisionWindowSeconds: number } | null | undefined): MlPaperUserConfig {
   if (!row) return DEFAULT_ML_PAPER_CONFIG;
   return {
     mode: row.strategyMode === 'ML' ? 'ML' : 'DEFAULT',
     modelVersion: row.modelVersion,
     buyThreshold: Number(row.buyThreshold),
     decisionWindowSeconds: row.decisionWindowSeconds,
-    // Only an explicit false turns the checks off (missing / unknown = checks ON).
-    tokenSafetyChecksEnabled: row.tokenSafetyChecksEnabled !== false,
   };
 }
 
@@ -173,18 +169,15 @@ export interface MlPaperStepInput {
   buildFeatures: () => MlFeatureSnapshotResult | null;
   /** ML eligibility: a real price and at least two trades (same rule as the SHADOW collection). */
   eligible: (snapshot: MlFeatureSnapshotResult) => boolean;
-  /**
-   * Mandatory safety blockers at this tick (empty = safe to hand to PAPER execution). With token-security checks OFF the
-   * caller returns the token-security blockers separately as `ignored` (recorded as warnings, never enforced).
-   */
-  safetyBlockers: (tokenSafetyChecksEnabled: boolean) => string[] | { enforced: string[]; ignored: string[] };
+  /** Mandatory safety blockers at this tick (empty = safe to hand to PAPER execution). */
+  safetyBlockers: () => string[];
   /** Rule-based decision at the same moment (comparison only). */
   base: { decision: string; reasons: string[] };
 }
 
 export type MlPaperStepResult =
   | { action: 'NONE' }
-  | { action: 'SIGNAL'; decisionId: string; modelVersion: string; probability: number; threshold: number; snapshotKind: string; snapshotAt: number; featureHash: string; tokenSafetyChecksEnabled: boolean; ignoredSafetyBlockers: string[] };
+  | { action: 'SIGNAL'; decisionId: string; modelVersion: string; probability: number; threshold: number; snapshotKind: string; snapshotAt: number; featureHash: string };
 
 interface DecisionMemory {
   decisionId: string;
@@ -198,9 +191,6 @@ interface DecisionMemory {
   featureHash: string;
   resolved: boolean;
   lastBlockers: string[];
-  /** Token-security checks in force when the decision was made. */
-  tokenSafetyChecksEnabled: boolean;
-  lastIgnored: string[];
 }
 
 export interface MlPaperEngineDeps {
@@ -240,20 +230,13 @@ export class MlPaperEntryEngine {
     if (!mlBuyWindowOpen(memory.decidedAt, input.config.decisionWindowSeconds, input.now)) {
       return this.resolve(key, memory, 'EXPIRED', memory.lastBlockers.length ? `WINDOW_EXPIRED: ${memory.lastBlockers.join(',')}` : 'WINDOW_EXPIRED', input.now, memory.lastBlockers);
     }
-    // The stricter setting wins: checks turned back ON while an ML BUY is pending apply at once.
-    const tokenSafety = memory.tokenSafetyChecksEnabled || input.config.tokenSafetyChecksEnabled;
-    const raw = input.safetyBlockers(tokenSafety);
-    const { enforced: blockers, ignored } = Array.isArray(raw) ? { enforced: raw, ignored: [] as string[] } : raw;
-    memory.lastIgnored = tokenSafety ? [] : ignored;
+    const blockers = input.safetyBlockers();
     if (blockers.some((reason) => ML_PERMANENT_BLOCKERS.has(reason))) return this.resolve(key, memory, 'SAFETY_BLOCKED', blockers.join(','), input.now, blockers);
     if (blockers.length) {
       memory.lastBlockers = blockers;
       return { action: 'NONE' };
     }
-    return {
-      action: 'SIGNAL', decisionId: memory.decisionId, modelVersion: memory.modelVersion, probability: memory.probability ?? 0, threshold: memory.threshold,
-      snapshotKind: memory.snapshotKind, snapshotAt: memory.snapshotAt, featureHash: memory.featureHash, tokenSafetyChecksEnabled: tokenSafety, ignoredSafetyBlockers: memory.lastIgnored,
-    };
+    return { action: 'SIGNAL', decisionId: memory.decisionId, modelVersion: memory.modelVersion, probability: memory.probability ?? 0, threshold: memory.threshold, snapshotKind: memory.snapshotKind, snapshotAt: memory.snapshotAt, featureHash: memory.featureHash };
   }
 
   /** The BUY signal for an ML BUY was created (PAPER execution decides the rest). */
@@ -267,11 +250,7 @@ export class MlPaperEntryEngine {
     }
     memory.resolved = true;
     this.metrics.signaled += 1;
-    await this.write(() => this.deps.prisma.mlPaperDecision.update({ where: { id: memory.decisionId }, data: {
-      outcome: 'SIGNALED', signalId, safetyPassed: true, safetyBlockers: [], resolvedAt: new Date(now),
-      // Experimental mode: which token-security blockers were present but not enforced (warnings, audit trail).
-      ...(memory.lastIgnored.length ? { ignoredSafetyBlockers: memory.lastIgnored as Prisma.InputJsonValue } : {}),
-    } }));
+    await this.write(() => this.deps.prisma.mlPaperDecision.update({ where: { id: memory.decisionId }, data: { outcome: 'SIGNALED', signalId, safetyPassed: true, safetyBlockers: [], resolvedAt: new Date(now) } }));
   }
 
   private async resolve(key: string, memory: DecisionMemory, outcome: 'EXPIRED' | 'SAFETY_BLOCKED', reason: string, now: number, blockers: string[] = []): Promise<MlPaperStepResult> {
@@ -309,7 +288,6 @@ export class MlPaperEntryEngine {
       userId: input.userId, candidateId: await input.candidateId().catch(() => null), mint: input.mint, modelVersion: model?.version ?? input.config.modelVersion ?? 'NONE',
       featureVersion: ML_FEATURE_VERSION, snapshotKind: model?.snapshotKind ?? 'AGE_30S', detectedAt: new Date(input.detectedAt), decidedAt: new Date(input.now),
       threshold: new Prisma.Decimal(threshold.toFixed(3)), ...base,
-      tokenSafetyChecksEnabled: input.config.tokenSafetyChecksEnabled,
     };
     if (!model) {
       row = { ...common, ...empty, snapshotAt: new Date(input.now), mlDecision: 'ML_ERROR', errorReason: lookup.ok ? 'UNKNOWN' : lookup.reason, outcome: 'ERROR', resolvedAt: new Date(input.now) };
@@ -368,18 +346,16 @@ export class MlPaperEntryEngine {
       this.metrics.writeFailures += 1;
       this.deps.logger.warn({ mint: input.mint, err: error instanceof Error ? error.message.slice(0, 200) : String(error) }, 'ML PAPER decision could not be stored: no ML entry');
       // Not persisted -> never executed (an unaudited ML entry is not allowed).
-      return { decisionId: '', mlDecision: 'ML_ERROR', modelVersion: '', probability: null, threshold, snapshotKind: '', snapshotAt: input.now, decidedAt: input.now, featureHash: '', resolved: true, lastBlockers: [], tokenSafetyChecksEnabled: true, lastIgnored: [] };
+      return { decisionId: '', mlDecision: 'ML_ERROR', modelVersion: '', probability: null, threshold, snapshotKind: '', snapshotAt: input.now, decidedAt: input.now, featureHash: '', resolved: true, lastBlockers: [] };
     }
   }
 
-  private fromRow(row: { id: string; mlDecision: string; modelVersion: string; probability: unknown; threshold: unknown; snapshotKind: string; snapshotAt: Date; decidedAt: Date; featureHash: string; outcome: string; tokenSafetyChecksEnabled?: boolean | null }): DecisionMemory {
+  private fromRow(row: { id: string; mlDecision: string; modelVersion: string; probability: unknown; threshold: unknown; snapshotKind: string; snapshotAt: Date; decidedAt: Date; featureHash: string; outcome: string }): DecisionMemory {
     return {
       decisionId: row.id, mlDecision: row.mlDecision as DecisionMemory['mlDecision'], modelVersion: row.modelVersion,
       probability: row.probability === null || row.probability === undefined ? null : Number(row.probability), threshold: Number(row.threshold),
       snapshotKind: row.snapshotKind, snapshotAt: row.snapshotAt.getTime(), decidedAt: row.decidedAt.getTime(), featureHash: row.featureHash,
       resolved: row.mlDecision !== 'ML_BUY' || row.outcome !== 'PENDING', lastBlockers: [],
-      // Rows from before the setting existed (or unknown) count as checks ON.
-      tokenSafetyChecksEnabled: row.tokenSafetyChecksEnabled !== false, lastIgnored: [],
     };
   }
 

@@ -74,7 +74,7 @@ function setup(models: Record<string, any>, options: { failCreate?: boolean } = 
   return { ...db, registry, engine, setClock: (value: number) => { clock = value; } };
 }
 
-const config = (modelVersion: string, overrides: Partial<MlPaperUserConfig> = {}): MlPaperUserConfig => ({ mode: 'ML', modelVersion, buyThreshold: 0.7, decisionWindowSeconds: 10, tokenSafetyChecksEnabled: true, ...overrides });
+const config = (modelVersion: string, overrides: Partial<MlPaperUserConfig> = {}): MlPaperUserConfig => ({ mode: 'ML', modelVersion, buyThreshold: 0.7, decisionWindowSeconds: 10, ...overrides });
 
 function input(now: number, cfg: MlPaperUserConfig, overrides: Partial<MlPaperStepInput> = {}): MlPaperStepInput {
   return {
@@ -133,28 +133,6 @@ describe('Safety and window for an ML BUY (test 4)', () => {
     expect(await expired.engine.step(input(T + 41_000, config('HIGH')))).toEqual({ action: 'NONE' });
     expect(expired.decisions[0].outcome).toBe('EXPIRED');
     expect(expired.decisions[0].executionReason).toContain('SECURITY_CHECK_PENDING');
-  });
-});
-
-describe('Token-security setting per decision', () => {
-  const split = (on: boolean) => (on ? ['FREEZE_AUTHORITY_ACTIVE'] : { enforced: [], ignored: ['FREEZE_AUTHORITY_ACTIVE'] });
-
-  it('checks OFF: token-security blockers do not stop the signal; they are reported as ignored and stored', async () => {
-    const off = setup({ HIGH: approvedModel('HIGH', constantArtifact('HIGH', 0.9)) });
-    const step = await off.engine.step(input(T + 30_000, config('HIGH', { tokenSafetyChecksEnabled: false }), { safetyBlockers: split }));
-    expect(step).toMatchObject({ action: 'SIGNAL', tokenSafetyChecksEnabled: false, ignoredSafetyBlockers: ['FREEZE_AUTHORITY_ACTIVE'] });
-    expect(off.decisions[0]).toMatchObject({ tokenSafetyChecksEnabled: false });
-    await off.engine.markSignaled('u1', 'MINT1', 'sig1', T + 30_000);
-    expect(off.decisions[0]).toMatchObject({ outcome: 'SIGNALED', ignoredSafetyBlockers: ['FREEZE_AUTHORITY_ACTIVE'] });
-  });
-
-  it('the stricter setting wins: checks turned back ON while an ML BUY is pending are enforced at once', async () => {
-    const run = setup({ HIGH: approvedModel('HIGH', constantArtifact('HIGH', 0.9)) });
-    // Decided with checks OFF, but a pending (waitable) market blocker keeps it waiting.
-    expect(await run.engine.step(input(T + 30_000, config('HIGH', { tokenSafetyChecksEnabled: false }), { safetyBlockers: (on) => (on ? ['PRICE_IMPACT_UNKNOWN', 'FREEZE_AUTHORITY_ACTIVE'] : { enforced: ['PRICE_IMPACT_UNKNOWN'], ignored: ['FREEZE_AUTHORITY_ACTIVE'] }) }))).toEqual({ action: 'NONE' });
-    // The user switches the checks ON: the permanent token-security blocker now ends the ML BUY.
-    expect(await run.engine.step(input(T + 32_000, config('HIGH'), { safetyBlockers: split }))).toEqual({ action: 'NONE' });
-    expect(run.decisions[0]).toMatchObject({ outcome: 'SAFETY_BLOCKED' });
   });
 });
 
