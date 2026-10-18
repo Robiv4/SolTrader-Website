@@ -17,12 +17,12 @@ import path from 'node:path';
 
 import { Prisma, type PrismaClient } from '@prisma/client';
 import {
-  computeCandidateOutcome, ML_FEATURE_VERSION, ML_LABEL_VERSION, newOutcomePath, predictMl, recordPathPoint, validateArtifact,
-  type LaunchSecurity, type LaunchState, type MlModelArtifact, type OutcomePathState, type SocialSnapshotResult,
+  computeCandidateOutcome, ML_COMMUNITY_FEATURE_VERSION, ML_FEATURE_SCHEMAS, ML_FEATURE_VERSION, ML_LABEL_VERSION, newOutcomePath, predictMl, recordPathPoint, validateArtifact,
+  type CommunitySnapshotResult, type LaunchSecurity, type LaunchState, type MlModelArtifact, type OutcomePathState, type SocialSnapshotResult,
 } from '@soltrader/strategy-engine';
 import { RollingPercentiles } from '@soltrader/trading-engine';
 
-import { buildLaunchMlSnapshot, ML_REFERENCE_ORDER_USD } from './launch-snapshot.js';
+import { buildLaunchMlSnapshot, buildLaunchMlSnapshotFor, ML_REFERENCE_ORDER_USD } from './launch-snapshot.js';
 
 export { ML_REFERENCE_ORDER_USD };
 
@@ -105,6 +105,11 @@ export interface MlShadowDeps {
   marketDataPerMinute?: number;
   getMarketPrice?: (mint: string) => Promise<{ priceUsd: number; liquidityUsd: number | null } | null>;
   incrementDaily?: (metric: string, amount?: number) => void;
+  /**
+   * Community Intelligence (optional): when present, every snapshot point also gets an ML-FEATURES-COMMUNITY-v1 snapshot
+   * (same moment, community data received by then only). Its outcome is the v1 snapshot's outcome of the candidate.
+   */
+  community?: { assess(mint: string, social: SocialSnapshotResult | null, at: number): CommunitySnapshotResult | null };
   now?: () => number;
 }
 
@@ -123,6 +128,8 @@ export class MlShadowService {
   private sweeping = false;
   private marketWindow = { start: 0, used: 0 };
   private model: { artifact: MlModelArtifact; version: string } | null = null;
+  /** Newest SHADOW model per OTHER feature version (e.g. ML-FEATURES-COMMUNITY-v1); the v1 model above is unchanged. */
+  private extraModels = new Map<string, { artifact: MlModelArtifact; version: string }>();
   private modelCheckedAt = 0;
   private modelStatus: 'NONE' | 'LOADED' | 'UNAVAILABLE' = 'NONE';
   private modelError: string | null = null;
@@ -130,7 +137,7 @@ export class MlShadowService {
     candidatesSeen: 0, candidatesEligible: 0, candidatesIneligible: 0, snapshotsCreated: 0, snapshotsMissedPoint: 0, leakageViolations: 0,
     trackingStarted: 0, trackingDropped: 0, trackingCompleted: 0, outcomeUpdates: 0, streamGaps: 0, streamDisconnects: 0,
     resumedPaths: 0, finalizedOnResume: 0, resumeFailures: 0, finalWriteRetries: 0, finalWriteGiveUps: 0, orphansFinalized: 0, sweepFailures: 0,
-    predictions: 0, predictionFailures: 0, lateDataExcluded: 0, writeFailures: 0, writesDropped: 0, additionalMarketDataRequests: 0, additionalRpcRequests: 0,
+    predictions: 0, predictionFailures: 0, lateDataExcluded: 0, communitySnapshots: 0, communitySnapshotFailures: 0, communityLateExcluded: 0, writeFailures: 0, writesDropped: 0, additionalMarketDataRequests: 0, additionalRpcRequests: 0,
     inferenceLatency: new RollingPercentiles(), snapshotLatency: new RollingPercentiles(),
   };
 
@@ -286,6 +293,39 @@ export class MlShadowService {
       this.deps.incrementDaily?.('snapshots');
       if ((this.deps.outcomeKinds ?? ['AGE_30S', 'BUY_DECISION']).includes(kind)) this.startTracking(row.id, mint, launch, snapshot.referencePriceUsd!, snapshot.referenceLiquidityUsd, at);
       this.predict(row.id, mint, snapshot.features, snapshot.dataQuality);
+    });
+    if (this.deps.community) this.communitySnapshot(mint, kind, at, launch, state, security, best, decision, decisionContext);
+  }
+
+  /** ML-FEATURES-COMMUNITY-v1 row of the same moment (best effort; never affects the v1 row or trading). */
+  private communitySnapshot(mint: string, kind: string, at: number, launch: MlLaunchView, state: ReturnType<MlLaunchAccessor['state']>, security: ReturnType<MlLaunchAccessor['security']>, best: ReturnType<MlShadowService['bestDecision']>['best'], decision: string, decisionContext: Record<string, unknown>) {
+    let built: ReturnType<typeof buildLaunchMlSnapshotFor> | null = null;
+    try {
+      const community = this.deps.community?.assess(mint, best?.social ?? null, at) ?? null;
+      built = buildLaunchMlSnapshotFor(ML_COMMUNITY_FEATURE_VERSION, { at, launch, state, security, riskScore: best?.riskScore ?? null, riskObservedAt: best ? best.at : null, social: best?.social ?? null, community });
+    } catch (error) {
+      this.metrics.communitySnapshotFailures += 1;
+      this.deps.logger.warn({ mint, err: error instanceof Error ? error.message.slice(0, 200) : String(error) }, 'Community feature snapshot failed (trading unaffected)');
+      return;
+    }
+    const { snapshot } = built;
+    if (snapshot.lateDataExcluded.includes('COMMUNITY')) this.metrics.communityLateExcluded += 1;
+    const accessor = this.accessor;
+    if (!accessor) return;
+    this.enqueue(async () => {
+      const candidateId = await accessor.candidateId(mint);
+      const row = await this.deps.prisma.mlFeatureSnapshot.create({
+        data: {
+          candidateId, mint, source: launch.source, kind, snapshotAt: new Date(at), detectedAt: new Date(launch.detectedAt), featureVersion: ML_COMMUNITY_FEATURE_VERSION,
+          features: snapshot.features as Prisma.InputJsonValue, observedAt: snapshot.observedAt as Prisma.InputJsonValue, dataQuality: snapshot.dataQuality,
+          validForTraining: snapshot.validForTraining, invalidReasons: snapshot.invalidReasons as Prisma.InputJsonValue, lateDataExcluded: snapshot.lateDataExcluded as Prisma.InputJsonValue, decision,
+          decisionContext: decisionContext as Prisma.InputJsonValue, newLaunchConfigVersion: best?.configVersion ?? null,
+          referencePriceUsd: new Prisma.Decimal(snapshot.referencePriceUsd!),
+        },
+        select: { id: true },
+      });
+      this.metrics.communitySnapshots += 1;
+      this.predictWith(this.extraModels.get(ML_COMMUNITY_FEATURE_VERSION) ?? null, row.id, mint, snapshot.features, snapshot.dataQuality);
     });
   }
 
@@ -539,7 +579,10 @@ export class MlShadowService {
   // ------------------------------------------------------------------ shadow predictions
 
   private predict(snapshotId: string, mint: string, features: Record<string, unknown>, dataQuality: number) {
-    const model = this.model;
+    this.predictWith(this.model, snapshotId, mint, features, dataQuality);
+  }
+
+  private predictWith(model: { artifact: MlModelArtifact; version: string } | null, snapshotId: string, mint: string, features: Record<string, unknown>, dataQuality: number) {
     if (!model) return;
     const started = globalThis.performance.now();
     try {
@@ -565,7 +608,8 @@ export class MlShadowService {
     if (!force && now - this.modelCheckedAt < 5 * 60_000) return;
     this.modelCheckedAt = now;
     try {
-      const row = await this.deps.prisma.mlModelVersion.findFirst({ where: { status: 'SHADOW' }, orderBy: { trainedAt: 'desc' } });
+      await this.refreshExtraModels();
+      const row = await this.deps.prisma.mlModelVersion.findFirst({ where: { status: 'SHADOW', featureVersion: ML_FEATURE_VERSION }, orderBy: { trainedAt: 'desc' } });
       if (!row) {
         this.model = null;
         this.modelStatus = 'NONE';
@@ -589,6 +633,33 @@ export class MlShadowService {
       this.modelError = error instanceof Error ? error.message.slice(0, 200) : String(error);
       this.deps.logger.warn({ err: this.modelError }, 'ML shadow model unavailable (trading unaffected)');
     }
+  }
+
+  /** Newest SHADOW model of every non-v1 supported feature version (artifact hash verified); failures only skip that model. */
+  private async refreshExtraModels() {
+    const next = new Map<string, { artifact: MlModelArtifact; version: string }>();
+    for (const featureVersion of Object.keys(ML_FEATURE_SCHEMAS).filter((version) => version !== ML_FEATURE_VERSION)) {
+      try {
+        const row = await this.deps.prisma.mlModelVersion.findFirst({ where: { status: 'SHADOW', featureVersion }, orderBy: { trainedAt: 'desc' } });
+        if (!row) continue;
+        const cached = this.extraModels.get(featureVersion);
+        if (cached?.version === row.version) {
+          next.set(featureVersion, cached);
+          continue;
+        }
+        const file = path.resolve(this.deps.repoRoot, row.artifactPath);
+        if (!file.startsWith(path.resolve(this.deps.repoRoot, 'ml', 'models'))) throw new Error('Artifact path outside ml/models');
+        const content = await readFile(file);
+        if (createHash('sha256').update(content).digest('hex') !== row.artifactHash) throw new Error('Artifact hash mismatch (corrupt or modified file)');
+        const artifact = validateArtifact(JSON.parse(content.toString('utf8')));
+        if (artifact.featureVersion !== featureVersion) throw new Error(`Model feature version ${artifact.featureVersion} != ${featureVersion}`);
+        next.set(featureVersion, { artifact, version: row.version });
+        this.deps.logger.info({ modelVersion: row.version, featureVersion }, 'ML shadow model loaded');
+      } catch (error) {
+        this.deps.logger.warn({ featureVersion, err: error instanceof Error ? error.message.slice(0, 200) : String(error) }, 'ML shadow model unavailable (trading unaffected)');
+      }
+    }
+    this.extraModels = next;
   }
 
   // ------------------------------------------------------------------ bounded background writes

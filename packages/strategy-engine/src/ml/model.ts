@@ -4,7 +4,8 @@
  * optionally Platt-calibrated on validation data. The column specs come from the trainer, which builds them from
  * the same ML_FEATURE_SCHEMA: identical preprocessing in training and serving (verified by a parity test).
  */
-import { ML_FEATURE_SCHEMA, type MlFeatures } from './features.js';
+import { featureSchemaFor } from './community-features.js';
+import type { MlFeatures } from './features.js';
 
 export const ML_ARTIFACT_FORMAT = 'soltrader-ml-model-v1';
 
@@ -111,7 +112,8 @@ export function validateArtifact(artifact: unknown): MlModelArtifact {
   const value = artifact as MlModelArtifact;
   if (!value || value.format !== ML_ARTIFACT_FORMAT) throw new Error('Unknown model artifact format');
   if (!Array.isArray(value.columns) || !value.columns.length) throw new Error('Model artifact has no columns');
-  const known = new Set(ML_FEATURE_SCHEMA.map((spec) => spec.name));
+  // Validated against the schema of the artifact's own feature version (unknown versions are rejected).
+  const known = new Set(featureSchemaFor(value.featureVersion).map((spec) => spec.name));
   for (const column of value.columns) if (!known.has(column.feature)) throw new Error(`Model uses unknown feature ${column.feature}`);
   if (value.algorithm === 'logistic_regression' && value.logistic?.coef.length !== value.columns.length) throw new Error('Coefficient count mismatch');
   if (value.algorithm === 'lightgbm' && !value.lightgbm?.trees?.length) throw new Error('LightGBM artifact has no trees');

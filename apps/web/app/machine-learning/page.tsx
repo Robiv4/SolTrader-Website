@@ -6,9 +6,10 @@ import { useState } from 'react';
 import { TokenLabel } from '../avatars';
 import { apiRequest, DataTable, EmptyState, ErrorState, fmt, LoadingState, Metric, PageHeader, Panel, Status, useApi } from '../components';
 
+import { CommunityTab } from './community-tab';
 import { PaperTab } from './paper-tab';
 
-const TABS = [['overview', 'Áttekintés'], ['paper', 'PAPER stratégiák'], ['dataset', 'Dataset'], ['models', 'Modellek'], ['predictions', 'Shadow predikciók'], ['analysis', 'Elemzés'], ['drift', 'Drift'], ['system', 'Rendszer']] as const;
+const TABS = [['overview', 'Áttekintés'], ['paper', 'PAPER stratégiák'], ['community', 'Community ML'], ['dataset', 'Dataset'], ['models', 'Modellek'], ['predictions', 'Shadow predikciók'], ['analysis', 'Elemzés'], ['drift', 'Drift'], ['system', 'Rendszer']] as const;
 type Tab = (typeof TABS)[number][0];
 
 const pct = (value: number | null | undefined, digits = 1) => (value == null ? '—' : `${(value * 100).toFixed(digits)}%`);
@@ -142,7 +143,7 @@ Az ezt a modellt használó ML stratégia azonnal leáll (nem nyit új pozíció
     {message ? <p className="sfield-help" role="status">{message}</p> : null}
     <DataTable wide headers={['Verzió', 'Algoritmus', 'Állapot', 'Készültség', 'Teszt ROC-AUC', 'Teszt PR-AUC', 'Overfitting', 'PAPER', 'Művelet']}>
       {data.models.map((model: any) => <tr key={model.version}>
-        <td><button type="button" className="text-button" onClick={() => setOpen(open === model.version ? null : model.version)}><strong>{model.version}</strong></button><small className="sfield-help" style={{ display: 'block' }}>{model.datasetVersion} · {model.target}</small></td>
+        <td><button type="button" className="text-button" onClick={() => setOpen(open === model.version ? null : model.version)}><strong>{model.version}</strong></button><small className="sfield-help" style={{ display: 'block' }}>{model.datasetVersion} · {model.target}{model.featureVersion ? ` · ${model.featureVersion}` : ''}</small></td>
         <td>{model.algorithm === 'logistic_regression' ? 'Logisztikus regresszió (baseline)' : 'LightGBM'}</td>
         <td><Status tone={STATUS_TONE[model.status] ?? 'neutral'}>{model.status}</Status></td>
         <td><Status tone={READINESS[model.readiness]?.tone ?? 'neutral'}>{READINESS[model.readiness]?.text ?? model.readiness}</Status></td>
@@ -249,6 +250,7 @@ export default function MachineLearningPage() {
     {loading && !data ? <LoadingState /> : error ? <ErrorState message={error} /> : <>
       {tab === 'overview' ? <Overview data={data?.data ?? {}} /> : null}
       {tab === 'paper' ? <PaperTab /> : null}
+      {tab === 'community' ? <CommunityTab /> : null}
       {tab === 'dataset' ? <Datasets data={data?.data ?? {}} /> : null}
       {tab === 'models' ? <Models data={data?.data ?? {}} onChanged={refresh} /> : null}
       {tab === 'predictions' ? <Predictions /> : null}

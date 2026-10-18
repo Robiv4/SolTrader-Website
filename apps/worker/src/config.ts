@@ -65,6 +65,26 @@ const envSchema = z.object({
   X_API_BEARER_TOKEN: z.string().optional(),
   /** Request budget per 15 minutes for X recent search (set to your API tier's limit). */
   X_API_MAX_REQUESTS_PER_15MIN: z.coerce.number().int().min(1).default(50),
+  // ---- Community Intelligence (MONITOR_ONLY: collects and scores, never makes / blocks / sizes a trade) ----
+  /** Master switch (default on). Off = no community provider requests at all; trading is unaffected either way. */
+  COMMUNITY_INTELLIGENCE_ENABLED: z.string().optional().transform((value) => value !== 'false'),
+  /** The only supported mode; any other value is refused at startup. */
+  COMMUNITY_INTELLIGENCE_MODE: z.enum(['MONITOR_ONLY']).default('MONITOR_ONLY'),
+  /** DEX Screener official public API (no key). */
+  DEXSCREENER_ENABLED: z.string().optional().transform((value) => value !== 'false'),
+  DEXSCREENER_REQUESTS_PER_MINUTE: z.coerce.number().int().min(1).max(300).default(40),
+  DEXSCREENER_CACHE_TTL_MS: z.coerce.number().int().min(10_000).default(60_000),
+  /** On-chain community statistics from the EXISTING launch trade stream (no extra Helius / RPC request). */
+  HELIUS_COMMUNITY_ENABLED: z.string().optional().transform((value) => value !== 'false'),
+  /** LunarCrush (optional, paid): off by default; without LUNARCRUSH_API_KEY it is NOT_CONFIGURED and makes no request. */
+  LUNARCRUSH_ENABLED: z.string().optional().transform((value) => value === 'true'),
+  /** Server-side secret: never logged, never returned by the API. */
+  LUNARCRUSH_API_KEY: z.string().optional(),
+  LUNARCRUSH_REQUESTS_PER_MINUTE: z.coerce.number().int().min(1).max(100).default(5),
+  LUNARCRUSH_CACHE_TTL_MS: z.coerce.number().int().min(60_000).default(1_800_000),
+  COMMUNITY_REQUEST_TIMEOUT_MS: z.coerce.number().int().min(1_000).max(30_000).default(6_000),
+  COMMUNITY_BACKOFF_BASE_MS: z.coerce.number().int().min(500).default(2_000),
+  COMMUNITY_BACKOFF_MAX_MS: z.coerce.number().int().min(1_000).default(300_000),
   STRATEGY_LOOKBACK_MS: z.coerce.number().int().positive().default(600_000),
   STRATEGY_HISTORY_WINDOW: z.coerce.number().int().positive().default(20),
   PAPER_EXECUTION_CONCURRENCY: z.coerce.number().int().positive().default(4),

@@ -16,7 +16,7 @@ import { fileURLToPath } from 'node:url';
 
 import { Prisma, type PrismaClient } from '@prisma/client';
 import {
-  effectiveMlMinLiquidityUsd, ML_FEATURE_VERSION, ML_HONEYPOT_CODES, ML_MIN_LIQUIDITY_FLOOR_USD, ML_MIN_LIQUIDITY_MAX_USD, ML_MIN_LIQUIDITY_SUGGESTED_USD, ML_PAPER_SNAPSHOT_POINTS,
+  effectiveMlMinLiquidityUsd, isSupportedFeatureVersion, ML_HONEYPOT_CODES, ML_MIN_LIQUIDITY_FLOOR_USD, ML_MIN_LIQUIDITY_MAX_USD, ML_MIN_LIQUIDITY_SUGGESTED_USD, ML_PAPER_SNAPSHOT_POINTS,
   ML_PAPER_THRESHOLD_MAX, ML_PAPER_THRESHOLD_MIN, ML_PAPER_WINDOW_MAX_SECONDS, mlBlockerCategory, mlBlockerGroup, resolveNewLaunchSettings,
 } from '@soltrader/strategy-engine';
 import { type Request, type Response, Router } from 'express';
@@ -69,7 +69,8 @@ export async function paperApprovalBlockers(prisma: PrismaClient, model: ModelRo
   const blockers: string[] = [];
   if (!['VALIDATED', 'SHADOW'].includes(model.status)) blockers.push(`STATUS_${model.status}`);
   if (model.readiness !== 'SHADOW_READY') blockers.push(`READINESS_${model.readiness}`);
-  if (model.featureVersion !== ML_FEATURE_VERSION) blockers.push('FEATURE_VERSION_MISMATCH');
+  // Any feature schema the worker can build at decision time (v1 or ML-FEATURES-COMMUNITY-v1); the dataset must match it.
+  if (!isSupportedFeatureVersion(model.featureVersion)) blockers.push('FEATURE_VERSION_MISMATCH');
   const history = Array.isArray(model.statusHistory) ? model.statusHistory as Array<{ status?: string }> : [];
   if (!history.some((entry) => entry.status === 'SHADOW')) blockers.push('NEVER_RUN_IN_SHADOW');
   const predictions = await prisma.mlPrediction.count({ where: { modelVersion: model.version } });
@@ -77,6 +78,7 @@ export async function paperApprovalBlockers(prisma: PrismaClient, model: ModelRo
   const dataset = await prisma.mlDatasetVersion.findUnique({ where: { version: model.datasetVersion } });
   const kind = record(dataset?.config).snapshotKind;
   if (typeof kind !== 'string' || ML_PAPER_SNAPSHOT_POINTS[kind] === undefined) blockers.push('UNSUPPORTED_SNAPSHOT_KIND');
+  if (!dataset || dataset.featureVersion !== model.featureVersion) blockers.push('DATASET_FEATURE_VERSION_MISMATCH');
   try {
     const content = await readArtifact(model.artifactPath);
     if (createHash('sha256').update(content).digest('hex') !== model.artifactHash) blockers.push('ARTIFACT_HASH_MISMATCH');

@@ -5,8 +5,12 @@
  * Determinism: rows are ordered by (snapshotAt, snapshotId); columns follow ML_FEATURE_SCHEMA; values are written
  * raw (encoding / transforms happen from the same schema in Python and in TS inference). Same input -> same CSV.
  */
-import { ML_FEATURE_SCHEMA, ML_FEATURE_VERSION, type MlFeatures } from './features.js';
-import { ML_LABEL_VERSION, type CandidateOutcomeResult } from './outcomes.js';
+import { DEFAULT_NEW_LAUNCH_SETTINGS } from '../launch/index.js';
+
+import { featureSchemaFor, isSupportedFeatureVersion } from './community-features.js';
+import { simulateNewLaunchExit, type SimExitResult, type SimExitRules } from './exit-simulation.js';
+import type { MlFeatures } from './features.js';
+import { ML_LABEL_VERSION, type CandidateOutcomeResult, type OutcomePathState } from './outcomes.js';
 
 export interface MlTargetDefinition {
   id: string;
@@ -14,8 +18,10 @@ export interface MlTargetDefinition {
    * classification: market-opportunity label from the SHADOW price path of EVERY eligible candidate.
    * paper_trade: research target from REAL closed PAPER trades only (selection-biased: only bought candidates; never
    * fabricated for skipped candidates). The trade result is the label, never a feature.
+   * simulated_exit: net result of a hypothetical PAPER entry at the snapshot, simulated with the New Launch exit rules
+   * and PAPER costs on the recorded SHADOW price path (every eligible candidate; see exit-simulation.ts).
    */
-  kind: 'classification' | 'paper_trade';
+  kind: 'classification' | 'paper_trade' | 'simulated_exit';
   /** Path label (first-hit ordering) evaluated within its horizon (classification targets). */
   pathLabel: string;
   horizonS: number;
@@ -27,6 +33,17 @@ export const ML_TARGETS: Record<string, MlTargetDefinition> = {
   plus10BeforeMinus10_30m: { id: 'plus10BeforeMinus10_30m', kind: 'classification', pathLabel: 'plus10BeforeMinus10', horizonS: 1800, description: '+10 % reached before -10 % within 30 minutes' },
   plus25BeforeMinus20_30m: { id: 'plus25BeforeMinus20_30m', kind: 'classification', pathLabel: 'plus25BeforeMinus20', horizonS: 1800, description: '+25 % reached before -20 % within 30 minutes' },
   paperNetPositive: { id: 'paperNetPositive', kind: 'paper_trade', pathLabel: '', horizonS: 0, description: 'RESEARCH: the actual PAPER trade closed with a positive net P&L (fees + slippage); bought candidates only (selection-biased)' },
+  simExitNetPositive: { id: 'simExitNetPositive', kind: 'simulated_exit', pathLabel: '', horizonS: 3600, description: 'Net PAPER result > 0 of an entry at the snapshot under the New Launch exit rules (SL / TP / break-even / trailing / liquidity / max hold), fees and simulated slippage, on the recorded price path' },
+};
+
+/** Exit rules of the simulated_exit target: the documented New Launch PAPER defaults unless the dataset config overrides them. */
+export const DEFAULT_SIM_EXIT_RULES: SimExitRules = {
+  stopLossPercent: DEFAULT_NEW_LAUNCH_SETTINGS.stopLossPercent, takeProfitPercent: DEFAULT_NEW_LAUNCH_SETTINGS.takeProfitPercent,
+  breakEvenEnabled: DEFAULT_NEW_LAUNCH_SETTINGS.breakEvenEnabled, breakEvenActivationPercent: DEFAULT_NEW_LAUNCH_SETTINGS.breakEvenActivationPercent,
+  breakEvenCostBufferPercent: DEFAULT_NEW_LAUNCH_SETTINGS.breakEvenCostBufferPercent, trailingEnabled: DEFAULT_NEW_LAUNCH_SETTINGS.trailingEnabled,
+  trailingActivationPercent: DEFAULT_NEW_LAUNCH_SETTINGS.trailingActivationPercent, trailingDistancePercent: DEFAULT_NEW_LAUNCH_SETTINGS.trailingDistancePercent,
+  maxHoldEnabled: DEFAULT_NEW_LAUNCH_SETTINGS.maxHoldEnabled, maxHoldMinutes: DEFAULT_NEW_LAUNCH_SETTINGS.maxHoldMinutes,
+  liquiditySafetyExitEnabled: DEFAULT_NEW_LAUNCH_SETTINGS.liquiditySafetyExitEnabled, liquidityDropExitPercent: DEFAULT_NEW_LAUNCH_SETTINGS.liquidityDropExitPercent,
 };
 
 export interface MlDatasetSourceRow {
@@ -49,6 +66,8 @@ export interface MlDatasetSourceRow {
   paperExitAt?: number | null;
   /** Which strategy opened that PAPER trade (DEFAULT | ML); provenance only, never a feature. */
   paperEntryStrategy?: string | null;
+  /** Recorded SHADOW price path after the snapshot (simulated_exit target only; label data, never a feature). */
+  outcomePath?: OutcomePathState | null;
 }
 
 export interface MlDatasetConfig {
@@ -62,6 +81,35 @@ export interface MlDatasetConfig {
   to?: number | null;
   sources?: string[] | null;
   minDataQuality: number;
+  /** simulated_exit target: exit rule overrides (default: documented New Launch PAPER defaults) and position size. */
+  simExitRules?: Partial<SimExitRules>;
+  simPositionUsd?: number;
+}
+
+/** Simulated exit summary for the manifest (labels only; never features). */
+function summarizeSimExits(results: SimExitResult[], rules: SimExitRules, positionUsd: number) {
+  const returns = results.map((item) => item.netReturnPct!).sort((a, b) => a - b);
+  const reasons: Record<string, number> = {};
+  for (const item of results) reasons[item.reason!] = (reasons[item.reason!] ?? 0) + 1;
+  const wins = returns.filter((value) => value > 0);
+  const losses = returns.filter((value) => value <= 0);
+  const grossWin = wins.reduce((sum, value) => sum + value, 0);
+  const grossLoss = -losses.reduce((sum, value) => sum + value, 0);
+  return {
+    labelVersion: 'SIM-EXIT-v1', rules, positionUsd, rows: results.length, exitReasons: reasons,
+    meanNetReturnPct: returns.length ? returns.reduce((sum, value) => sum + value, 0) / returns.length : null,
+    medianNetReturnPct: returns.length ? returns[Math.floor(returns.length / 2)] : null,
+    winRate: returns.length ? wins.length / returns.length : null,
+    profitFactor: grossLoss > 0 ? grossWin / grossLoss : null,
+    stopLossRate: results.length ? (reasons.STOP_LOSS ?? 0) / results.length : null,
+  };
+}
+
+/** Share of rows with community data (communityCoverage > 0) and with a Community Score. */
+function communityCoverage(rows: MlFeatures[]) {
+  const withData = rows.filter((features) => typeof features.communityCoverage === 'number' && features.communityCoverage > 0).length;
+  const withScore = rows.filter((features) => typeof features.communityScore === 'number').length;
+  return { rows: rows.length, withCommunityData: withData, withCommunityScore: withScore, share: rows.length ? withData / rows.length : null };
 }
 
 export const ML_META_COLUMNS = ['snapshot_id', 'candidate_id', 'mint', 'source', 'snapshot_kind', 'snapshot_at_ms', 'label_end_ms', 'decision', 'label', 'paper_net_pnl'];
@@ -84,7 +132,10 @@ const csvCell = (value: unknown) => {
 export function buildMlDataset(input: MlDatasetSourceRow[], config: MlDatasetConfig) {
   const target = ML_TARGETS[config.target];
   if (!target) throw new Error(`Unknown target ${config.target}`);
-  if (config.featureVersion !== ML_FEATURE_VERSION) throw new Error(`Feature version ${config.featureVersion} is not the current schema ${ML_FEATURE_VERSION}`);
+  if (!isSupportedFeatureVersion(config.featureVersion)) throw new Error(`Feature version ${config.featureVersion} is not a supported schema`);
+  const schema = featureSchemaFor(config.featureVersion);
+  const simRules = { ...DEFAULT_SIM_EXIT_RULES, ...(config.simExitRules ?? {}) };
+  const simResults = new Map<string, SimExitResult>();
   if (config.labelVersion !== ML_LABEL_VERSION) throw new Error(`Label version ${config.labelVersion} is not ${ML_LABEL_VERSION}`);
   const excluded: Record<string, number> = {};
   const exclude = (reason: string) => {
@@ -151,6 +202,22 @@ export function buildMlDataset(input: MlDatasetSourceRow[], config: MlDatasetCon
       exclude('NO_OUTCOME');
       continue;
     }
+    if (target.kind === 'simulated_exit') {
+      // Only completely observed paths; an exit that cannot be decided from the stored path is excluded, never guessed.
+      if (row.outcome.quality !== 'COMPLETE' || !row.outcomePath) {
+        exclude(row.outcomePath ? 'OUTCOME_INCOMPLETE' : 'NO_OUTCOME_PATH');
+        continue;
+      }
+      const sim = simulateNewLaunchExit(row.outcomePath, simRules, config.simPositionUsd ?? 20);
+      if (sim.status !== 'RESOLVED' || sim.netReturnPct === null) {
+        exclude(`SIM_EXIT_${sim.unknownReason ?? 'UNKNOWN'}`);
+        continue;
+      }
+      simResults.set(row.snapshotId, sim);
+      seenCandidates.add(row.candidateId);
+      kept.push({ row, label: sim.netReturnPct > 0 });
+      continue;
+    }
     const label = row.outcome.pathLabels[target.pathLabel];
     if (label === null || label === undefined) {
       exclude(row.outcome.quality === 'COMPLETE' ? 'LABEL_AMBIGUOUS' : 'OUTCOME_INCOMPLETE');
@@ -161,13 +228,15 @@ export function buildMlDataset(input: MlDatasetSourceRow[], config: MlDatasetCon
   }
 
   // 'source' is both a meta column and a feature: written once (meta), read as the feature by name.
-  const featureNames = ML_FEATURE_SCHEMA.map((spec) => spec.name).filter((name) => !ML_META_COLUMNS.includes(name));
+  const featureNames = schema.map((spec) => spec.name).filter((name) => !ML_META_COLUMNS.includes(name));
   const header = [...ML_META_COLUMNS, ...featureNames];
   const lines = [header.join(',')];
   for (const { row, label } of kept) {
     lines.push([
       // label_end_ms: when the label became known (purged split); for paper_trade targets the trade exit time.
-      row.snapshotId, row.candidateId, row.mint, row.source, row.kind, row.snapshotAt, target.kind === 'paper_trade' ? row.paperExitAt : row.snapshotAt + target.horizonS * 1000, row.decision, label ? 1 : 0, row.paperNetPnl ?? null,
+      row.snapshotId, row.candidateId, row.mint, row.source, row.kind, row.snapshotAt,
+      target.kind === 'paper_trade' ? row.paperExitAt : target.kind === 'simulated_exit' ? row.snapshotAt + (simResults.get(row.snapshotId)?.exitOffsetMs ?? target.horizonS * 1000) : row.snapshotAt + target.horizonS * 1000,
+      row.decision, label ? 1 : 0, row.paperNetPnl ?? null,
       ...featureNames.map((name) => row.features[name] ?? null),
     ].map(csvCell).join(','));
   }
@@ -176,7 +245,7 @@ export function buildMlDataset(input: MlDatasetSourceRow[], config: MlDatasetCon
     return acc;
   }, {});
   const positives = kept.filter((item) => item.label).length;
-  const missingRates = Object.fromEntries(ML_FEATURE_SCHEMA.map((spec) => spec.name).map((name) => [name, kept.length ? kept.filter((item) => item.row.features[name] === null || item.row.features[name] === undefined).length / kept.length : null]));
+  const missingRates = Object.fromEntries(schema.map((spec) => spec.name).map((name) => [name, kept.length ? kept.filter((item) => item.row.features[name] === null || item.row.features[name] === undefined).length / kept.length : null]));
   const manifest = {
     version: config.version,
     featureVersion: config.featureVersion,
@@ -206,6 +275,8 @@ export function buildMlDataset(input: MlDatasetSourceRow[], config: MlDatasetCon
     invalidTimestamps,
     duplicateCandidates,
     readiness: datasetReadiness(kept.length, positives),
+    ...(target.kind === 'simulated_exit' ? { simulatedExit: summarizeSimExits([...simResults.values()], simRules, config.simPositionUsd ?? 20) } : {}),
+    ...(config.featureVersion !== 'ML-FEATURES-v1' ? { communityCoverage: communityCoverage(kept.map((item) => item.row.features)) } : {}),
     columns: header,
   };
   return { csv: `${lines.join('\n')}\n`, manifest, rows: kept.length };

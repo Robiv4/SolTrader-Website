@@ -9,7 +9,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { buildMlFeatureSnapshot, type LaunchSecurity, type MlModelArtifact } from '@soltrader/strategy-engine';
+import { buildCommunityFeatureSnapshot, buildMlFeatureSnapshot, ML_COMMUNITY_FEATURE_VERSION, type LaunchSecurity, type MlModelArtifact } from '@soltrader/strategy-engine';
 import { describe, expect, it } from 'vitest';
 
 import { MlPaperEntryEngine, MlPaperModelRegistry, type MlPaperStepInput, type MlPaperUserConfig } from '../src/ml/ml-paper-engine.js';
@@ -27,11 +27,15 @@ function constantArtifact(version: string, p: number): MlModelArtifact {
 }
 
 function snapshotAt(now: number) {
+  return buildMlFeatureSnapshot(snapshotInput(now));
+}
+
+function snapshotInput(now: number) {
   const observations = Array.from({ length: 15 }, (_, i) => ({
     takenAt: T + i * 2_000, priceUsd: 0.00001, liquidityUsd: 30_000, buyCount: 3 + i, sellCount: 1, volumeUsd: 100 + i * 40, buyVolumeUsd: 80, sellVolumeUsd: 20, uniqueBuyers: 2 + i, uniqueSellers: 1,
   }));
   const state = { mint: 'M', detectedAt: T, createdAt: T - 1_000, observations, largestBuyerShare: 0.1, buysPerBuyer: 1.2, creatorSoldRatio: 0, largestHolderSupplyShare: 0.04, priceImpactPercent: 1, observedSellers: 3 };
-  return buildMlFeatureSnapshot({ snapshotAt: now, source: 'PUMP_FUN', detectedAt: T, createdAt: T - 1_000, firstTradeAt: T + 500, state, security, securityObservedAt: T + 5_000, riskScore: 40, riskObservedAt: now, social: null, referenceImpactPct: 1 });
+  return { snapshotAt: now, source: 'PUMP_FUN', detectedAt: T, createdAt: T - 1_000, firstTradeAt: T + 500, state, security, securityObservedAt: T + 5_000, riskScore: 40, riskObservedAt: now, social: null, referenceImpactPct: 1 };
 }
 
 interface Row { id: string; [key: string]: any }
@@ -238,3 +242,43 @@ describe('Idempotency (test 5) and model / strategy switches (test 9)', () => {
   });
 });
 
+describe('Community model (ML-FEATURES-COMMUNITY-v1) in the same ML PAPER flow', () => {
+  const communityArtifact = (version: string, p: number): MlModelArtifact => ({ ...constantArtifact(version, p), featureVersion: ML_COMMUNITY_FEATURE_VERSION });
+  const communityModel = (version: string, p: number) => approvedModel(version, communityArtifact(version, p), { featureVersion: ML_COMMUNITY_FEATURE_VERSION });
+  const communitySnapshot = (now: number) => ({ ...buildCommunityFeatureSnapshot({ ...snapshotInput(now), community: null }) });
+
+  it('features are built for the model\'s own feature version; ML BUY is stored with that version', async () => {
+    const { engine, decisions } = setup({ COMM: communityModel('COMM', 0.9) });
+    const requested: string[] = [];
+    const step = await engine.step(input(T + 31_000, config('COMM'), { buildFeatures: (featureVersion: string) => { requested.push(featureVersion); return communitySnapshot(T + 31_000); } }));
+    expect(requested).toEqual([ML_COMMUNITY_FEATURE_VERSION]);
+    expect(step).toMatchObject({ action: 'SIGNAL', modelVersion: 'COMM' });
+    expect(decisions[0]).toMatchObject({ mlDecision: 'ML_BUY', featureVersion: ML_COMMUNITY_FEATURE_VERSION });
+  });
+
+  it('a v1 snapshot for a community model is an ML_ERROR (never scored with the wrong schema)', async () => {
+    const { engine, decisions } = setup({ COMM: communityModel('COMM', 0.9) });
+    expect(await engine.step(input(T + 31_000, config('COMM')))).toEqual({ action: 'NONE' });
+    expect(decisions[0]).toMatchObject({ mlDecision: 'ML_ERROR', errorReason: 'FEATURE_VERSION_MISMATCH' });
+  });
+
+  it('below the threshold the community model skips (it does not buy everything)', async () => {
+    const { engine, decisions } = setup({ COMM: communityModel('COMM', 0.4) });
+    await engine.step(input(T + 31_000, config('COMM'), { buildFeatures: () => communitySnapshot(T + 31_000) }));
+    expect(decisions[0]).toMatchObject({ mlDecision: 'ML_SKIP', outcome: 'SKIPPED' });
+  });
+
+  it('a mandatory safety blocker still blocks a community ML BUY (no community score bypass)', async () => {
+    const { engine, decisions } = setup({ COMM: communityModel('COMM', 0.95) });
+    const step = await engine.step(input(T + 31_000, config('COMM'), { buildFeatures: () => communitySnapshot(T + 31_000), safetyBlockers: () => ['HONEYPOT_SUSPECTED'] }));
+    expect(step).not.toMatchObject({ action: 'SIGNAL' });
+    expect(decisions[0].mlDecision).toBe('ML_BUY');
+    expect(decisions[0].outcome).not.toBe('SIGNALED');
+  });
+
+  it('a registry row whose artifact has another feature version is refused', async () => {
+    const { engine, decisions } = setup({ MIX: approvedModel('MIX', constantArtifact('MIX', 0.9), { featureVersion: ML_COMMUNITY_FEATURE_VERSION }) });
+    await engine.step(input(T + 31_000, config('MIX'), { buildFeatures: () => communitySnapshot(T + 31_000) }));
+    expect(decisions[0]?.mlDecision ?? 'NONE').not.toBe('ML_BUY');
+  });
+});

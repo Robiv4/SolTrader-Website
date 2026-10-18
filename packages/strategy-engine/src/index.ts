@@ -325,4 +325,5 @@ export function createConfiguredStrategy(strategyName: string, params: Record<st
 export * from './advanced/index.js';
 export * from './launch/index.js';
 export * from './ml/index.js';
+export * from './community/index.js';
 export * from './social/index.js';

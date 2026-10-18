@@ -90,7 +90,7 @@ export function createMlRouter(deps: { prisma: PrismaClient; readJson: (key: str
         prisma.mlCandidateOutcome.groupBy({ by: ['status'], _count: { _all: true } }),
         prisma.mlFeatureSnapshot.groupBy({ by: ['validForTraining'], where: { kind: 'AGE_30S' }, _count: { _all: true }, _avg: { dataQuality: true } }),
         prisma.mlDatasetVersion.findMany({ orderBy: { createdAt: 'desc' }, take: 10, select: { version: true, target: true, rowCount: true, createdAt: true, manifest: true, createdBy: true } }),
-        prisma.mlModelVersion.findMany({ orderBy: { createdAt: 'desc' }, take: 20, select: { version: true, algorithm: true, status: true, readiness: true, target: true, datasetVersion: true, trainedAt: true, metrics: true, statusHistory: true, paperApproved: true, paperApprovedAt: true, paperApprovedBy: true } }),
+        prisma.mlModelVersion.findMany({ orderBy: { createdAt: 'desc' }, take: 20, select: { version: true, algorithm: true, status: true, readiness: true, target: true, datasetVersion: true, featureVersion: true, trainedAt: true, metrics: true, statusHistory: true, paperApproved: true, paperApprovedAt: true, paperApprovedBy: true } }),
         prisma.mlPrediction.count(),
         prisma.mlFeatureSnapshot.count({ where: { kind: 'AGE_30S', snapshotAt: { gte: new Date(Date.now() - 86_400_000) } } }),
       ]);

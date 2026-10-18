@@ -102,3 +102,25 @@ def test_training_is_reproducible_and_exports_reproduce_library_scores(tmp_path)
     target = ROOT / 'packages' / 'strategy-engine' / 'test' / 'fixtures' / 'ml-parity.json'
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(json.dumps(fixture), encoding='utf-8')
+
+
+def test_community_feature_version_trains_with_its_own_schema_and_name(tmp_path):
+    # SYNTHETIC smoke test of the pipeline only: says nothing about real community-model performance.
+    directory = make_synthetic_dataset(tmp_path / 'ds-community', rows=1200, seed=7, feature_version='ML-FEATURES-COMMUNITY-v1', version='COMMUNITY-v1')
+    out = tmp_path / 'models-community'
+    assert train_main(['--dataset', str(directory), '--out', str(out), '--seed', '42']) == 0
+    meta = json.loads((out / 'ML-LGBM-COMMUNITY-v1-s42' / 'metadata.json').read_text())
+    assert meta['featureVersion'] == 'ML-FEATURES-COMMUNITY-v1'
+    assert meta['status'] == 'TRAINED'
+    assert meta['readiness'] in {'INSUFFICIENT_DATA', 'RESEARCH_ONLY'}
+    assert 'testRocAucWithoutCommunity' in meta['socialAblation']
+    artifact = json.loads((out / 'ML-LGBM-COMMUNITY-v1-s42' / 'model.json').read_text())
+    assert artifact['featureVersion'] == 'ML-FEATURES-COMMUNITY-v1'
+    assert any(column['feature'] == 'communityScore' for column in artifact['columns'])
+
+
+def test_unknown_feature_version_is_refused():
+    import pytest
+    from soltrader_ml.data import load_schema
+    with pytest.raises(SystemExit):
+        load_schema(feature_version='ML-FEATURES-v999')

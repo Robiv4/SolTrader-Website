@@ -127,7 +127,7 @@ def main(argv=None):
 
     dataset_dir = Path(args.dataset)
     frame, manifest = load_dataset(dataset_dir)
-    schema = load_schema()
+    schema = load_schema(feature_version=manifest['featureVersion'])
     if schema['featureVersion'] != manifest['featureVersion']:
         raise SystemExit(f"Feature version mismatch: schema {schema['featureVersion']} vs dataset {manifest['featureVersion']}")
     quality = data_quality_report(frame, manifest, schema)
@@ -178,6 +178,11 @@ def main(argv=None):
             no_social, no_social_columns = fit_and_score(algorithm, schema, frame, split.train, args.seed, exclude_groups={'SOCIAL'})
             _, y_ns, p_ns = evaluate(algorithm, no_social, no_social_columns, frame, split.test, None)
             ablation = {'testRocAucWithoutSocial': classification_metrics(y_ns, p_ns)['rocAuc'], 'testRocAucWithSocial': classification_metrics(y_test, p_test)['rocAuc']}
+            # Community ablation (ML-FEATURES-COMMUNITY-v1): does the COMMUNITY group add out-of-sample value?
+            if any(spec['group'] == 'COMMUNITY' for spec in schema['features']):
+                no_community, no_community_columns = fit_and_score(algorithm, schema, frame, split.train, args.seed, exclude_groups={'COMMUNITY'})
+                _, y_nc, p_nc = evaluate(algorithm, no_community, no_community_columns, frame, split.test, None)
+                ablation['testRocAucWithoutCommunity'] = classification_metrics(y_nc, p_nc)['rocAuc']
         by_source = {}
         test_frame = frame.iloc[split.test]
         for source in sorted(test_frame['source'].unique()):

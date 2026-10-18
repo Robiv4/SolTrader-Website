@@ -2,9 +2,11 @@
  * SolTrader ML command line (explicit actions only; nothing here runs automatically).
  *
  *   pnpm ml:setup                       create ml/.venv (Python 3.12 x64) and install pinned requirements
- *   pnpm ml:schema                      export ML_FEATURE_SCHEMA -> ml/schema/features-v1.json
- *   pnpm ml:dataset [--target T] [--kind AGE_30S] [--min-quality 50]
+ *   pnpm ml:schema                      export the feature schemas -> ml/schema/features-v1.json, features-community-v1.json
+ *   pnpm ml:dataset [--target T] [--kind AGE_30S] [--min-quality 50] [--feature-version ML-FEATURES-v1]
  *                                       build an immutable dataset version from DB snapshots + outcomes
+ *                                       (--feature-version ML-FEATURES-COMMUNITY-v1: community snapshots, outcome of the
+ *                                       same candidate's v1 snapshot; default version name COMMUNITY-v<n>)
  *   pnpm ml:train [--dataset VERSION] [--seed 42]
  *                                       train baseline + LightGBM offline, register models as TRAINED
  *   pnpm ml:status                      shadow collection / model status
@@ -21,12 +23,12 @@ import { fileURLToPath } from 'node:url';
 
 import { Prisma, PrismaClient } from '@prisma/client';
 import {
-  buildMlDataset, ML_FEATURE_VERSION, ML_LABEL_VERSION, ML_TARGETS, mlFeatureSchemaJson,
-  type CandidateOutcomeResult, type MlDatasetSourceRow, type MlFeatures,
+  buildMlDataset, isSupportedFeatureVersion, ML_COMMUNITY_FEATURE_VERSION, ML_FEATURE_VERSION, ML_LABEL_VERSION, ML_TARGETS, mlCommunityFeatureSchemaJson, mlFeatureSchemaJson,
+  type CandidateOutcomeResult, type MlDatasetSourceRow, type MlFeatures, type OutcomePathState,
 } from '@soltrader/strategy-engine';
 import { createClient } from 'redis';
 
-import { indexPaperTrades, loadAllPages, loadPaperTradesInBatches, matchPaperTrade, paperProvenance } from '../src/ml/dataset-source.js';
+import { chunk, indexPaperTrades, loadAllPages, loadPaperTradesInBatches, matchPaperTrade, paperProvenance } from '../src/ml/dataset-source.js';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
 // Server-side configuration (DATABASE_URL, REDIS_URL) from the repository .env; values are never printed.
@@ -46,10 +48,12 @@ async function audit(prisma: PrismaClient, action: string, details: Record<strin
 }
 
 function writeSchema() {
-  const target = path.join(ML_DIR, 'schema', 'features-v1.json');
-  mkdirSync(path.dirname(target), { recursive: true });
-  writeFileSync(target, `${JSON.stringify(mlFeatureSchemaJson(), null, 2)}\n`);
-  console.log(`schema written: ${path.relative(ROOT, target)} (${ML_FEATURE_VERSION})`);
+  for (const [file, schema, version] of [['features-v1.json', mlFeatureSchemaJson(), ML_FEATURE_VERSION], ['features-community-v1.json', mlCommunityFeatureSchemaJson(), ML_COMMUNITY_FEATURE_VERSION]] as const) {
+    const target = path.join(ML_DIR, 'schema', file);
+    mkdirSync(path.dirname(target), { recursive: true });
+    writeFileSync(target, `${JSON.stringify(schema, null, 2)}\n`);
+    console.log(`schema written: ${path.relative(ROOT, target)} (${version})`);
+  }
 }
 
 function setup() {
@@ -73,10 +77,14 @@ async function dataset() {
     if (!ML_TARGETS[target]) throw new Error(`Unknown target ${target}. Known: ${Object.keys(ML_TARGETS).join(', ')}`);
     const kind = option('kind', 'AGE_30S');
     const minQuality = Number(option('min-quality', '50'));
+    const featureVersion = option('feature-version', ML_FEATURE_VERSION);
+    if (!isSupportedFeatureVersion(featureVersion)) throw new Error(`Unsupported feature version ${featureVersion}`);
+    // The simulated-exit target needs the recorded price path; other targets do not load it (large JSON).
+    const withPath = ML_TARGETS[target].kind === 'simulated_exit';
     // Paged (keyset on id after the same ordering): the outcome include never exceeds the bind-parameter limit.
     const snapshots = await loadAllPages((cursor, take) => prisma.mlFeatureSnapshot.findMany({
-      where: { featureVersion: ML_FEATURE_VERSION, kind },
-      include: { outcome: { select: { status: true, result: true } } },
+      where: { featureVersion, kind },
+      include: { outcome: { select: { status: true, result: true, path: withPath } } },
       orderBy: [{ snapshotAt: 'asc' }, { id: 'asc' }],
       take,
       ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
@@ -90,18 +98,30 @@ async function dataset() {
       select: { tokenAddress: true, netPnl: true, entryAt: true, exitAt: true, entryStrategy: true },
     }));
     const tradeIndex = indexPaperTrades(trades);
+    // Community snapshots carry no outcome of their own: the label is the outcome of the SAME candidate's v1 snapshot of
+    // the same kind (same moment, same reference price). Loaded in batches (bind-parameter limit).
+    type OutcomeRow = { status: string; result: unknown; path?: unknown } | null;
+    const sharedOutcome = new Map<string, OutcomeRow>();
+    if (featureVersion !== ML_FEATURE_VERSION) {
+      for (const batch of chunk([...new Set(snapshots.map((row) => row.candidateId))], 1_000)) {
+        const v1 = await prisma.mlFeatureSnapshot.findMany({ where: { featureVersion: ML_FEATURE_VERSION, kind, candidateId: { in: batch } }, select: { candidateId: true, outcome: { select: { status: true, result: true, path: withPath } } } });
+        for (const row of v1) sharedOutcome.set(row.candidateId, row.outcome);
+      }
+    }
     const rows: MlDatasetSourceRow[] = snapshots.map((row) => {
       const trade = matchPaperTrade(tradeIndex, row.mint, row.snapshotAt.getTime());
-      const outcome = row.outcome && row.outcome.status !== 'TRACKING' ? row.outcome.result as unknown as CandidateOutcomeResult : null;
+      const source: OutcomeRow = featureVersion === ML_FEATURE_VERSION ? row.outcome : sharedOutcome.get(row.candidateId) ?? null;
+      const outcome = source && source.status !== 'TRACKING' ? source.result as unknown as CandidateOutcomeResult : null;
       return {
         snapshotId: row.id, candidateId: row.candidateId, mint: row.mint, source: row.source, kind: row.kind, snapshotAt: row.snapshotAt.getTime(), featureVersion: row.featureVersion,
         features: row.features as MlFeatures, validForTraining: row.validForTraining, invalidReasons: row.invalidReasons as string[], dataQuality: row.dataQuality,
-        decision: row.decision, outcome, ...paperProvenance(trade),
+        decision: row.decision, outcome, outcomePath: withPath && source?.path ? source.path as unknown as OutcomePathState : null, ...paperProvenance(trade),
       };
     });
-    const existing = await prisma.mlDatasetVersion.count();
-    const version = option('version', `NL-DATASET-v${existing + 1}`);
-    const config = { version, featureVersion: ML_FEATURE_VERSION, labelVersion: ML_LABEL_VERSION, target, snapshotKind: kind, minDataQuality: minQuality };
+    const community = featureVersion === ML_COMMUNITY_FEATURE_VERSION;
+    const existing = await prisma.mlDatasetVersion.count({ where: community ? { featureVersion } : { featureVersion: { not: ML_COMMUNITY_FEATURE_VERSION } } });
+    const version = option('version', community ? `COMMUNITY-v${existing + 1}` : `NL-DATASET-v${existing + 1}`);
+    const config = { version, featureVersion, labelVersion: ML_LABEL_VERSION, target, snapshotKind: kind, minDataQuality: minQuality };
     const built = buildMlDataset(rows, config);
     const directory = path.join(ML_DIR, 'datasets', version);
     if (existsSync(directory)) throw new Error(`Dataset ${version} already exists (immutable)`);
@@ -110,7 +130,7 @@ async function dataset() {
     const fileHash = sha256(built.csv);
     const manifest = { ...built.manifest, createdAt: new Date().toISOString(), fileHash, snapshotIds: rows.length };
     writeFileSync(path.join(directory, 'manifest.json'), `${JSON.stringify(manifest, null, 2)}\n`);
-    await prisma.mlDatasetVersion.create({ data: { version, featureVersion: ML_FEATURE_VERSION, labelVersion: ML_LABEL_VERSION, target, config: config as Prisma.InputJsonValue, manifest: manifest as unknown as Prisma.InputJsonValue, rowCount: built.rows, filePath: path.relative(ROOT, path.join(directory, 'dataset.csv')).replace(/\\/g, '/'), fileHash, createdBy: actor } });
+    await prisma.mlDatasetVersion.create({ data: { version, featureVersion, labelVersion: ML_LABEL_VERSION, target, config: config as Prisma.InputJsonValue, manifest: manifest as unknown as Prisma.InputJsonValue, rowCount: built.rows, filePath: path.relative(ROOT, path.join(directory, 'dataset.csv')).replace(/\\/g, '/'), fileHash, createdBy: actor } });
     await audit(prisma, 'ml_dataset_created', { version, rows: built.rows, target, fileHash });
     console.log(JSON.stringify({ version, rows: built.rows, positives: built.manifest.positives, readiness: built.manifest.readiness, excluded: built.manifest.excluded, directory: path.relative(ROOT, directory) }, null, 2));
   } finally {

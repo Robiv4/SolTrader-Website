@@ -31,6 +31,7 @@ import {
 import { runHistoricalBacktest, serializeBacktestResult } from './backtesting.js';
 import { createBotController } from './bot-controller.js';
 import { buildCapacityAnalytics } from './capacity-analytics.js';
+import { createCommunityMlRouter } from './community-ml.js';
 import { env } from './config.js';
 import { prisma } from './database.js';
 import { createEmailVerification, createStepUpGate, EmailDeliveryError, normalizeIp, VERIFY_FAILURE_MESSAGES, verificationEnabled } from './email-verification.js';
@@ -628,6 +629,7 @@ app.get('/api/users/:id/avatar', async (req, res) => {
 
 // Machine Learning (shadow research; read for every signed-in user, model status: admin + e-mail code).
 app.use('/api', createMlPaperRouter({ prisma, readJson: (key) => readJsonKey<Record<string, unknown>>(key), logAuditEvent, stepUp, logger, serverTradingMode: () => env.TRADING_MODE }));
+app.use('/api', createCommunityMlRouter({ prisma, readJson: (key) => readJsonKey<Record<string, unknown>>(key), logger }));
 app.use('/api/ml', createMlRouter({ prisma, readJson: (key) => readJsonKey<Record<string, unknown>>(key), logAuditEvent, stepUp, logger }));
 
 // Administrator user management (list / create / role / password / sessions / delete).

@@ -46,7 +46,7 @@ function launchPosition(overrides: Partial<PositionRecord> = {}): PositionRecord
   };
 }
 
-function harness(initial: PositionRecord[], options: { config?: Partial<HotPositionMonitorConfig>; persistDelayMs?: number; stream?: () => StreamStatus; poll?: (mint: string) => Promise<MarketEvent | null>; store?: ReturnType<typeof makeStore> } = {}) {
+function harness(initial: PositionRecord[], options: { config?: Partial<HotPositionMonitorConfig>; persistDelayMs?: number; stream?: () => StreamStatus; poll?: (mint: string) => Promise<MarketEvent | null>; store?: ReturnType<typeof makeStore>; latest?: (mint: string) => MarketEvent | null } = {}) {
   const fixture = options.store ?? makeStore(initial, { persistDelayMs: options.persistDelayMs });
   const clock = { now: T0 };
   let slot = 1_000;
@@ -60,7 +60,7 @@ function harness(initial: PositionRecord[], options: { config?: Partial<HotPosit
     loadOpenPositions: () => fixture.store.getOpenPositions({ exitPolicy: 'NEW_LAUNCH' }),
     persist: (id, updates) => fixture.store.updatePosition(id, updates),
     streamStatus: options.stream ?? (() => ({ state: 'ACTIVE', lastEventAt: clock.now })),
-    latestStreamEvent: () => null,
+    latestStreamEvent: options.latest ?? (() => null),
     pollQuote: async (mint) => {
       polls.push(mint);
       return options.poll ? options.poll(mint) : null;
@@ -317,5 +317,42 @@ describe('hot position monitor (event-driven exits)', () => {
     expect(h.fixture.closes).toHaveLength(0);
     await h.monitor.stop();
   });
-});
 
+  describe('max hold of a silent token (stuck positions MEOWN / CLEVER)', () => {
+    const curve = { virtualQuote: 30, virtualBase: 1_000_000_000, realQuote: 5, quoteUsd: 150 };
+    const lastTrade = (overrides: Partial<MarketEvent> = {}): MarketEvent => ({ mint: 'MINT', price: 103, liquidityUsd: 9_000, marketTimestamp: T0 - 600_000, sourceTimestamp: null, receivedAt: T0 - 600_000, slot: 5, eventId: 'sig-last', source: 'PUMP_FUN_STREAM', curve, migrated: false, ...overrides });
+
+    it('healthy stream + silent bonding-curve token: max hold closes on the last curve state (the current price)', async () => {
+      const h = harness([launchPosition({ maxHoldUntil: new Date(T0 - 1_000) })], { latest: () => lastTrade() });
+      await h.monitor.start();
+      await h.monitor.watchdog();
+      await h.settle();
+      expect(h.fixture.closes).toHaveLength(1);
+      expect(h.fixture.closes[0].updates.exitReason).toBe('MAX_HOLD_TIME');
+      expect(h.monitor.snapshot().maxHoldOnSilentCurve).toBe(1);
+      await h.monitor.stop();
+    });
+
+    it('migrated token without a fresh quote: no exit at an invented price, waits for a real quote (logged once)', async () => {
+      const h = harness([launchPosition({ maxHoldUntil: new Date(T0 - 1_000) })], { latest: () => lastTrade({ migrated: true, curve: null }) });
+      await h.monitor.start();
+      await h.monitor.watchdog();
+      await h.monitor.watchdog();
+      await h.settle();
+      expect(h.fixture.closes).toHaveLength(0);
+      expect(h.monitor.snapshot().maxHoldWaitingForQuote).toBe(1);
+      expect(h.polls.length).toBeGreaterThan(0);
+      await h.monitor.stop();
+    });
+
+    it('no max hold configured (maxHoldUntil null): a silent position between SL and TP stays open (reported by diagnostics)', async () => {
+      const h = harness([launchPosition({ maxHoldUntil: null })], { latest: () => lastTrade() });
+      await h.monitor.start();
+      h.clock.now += 14 * 3_600_000;
+      await h.monitor.watchdog();
+      await h.settle();
+      expect(h.fixture.closes).toHaveLength(0);
+      await h.monitor.stop();
+    });
+  });
+});

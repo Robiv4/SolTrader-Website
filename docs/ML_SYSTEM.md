@@ -348,3 +348,31 @@ Python found on PATH cannot install scikit-learn or LightGBM.
 - `sellabilityFailureAfterEntry` cannot be observed without real sells.
 - The trading simulation only covers candidates that were actually bought. It filters real PAPER trades and does not
   simulate fills for unbought candidates.
+
+## Community model (`ML-FEATURES-COMMUNITY-v1`)
+
+A separate feature version: the v1 features (unchanged builder) + 28 `COMMUNITY` features. v1 / v3 models never see
+them. The v1 SHADOW model is still chosen among `ML-FEATURES-v1` models only.
+
+- **Sources** (worker `CommunityService`, MONITOR_ONLY): Telegram / X from Social Intelligence; DEX Screener public API
+  (`/tokens/v1/solana/{≤30 mints}`, `/orders/v1/solana/{mint}`; identity = pair base token equals the mint); on-chain
+  breadth / concentration / large sells / repeated amounts from the existing launch trade stream; LunarCrush only with
+  a key and only when the response contains the mint. Budgets, 429 / 5xx / timeout backoff; an outage removes data
+  only. Provider health: Redis `community:health`.
+- **Time correctness**: `assess(mint, social, at)` uses observations received at or before `at`; a community snapshot
+  newer than the ML snapshot is excluded (`lateDataExcluded: COMMUNITY`, features null). Missing data is null, never 0.
+- **Community Score** (`computeCommunitySnapshot`): weighted mean of the available components (social activity .30,
+  organic interest .25, on-chain breadth .25, DEX profile .10, cleanliness .10), null unless ≥ 2 components including
+  social or on-chain. It never replaces the mandatory safety checks.
+- **SHADOW rows**: every snapshot point also stores a community-version `MlFeatureSnapshot`; its outcome is the v1
+  snapshot of the same candidate and kind. The newest SHADOW model of the community version predicts on it.
+- **Targets**: A = `plus20BeforeMinus10_30m` (price events); B = `simExitNetPositive` (`SIM-EXIT-v1`): net PAPER
+  result of a 20 USD entry under the New Launch exit rules (SL first inside a bucket, break-even / trailing from the
+  next bucket, TP, liquidity safety, max hold), 30 bps fee per side and the PAPER impact model. Data gaps or an early
+  observation end exclude the row (never guessed).
+- **Commands**: `pnpm ml:schema` (writes `features-community-v1.json`), `pnpm ml:dataset --feature-version
+  ML-FEATURES-COMMUNITY-v1 [--target simExitNetPositive]` (default version `COMMUNITY-v<n>`), `pnpm ml:train --dataset
+  COMMUNITY-v1` → `ML-LGBM-COMMUNITY-v1-s42` (status TRAINED; promotion and PAPER approval are the usual manual gates,
+  plus `DATASET_FEATURE_VERSION_MISMATCH`).
+- **UI**: Machine Learning → Community ML (provider status, community models, Community vs v3, hourly funnel, per-token
+  decisions with the community data known at decision time, stuck-position diagnostics).

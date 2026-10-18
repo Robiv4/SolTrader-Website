@@ -16,7 +16,7 @@ import path from 'node:path';
 
 import { Prisma, type PrismaClient } from '@prisma/client';
 import {
-  classifyMlProbability, ML_FEATURE_VERSION, ML_PAPER_SNAPSHOT_POINTS, ML_PERMANENT_BLOCKERS, mlBuyWindowOpen, mlDecisionTiming, predictMl, validateArtifact,
+  classifyMlProbability, isSupportedFeatureVersion, ML_FEATURE_VERSION, ML_PAPER_SNAPSHOT_POINTS, ML_PERMANENT_BLOCKERS, mlBuyWindowOpen, mlDecisionTiming, predictMl, validateArtifact,
   type MlFeatureSnapshotResult, type MlModelArtifact,
 } from '@soltrader/strategy-engine';
 
@@ -102,7 +102,8 @@ export class MlPaperModelRegistry {
     if (!row) return { lookup: { ok: false, reason: 'MODEL_NOT_FOUND' }, hash: null };
     if (!row.paperApproved) return { lookup: { ok: false, reason: 'MODEL_NOT_PAPER_APPROVED' }, hash: row.artifactHash };
     if (row.status === 'RETIRED') return { lookup: { ok: false, reason: 'MODEL_RETIRED' }, hash: row.artifactHash };
-    if (row.featureVersion !== ML_FEATURE_VERSION) return { lookup: { ok: false, reason: 'FEATURE_VERSION_MISMATCH' }, hash: row.artifactHash };
+    // ML-FEATURES-v1 or ML-FEATURES-COMMUNITY-v1 (each model gets exactly its own feature set).
+    if (!isSupportedFeatureVersion(row.featureVersion)) return { lookup: { ok: false, reason: 'FEATURE_VERSION_MISMATCH' }, hash: row.artifactHash };
     const cached = this.cache.get(version);
     // Same approved artifact as before: keep the parsed model (only approval / hash are re-checked).
     if (cached?.lookup.ok && cached.hash === row.artifactHash) return { lookup: cached.lookup, hash: row.artifactHash };
@@ -112,7 +113,7 @@ export class MlPaperModelRegistry {
     const snapshotAgeMs = ML_PAPER_SNAPSHOT_POINTS[snapshotKind];
     if (snapshotAgeMs === undefined) return { lookup: { ok: false, reason: `UNSUPPORTED_SNAPSHOT_KIND_${snapshotKind}` }, hash: row.artifactHash };
     const artifact = validateArtifact(await this.readArtifact(row));
-    if (artifact.featureVersion !== ML_FEATURE_VERSION) return { lookup: { ok: false, reason: 'ARTIFACT_FEATURE_VERSION_MISMATCH' }, hash: row.artifactHash };
+    if (artifact.featureVersion !== row.featureVersion) return { lookup: { ok: false, reason: 'ARTIFACT_FEATURE_VERSION_MISMATCH' }, hash: row.artifactHash };
     if (artifact.modelVersion !== row.version) return { lookup: { ok: false, reason: 'ARTIFACT_VERSION_MISMATCH' }, hash: row.artifactHash };
     this.deps.logger.info({ modelVersion: version, algorithm: artifact.algorithm, snapshotKind }, 'ML PAPER model loaded');
     return { lookup: { ok: true, model: { version, artifact, snapshotKind, snapshotAgeMs, minDataQuality: datasetConfig.minDataQuality ?? 50 } }, hash: row.artifactHash };
@@ -168,8 +169,8 @@ export interface MlPaperStepInput {
   now: number;
   config: MlPaperUserConfig;
   candidateId: () => Promise<string | null>;
-  /** Builds the feature snapshot at `now` (same builder and inputs as the SHADOW collection). */
-  buildFeatures: () => MlFeatureSnapshotResult | null;
+  /** Builds the feature snapshot of `featureVersion` at `now` (same builder and inputs as the SHADOW collection). */
+  buildFeatures: (featureVersion: string) => MlFeatureSnapshotResult | null;
   /** ML eligibility: a real price and at least two trades (same rule as the SHADOW collection). */
   eligible: (snapshot: MlFeatureSnapshotResult) => boolean;
   /** Mandatory safety blockers at this tick (empty = safe to hand to PAPER execution). */
@@ -304,7 +305,7 @@ export class MlPaperEntryEngine {
     let row: Parameters<PrismaClient['mlPaperDecision']['create']>[0]['data'];
     const common = {
       userId: input.userId, candidateId: await input.candidateId().catch(() => null), mint: input.mint, modelVersion: model?.version ?? input.config.modelVersion ?? 'NONE',
-      featureVersion: ML_FEATURE_VERSION, snapshotKind: model?.snapshotKind ?? 'AGE_30S', detectedAt: new Date(input.detectedAt), decidedAt: new Date(input.now),
+      featureVersion: model?.artifact.featureVersion ?? ML_FEATURE_VERSION, snapshotKind: model?.snapshotKind ?? 'AGE_30S', detectedAt: new Date(input.detectedAt), decidedAt: new Date(input.now),
       threshold: new Prisma.Decimal(threshold.toFixed(3)), ...base,
       ...factsData((() => {
         try {
@@ -323,8 +324,10 @@ export class MlPaperEntryEngine {
       let failure: { decision: 'ML_SKIP' | 'ML_ERROR'; reason: string } | null = null;
       let probability: number | null = null;
       try {
-        snapshot = input.buildFeatures();
-        if (!snapshot || !input.eligible(snapshot)) failure = { decision: 'ML_SKIP', reason: 'ML_INELIGIBLE' };
+        snapshot = input.buildFeatures(model.artifact.featureVersion);
+        if (snapshot && snapshot.featureVersion !== model.artifact.featureVersion) failure = { decision: 'ML_ERROR', reason: 'FEATURE_VERSION_MISMATCH' };
+        if (failure) { /* keep the version mismatch error */ }
+        else if (!snapshot || !input.eligible(snapshot)) failure = { decision: 'ML_SKIP', reason: 'ML_INELIGIBLE' };
         // Critical groups (market / security / risk) observed after the snapshot, or a late optional group that still
         // carries a value: real leakage -> refused. Late SOCIAL data alone is excluded (null) by the builder, not leakage.
         else if (snapshot.invalidReasons.some((reason) => reason.startsWith('FUTURE_DATA') || reason.startsWith('LATE_DATA_NOT_EXCLUDED'))) {

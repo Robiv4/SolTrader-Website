@@ -10,9 +10,9 @@ import pandas as pd
 from .data import META_COLUMNS, load_schema
 
 
-def make_synthetic_dataset(directory: Path, rows: int = 1200, seed: int = 7) -> Path:
+def make_synthetic_dataset(directory: Path, rows: int = 1200, seed: int = 7, feature_version: str | None = None, version: str | None = None) -> Path:
     rng = np.random.default_rng(seed)
-    schema = load_schema()
+    schema = load_schema(feature_version=feature_version)
     start = 1_790_000_000_000
     times = start + np.cumsum(rng.integers(5_000, 60_000, size=rows))
     data: dict[str, object] = {}
@@ -26,7 +26,7 @@ def make_synthetic_dataset(directory: Path, rows: int = 1200, seed: int = 7) -> 
             data[name] = values
         else:
             values = np.abs(rng.normal(50, 40, size=rows))
-            if spec['group'] == 'SOCIAL':
+            if spec['group'] in ('SOCIAL', 'COMMUNITY'):
                 values[rng.random(rows) < 0.8] = np.nan
             elif rng.random() < 0.3:
                 values[rng.random(rows) < 0.1] = np.nan
@@ -44,7 +44,7 @@ def make_synthetic_dataset(directory: Path, rows: int = 1200, seed: int = 7) -> 
     out = pd.concat([meta[META_COLUMNS], frame[feature_columns]], axis=1)
     directory.mkdir(parents=True, exist_ok=True)
     out.to_csv(directory / 'dataset.csv', index=False)
-    manifest = {'version': f'SYNTHETIC-{seed}-{rows}', 'featureVersion': schema['featureVersion'], 'labelVersion': 'ML-LABELS-v1', 'target': 'plus20BeforeMinus10_30m',
+    manifest = {'version': version or f'SYNTHETIC-{seed}-{rows}', 'featureVersion': schema['featureVersion'], 'labelVersion': 'ML-LABELS-v1', 'target': 'plus20BeforeMinus10_30m',
                 'synthetic': True, 'leakageViolations': 0, 'outcomeQuality': {'COMPLETE': rows}}
     (directory / 'manifest.json').write_text(json.dumps(manifest), encoding='utf-8')
     return directory

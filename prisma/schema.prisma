@@ -1548,3 +1548,38 @@ model MlPrediction {
   @@unique([snapshotId, modelVersion])
   @@index([modelVersion, predictedAt])
 }
+
+/// Community Intelligence snapshot (COMMUNITY-v1, MONITOR_ONLY): audit / UI history of the combined community view of a
+/// token at `at` (Telegram / X via Social Intelligence, DEX Screener, on-chain stream, optional LunarCrush). Only data
+/// received at or before `at`; missing sources are listed in `sources` (never stored as zero). Not used to trade.
+model CommunitySnapshot {
+  id                 String   @id @default(cuid())
+  mint               String
+  at                 DateTime
+  version            String
+  mode               String
+  /// GOOD | WEAK | NO_DATA | STALE | UNRELIABLE_IDENTITY
+  quality            String
+  communityScore     Int?
+  dataQuality        Int
+  coverage           Decimal? @db.Decimal(6, 4)
+  socialMomentum     Int?
+  spamScore          Int?
+  mentions5m         Int?
+  uniqueAuthors5m    Int?
+  onchainBuyers5m    Int?
+  buyerConcentration Decimal? @db.Decimal(6, 4)
+  paidPromotion      Boolean?
+  /// All community features (null = unknown)
+  features           Json
+  /// Per source: status, receivedAt, ageSeconds, reason
+  sources            Json
+  /// Score components and the weights actually used
+  components         Json
+  lateExcluded       Json
+  reasons            Json
+  createdAt          DateTime @default(now())
+
+  @@index([mint, at])
+  @@index([at])
+}

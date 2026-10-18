@@ -25,10 +25,10 @@ import type { SocialSnapshotResult } from '../social/index.js';
 
 export const ML_FEATURE_VERSION = 'ML-FEATURES-v1';
 /** Feature groups whose late data is excluded (null) instead of invalidating the snapshot. Critical groups are never here. */
-export const ML_OPTIONAL_LATE_GROUPS: ReadonlyArray<string> = ['SOCIAL'];
+export const ML_OPTIONAL_LATE_GROUPS: ReadonlyArray<string> = ['SOCIAL', 'COMMUNITY'];
 
 export type MlFeatureType = 'number' | 'boolean' | 'category';
-export type MlFeatureGroup = 'AGE' | 'MARKET' | 'STRUCTURE' | 'SECURITY' | 'RISK' | 'LAUNCH' | 'SOCIAL' | 'SOURCE';
+export type MlFeatureGroup = 'AGE' | 'MARKET' | 'STRUCTURE' | 'SECURITY' | 'RISK' | 'LAUNCH' | 'SOCIAL' | 'SOURCE' | 'COMMUNITY';
 
 export interface MlFeatureSpec {
   name: string;

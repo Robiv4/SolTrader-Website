@@ -47,8 +47,9 @@ describe('late social data is excluded, never leaked (task 2 / 3 / 5)', () => {
     expect(onTime.validForTraining).toBe(true);
   });
 
-  it('only SOCIAL is an optional group; critical groups are never excluded silently', () => {
-    expect(ML_OPTIONAL_LATE_GROUPS).toEqual(['SOCIAL']);
+  it('only SOCIAL and COMMUNITY are optional groups; critical groups are never excluded silently', () => {
+    expect(ML_OPTIONAL_LATE_GROUPS).toEqual(['SOCIAL', 'COMMUNITY']);
+    for (const critical of ['AGE', 'MARKET', 'STRUCTURE', 'SECURITY', 'RISK', 'LAUNCH', 'SOURCE']) expect(ML_OPTIONAL_LATE_GROUPS).not.toContain(critical);
   });
 });
 

@@ -1,10 +1,11 @@
 import { Prisma, type PrismaClient } from '@prisma/client';
 import type { TokenDataProvider } from '@soltrader/market-data';
 import { assessRisk, DEFAULT_RISK_THRESHOLDS, type RiskFactorInput } from '@soltrader/risk-engine';
-import { buyerTrendFromObservations, effectiveMlMinLiquidityUsd, evaluateNewLaunch, mlEntrySafetyBlockers, socialBlocksEntry, evaluateQualityGate, socialSummary, type LaunchSecurity, type LaunchState, type NewLaunchStrategyResult, type QualityGateResult, type SocialSnapshotResult } from '@soltrader/strategy-engine';
+import { buyerTrendFromObservations, effectiveMlMinLiquidityUsd, evaluateNewLaunch, ML_FEATURE_VERSION, mlEntrySafetyBlockers, socialBlocksEntry, evaluateQualityGate, socialSummary, type LaunchSecurity, type LaunchState, type NewLaunchStrategyResult, type QualityGateResult, type SocialSnapshotResult } from '@soltrader/strategy-engine';
 import { toRiskEngineConfig } from '@soltrader/token-discovery';
 
-import { buildLaunchMlSnapshot, ML_REFERENCE_ORDER_USD } from '../ml/launch-snapshot.js';
+import type { CommunityService } from '../community/community-service.js';
+import { buildLaunchMlSnapshot, buildLaunchMlSnapshotFor, ML_REFERENCE_ORDER_USD } from '../ml/launch-snapshot.js';
 import { DEFAULT_ML_PAPER_CONFIG, type MlPaperEntryEngine, type MlPaperUserConfig, toMlPaperConfig } from '../ml/ml-paper-engine.js';
 import type { MlShadowService } from '../ml/ml-shadow-service.js';
 import { inRejectedSample, type SocialService } from '../social/social-service.js';
@@ -54,6 +55,11 @@ export interface NewLaunchServiceDependencies {
   publish: (payload: Record<string, unknown>) => Promise<void>;
   /** Social Intelligence (optional; shadow features, never on the exit path, never awaited at decision time). */
   social?: Pick<SocialService, 'track' | 'assess' | 'latest'>;
+  /**
+   * Community Intelligence (MONITOR_ONLY): receives the trade stream and the tracked tokens; its synchronous `assess`
+   * feeds the COMMUNITY features of models trained on ML-FEATURES-COMMUNITY-v1. Never makes, blocks or sizes a trade.
+   */
+  community?: Pick<CommunityService, 'track' | 'onTrade' | 'assess'>;
   /**
    * Machine Learning SHADOW observer (learning pipeline). Receives copies of data only; every call is synchronous,
    * wrapped (failures isolated) and nothing is awaited: it cannot change or delay any trading decision.
@@ -167,6 +173,7 @@ export class NewLaunchService {
           onTrade: (trade) => {
             this.tracker.onTrade(trade);
             this.mlSafe(() => this.deps.ml?.onTrade(trade, this.tracker.solPriceUsd));
+            this.mlSafe(() => this.deps.community?.onTrade(trade, this.tracker.solPriceUsd));
             try {
               this.deps.candles?.record(trade, this.tracker.solPriceUsd);
             } catch {
@@ -450,6 +457,8 @@ export class NewLaunchService {
       await this.persistSnapshot(launch, candidateId, result.dataQuality, now);
       // Social Intelligence: computed from already collected data (no provider request here). MONITOR_ONLY never changes the decision.
       const social = this.socialFor(launch, user, result, now);
+      // Community collection priority: tokens already failing hard security get the slow cadence only.
+      this.mlSafe(() => this.deps.community?.track(launch.mint, result.status === 'BLOCKED' || result.reasons.some((reason) => reason === 'CREATOR_SELLING' || reason === 'CRITICAL_LIQUIDITY') ? 1 : 3));
       const socialEnforcedBlock = socialBlocksEntry({ decision: result.decision, mode: user.settings.socialDecisionMode, shadowDecision: social?.shadowDecision });
       // Quality gate: only for candidates the strategy decided to BUY (after hard security / risk), before execution.
       const gate = result.decision === 'BUY' ? this.qualityGateFor(result, state, user) : null;
@@ -546,8 +555,23 @@ export class NewLaunchService {
     if (!engine) return;
     // Same builder and inputs as the SHADOW collection at this moment (the risk score and social assessment of this
     // evaluation, both computed at `now`): identical features in both pipelines.
-    let built: ReturnType<typeof buildLaunchMlSnapshot> | null = null;
-    const build = () => (built ??= buildLaunchMlSnapshot({ at: now, launch, state: this.tracker.state(launch.mint, ML_REFERENCE_ORDER_USD), security, riskScore: risk.riskScore, riskObservedAt: now, social }));
+    const built = new Map<string, ReturnType<typeof buildLaunchMlSnapshot>>();
+    // Feature set of the model: v1 (unchanged) or COMMUNITY-v1 (community snapshot assessed at `now`, synchronous).
+    const build = (featureVersion = ML_FEATURE_VERSION) => {
+      let value = built.get(featureVersion);
+      if (!value) {
+        const community = featureVersion === ML_FEATURE_VERSION ? null : (() => {
+          try {
+            return this.deps.community?.assess(launch.mint, social, now) ?? null;
+          } catch {
+            return null;
+          }
+        })();
+        value = buildLaunchMlSnapshotFor(featureVersion, { at: now, launch, state: this.tracker.state(launch.mint, ML_REFERENCE_ORDER_USD), security, riskScore: risk.riskScore, riskObservedAt: now, social, community });
+        built.set(featureVersion, value);
+      }
+      return value;
+    };
     // ML PAPER minimum liquidity: the user's saved ML value (else the DEFAULT minimum: no looser limit without a save).
     // The ML risk assessment uses it as the risk engine's liquidity reference too, so the DEFAULT / bot minimum cannot
     // re-enter through the risk score. The SHADOW features above keep the unchanged DEFAULT risk score (same as training).
@@ -561,7 +585,7 @@ export class NewLaunchService {
       userId: user.userId, mint: launch.mint, detectedAt: launch.detectedAt, now, config: user.strategy,
       facts: () => ({ minLiquidityUsd: mlMinLiquidityUsd, liquidityUsd: f.liquidityUsd, sellability: security.security.sellability }),
       candidateId: context.getCandidateId,
-      buildFeatures: () => build().snapshot,
+      buildFeatures: (featureVersion) => build(featureVersion).snapshot,
       eligible: () => build().eligible,
       // Mandatory safety only: the DEFAULT strategy's decision, thresholds, timing window, quality gate and social AVOID
       // never veto an ML BUY (ML-only mode, see ML_IGNORED_DEFAULT_FILTERS).

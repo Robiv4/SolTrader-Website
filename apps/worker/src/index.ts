@@ -7,6 +7,10 @@ import { createMarketDataProvider, PrismaMarketDataRepository } from '@soltrader
 import { BotCommandSubscriber } from '@soltrader/shared';
 import { createClient } from 'redis';
 
+import { CommunityService } from './community/community-service.js';
+import { DexScreenerClient } from './community/dexscreener.js';
+import { HttpBudget } from './community/http-budget.js';
+import { LunarCrushClient } from './community/lunarcrush.js';
 import { env } from './config.js';
 import { capacityMetrics } from './exit/entry-capacity.js';
 import { HotPositionMonitor, type MarketEvent } from './exit/hot-position-monitor.js';
@@ -113,6 +117,24 @@ const socialService = env.SOCIAL_COLLECTION_ENABLED ? new SocialService({
 }) : null;
 socialServiceRef = socialService;
 
+// Community Intelligence (MONITOR_ONLY): DEX Screener (public API), on-chain stream statistics, optional LunarCrush.
+// Background collection only; entries / exits never wait for it and an outage only removes community data.
+const communityBudget = (source: string, enabled: boolean, configured: boolean, perMinute: number) => new HttpBudget({
+  source, enabled, configured, perMinute, timeoutMs: env.COMMUNITY_REQUEST_TIMEOUT_MS, backoffBaseMs: env.COMMUNITY_BACKOFF_BASE_MS, backoffMaxMs: env.COMMUNITY_BACKOFF_MAX_MS,
+});
+const lunarKey = env.LUNARCRUSH_ENABLED ? env.LUNARCRUSH_API_KEY?.trim() || null : null;
+const communityService = env.COMMUNITY_INTELLIGENCE_ENABLED ? (() => {
+  const dexHttp = communityBudget('DEXSCREENER', env.DEXSCREENER_ENABLED, true, env.DEXSCREENER_REQUESTS_PER_MINUTE);
+  const lunarHttp = communityBudget('LUNARCRUSH', env.LUNARCRUSH_ENABLED, Boolean(lunarKey), env.LUNARCRUSH_REQUESTS_PER_MINUTE);
+  return new CommunityService({
+    prisma,
+    logger,
+    onchainEnabled: env.HELIUS_COMMUNITY_ENABLED,
+    dex: { http: dexHttp, client: new DexScreenerClient(dexHttp), cacheTtlMs: env.DEXSCREENER_CACHE_TTL_MS },
+    lunar: { http: lunarHttp, client: new LunarCrushClient(lunarHttp, lunarKey), cacheTtlMs: env.LUNARCRUSH_CACHE_TTL_MS },
+  });
+})() : null;
+
 // Machine Learning (learning pipeline, SHADOW only): snapshots + outcomes from data the NewLaunch pipeline already has.
 // ENFORCE_PAPER is prepared but not available in this release; LIVE is never an ML mode.
 const mlModeRequested = (process.env.ML_MODE?.trim().toUpperCase() || 'SHADOW') as MlMode;
@@ -131,6 +153,7 @@ const mlService = new MlShadowService({
     const snapshot = await marketDataProvider.getTokenMetrics(mint).catch(() => null);
     return snapshot?.priceUsd ? { priceUsd: snapshot.priceUsd, liquidityUsd: snapshot.liquidityUsd ?? null } : null;
   },
+  community: communityService ?? undefined,
   incrementDaily: (metric, amount = 1) => {
     const key = `ml:stats:${new Date().toISOString().slice(0, 10)}:${metric}`;
     void redisClient.incrBy(key, amount).then(() => redisClient.expire(key, 30 * 86_400)).catch(() => undefined);
@@ -149,6 +172,7 @@ const newLaunch = new NewLaunchService({
   mlPaper: mlPaperEngine,
   candles: tradeCandles,
   social: socialService ?? undefined,
+  community: communityService ?? undefined,
   ml: mlService.enabled ? mlService : undefined,
   prisma,
   providers: [
@@ -383,6 +407,10 @@ async function main() {
     await mlService.resume().catch((error: unknown) => logger.warn({ err: error instanceof Error ? error.message : String(error) }, 'ML outcome resume failed (trading unaffected)'));
     void mlService.refreshModel(Date.now(), true);
   }
+  if (communityService) {
+    communityService.start();
+    globalThis.setInterval(() => void eventPublisher.set('community:health', JSON.stringify(communityService.health()), { EX: 60 }).catch(() => undefined), 5_000);
+  }
   if (socialService) {
     socialService.start();
     globalThis.setInterval(() => void eventPublisher.set('social:health', JSON.stringify(socialService.health()), { EX: 60 }).catch(() => undefined), 5_000);
@@ -409,6 +437,7 @@ async function shutdown(signal: string) {
   if (exitMonitorTimer) globalThis.clearInterval(exitMonitorTimer);
   await hotMonitor?.stop();
   socialService?.stop();
+  communityService?.stop();
   await telegramProvider.stop();
   newLaunch.stop();
   await loop.stop();

@@ -42,6 +42,8 @@ export interface SocialEvent {
   /** Telegram: the message is a forward / how often it was forwarded (channels expose this). */
   forwarded?: boolean;
   forwards?: number | null;
+  /** Telegram / X: id of the message this one replies to (conversation activity); undefined = not exposed. */
+  replyToId?: string | null;
   matchBasis: MatchBasis;
   matchConfidence: number;
 }
@@ -196,6 +198,10 @@ export interface WindowMetrics {
   questionRatio: number | null;
   /** Sum of forward counts where the platform exposes them (null = not exposed). */
   forwards: number | null;
+  /** Share of messages that are forwards (Telegram exposes it; null when no event carries the flag). */
+  forwardedShare: number | null;
+  /** Share of messages replying to another message (conversation activity; null when not exposed). */
+  replyShare: number | null;
 }
 
 /** Events visible at `at` (created and received no later than `at`) within the window. */
@@ -217,6 +223,8 @@ export function windowMetrics(events: SocialEvent[], windowMs: number): WindowMe
     engagements: withEngagement.length ? withEngagement.reduce((sum, event) => sum + (event.likes ?? 0) + (event.reposts ?? 0) + (event.replies ?? 0), 0) : null,
     views: withViews.length ? withViews.reduce((sum, event) => sum + (event.views ?? 0), 0) : null,
     forwards: events.some((event) => event.forwards != null) ? events.reduce((sum, event) => sum + (event.forwards ?? 0), 0) : null,
+    forwardedShare: events.some((event) => event.forwarded !== undefined) ? events.filter((event) => event.forwarded === true).length / events.length : null,
+    replyShare: events.some((event) => event.replyToId !== undefined) ? events.filter((event) => Boolean(event.replyToId)).length / events.length : null,
     topAuthorShare: events.length ? counts[0] / events.length : null,
     top3AuthorShare: events.length ? counts.slice(0, 3).reduce((sum, count) => sum + count, 0) / events.length : null,
     ...dup,

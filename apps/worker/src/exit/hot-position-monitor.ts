@@ -115,6 +115,8 @@ interface HotPosition {
   polling: boolean;
   lastPollAt: number;
   fallbackActive: boolean;
+  /** A due max hold waiting for a real quote was logged once. */
+  maxHoldWaitLogged?: boolean;
   persistPending: Partial<PositionRecord> | null;
   persistTimer: ReturnType<typeof globalThis.setTimeout> | null;
   persisting: Promise<void> | null;
@@ -148,6 +150,10 @@ export class HotPositionMonitor {
   private resyncing: Promise<void> | null = null;
   private health: StreamHealth = 'DISCONNECTED';
   private readonly metrics = {
+    /** Max hold evaluated on the current curve state of a silent token (stream healthy). */
+    maxHoldOnSilentCurve: 0,
+    /** Max hold due without any current price (migrated / pool token): waiting for a real quote. */
+    maxHoldWaitingForQuote: 0,
     eventsReceived: 0,
     evaluations: 0,
     exitsTriggered: 0,
@@ -499,6 +505,21 @@ export class HotPositionMonitor {
       const silentFor = position.lastStreamEventAt !== null ? now - position.lastStreamEventAt : Number.POSITIVE_INFINITY;
       const covered = next === 'CONNECTED' && streamed !== null && silentFor <= this.config.tokenSilenceFallbackMs;
       if (!covered) {
+        const maxHoldDue = Boolean(position.record.maxHoldUntil) && now >= new Date(position.record.maxHoldUntil!).getTime();
+        // A silent bonding-curve token: with the stream itself healthy, no event means no trade, so the last streamed
+        // curve state IS the current price (the price only moves on trades). A due max hold is evaluated on it instead of
+        // waiting for a market-data poll that a fresh launch usually cannot answer (positions stuck past their max hold).
+        if (maxHoldDue && next === 'CONNECTED' && streamed !== null && streamed.curve && !streamed.migrated && this.deps.isActive()) {
+          this.metrics.maxHoldOnSilentCurve += 1;
+          this.enqueue(position, { ...streamed, marketTimestamp: now, source: 'WATCHDOG' });
+          continue;
+        }
+        if (maxHoldDue && !position.maxHoldWaitLogged) {
+          // Never an invented exit price: a migrated / pool token without a fresh quote waits for the next real quote.
+          position.maxHoldWaitLogged = true;
+          this.metrics.maxHoldWaitingForQuote += 1;
+          this.deps.logger.warn({ positionId: position.record.id, mint, streamHealth: next, silentForMs: Number.isFinite(silentFor) ? silentFor : null }, 'Max hold due but no current price: waiting for a real quote');
+        }
         pollingNeeded.push(position);
         continue;
       }

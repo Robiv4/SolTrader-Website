@@ -16,9 +16,16 @@ META_COLUMNS = ['snapshot_id', 'candidate_id', 'mint', 'source', 'snapshot_kind'
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def load_schema(path: Path | None = None) -> dict:
-    schema_path = path or ROOT / 'schema' / 'features-v1.json'
-    return json.loads(schema_path.read_text(encoding='utf-8'))
+# Feature version -> exported schema file (pnpm ml:schema). Unknown versions are refused, never guessed.
+SCHEMA_FILES = {'ML-FEATURES-v1': 'features-v1.json', 'ML-FEATURES-COMMUNITY-v1': 'features-community-v1.json'}
+
+
+def load_schema(path: Path | None = None, feature_version: str | None = None) -> dict:
+    if path is None:
+        if feature_version is not None and feature_version not in SCHEMA_FILES:
+            raise SystemExit(f'Unsupported feature version {feature_version}')
+        path = ROOT / 'schema' / SCHEMA_FILES[feature_version or 'ML-FEATURES-v1']
+    return json.loads(path.read_text(encoding='utf-8'))
 
 
 def load_dataset(directory: Path) -> tuple[pd.DataFrame, dict]:
