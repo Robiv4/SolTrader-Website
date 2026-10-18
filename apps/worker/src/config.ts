@@ -61,6 +61,11 @@ const envSchema = z.object({
   TELEGRAM_GLOBAL_SEARCH_PER_MIN: z.coerce.number().int().min(0).max(20).default(2),
   /** Optional AI social analysis: default off (zero LLM calls). */
   AI_SOCIAL_ANALYSIS_ENABLED: z.string().optional().transform((value) => value === 'true'),
+  /** Token metadata (social links): IPFS gateways tried in order by CID (comma separated https URLs ending in /ipfs/). */
+  SOCIAL_IPFS_GATEWAYS: z.string().optional().transform((value) => (value ?? '').split(',').map((item) => item.trim()).filter((item) => /^https:\/\/[a-z0-9.-]+\/ipfs\/?$/i.test(item))),
+  /** Extra non-IPFS metadata hosts (exact or *.suffix), in addition to the built-in allowlist. */
+  SOCIAL_METADATA_EXTRA_HOSTS: z.string().optional().transform((value) => (value ?? '').split(',').map((item) => item.trim().toLowerCase()).filter((item) => /^(\*\.)?[a-z0-9-]+(\.[a-z0-9-]+)+$/.test(item))),
+  SOCIAL_METADATA_TIMEOUT_MS: z.coerce.number().int().min(1_000).max(20_000).default(6_000),
   /** Official X API v2 bearer token (server-side secret; never logged or sent to the frontend). Unset = X not configured. */
   X_API_BEARER_TOKEN: z.string().optional(),
   /** Request budget per 15 minutes for X recent search (set to your API tier's limit). */

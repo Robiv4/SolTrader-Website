@@ -17,7 +17,7 @@ import { createHash } from 'node:crypto';
 import type { MatchBasis, SocialIdentity } from '@soltrader/strategy-engine';
 import { RollingPercentiles } from '@soltrader/trading-engine';
 
-import { newHealth, type FetchResult, type ProviderHealth, type RawSocialPost, type SocialDataProvider } from './providers.js';
+import { newHealth, type FetchContext, type FetchResult, type ProviderHealth, type RawSocialPost, type SocialDataProvider, type TelegramDiscoveryVia, type TelegramLinkCandidate } from './providers.js';
 
 export type TelegramChatType = 'CHANNEL' | 'GROUP' | 'SUPERGROUP' | 'UNKNOWN';
 
@@ -84,7 +84,13 @@ export interface TelegramSourceRecord {
   url: string;
   chat: TelegramChat | null;
   officialStatus: TelegramOfficialStatus;
-  matchBasis: MatchBasis | 'VERIFIED_LINK';
+  /**
+   * Persisted provenance: OFFICIAL_SOCIAL_LINK = pump.fun metadata of the mint, DEXSCREENER_LINK = DEX Screener profile
+   * whose pair base token is the mint, MINT_ADDRESS = public message containing the exact mint (Telegram search).
+   */
+  matchBasis: MatchBasis | 'VERIFIED_LINK' | 'DEXSCREENER_LINK';
+  /** How the source was found (in memory / health; matchBasis carries it in the database). */
+  via: TelegramDiscoveryVia;
   matchConfidence: number;
   accessStatus: TelegramAccessStatus;
   discoveredAt: number;
@@ -129,6 +135,8 @@ const BUFFER_RETENTION_MS = 31 * 60_000;
 const SEARCH_REPEAT_MS = 10 * 60_000;
 const MAX_SOURCES_PER_TOKEN = 3;
 const MAX_COMMUNITY_SOURCES_PER_TOKEN = 2;
+/** A message older than this at fetch time is history (never live community momentum). */
+export const TELEGRAM_FRESH_MESSAGE_MS = BUFFER_RETENTION_MS;
 
 /** Stable, non-reversible author id (no raw Telegram user id is stored). */
 export function hashTelegramSender(senderId: string | null, chatId: string) {
@@ -162,6 +170,13 @@ export class TelegramSocialProvider implements SocialDataProvider {
     connectedSince: null as number | null, lastMessageAt: null as number | null, lastSyncAt: null as number | null,
     messagesReceived: 0, announcementsSkipped: 0, reconnects: 0, lastFloodWaitSeconds: null as number | null,
     searches: 0, sourcesSkippedCap: 0, sourcesNoAccess: 0, botMessagesReceived: 0,
+    /** Mint searches that returned at least one usable chat / hits rejected by reason. */
+    searchesWithHits: 0, searchHits: 0, searchHitsRejected: { NO_EXACT_MINT: 0, NO_PUBLIC_USERNAME: 0, BROADCAST_CHANNEL: 0, PER_TOKEN_LIMIT: 0 } as Record<string, number>,
+    /** Sources registered per discovery route, and how many of them were readable (ACCESSIBLE). */
+    sourcesByVia: { PUMP_FUN_METADATA: 0, DEXSCREENER: 0, TELEGRAM_SEARCH: 0 } as Record<TelegramDiscoveryVia, number>,
+    accessibleByVia: { PUMP_FUN_METADATA: 0, DEXSCREENER: 0, TELEGRAM_SEARCH: 0 } as Record<TelegramDiscoveryVia, number>,
+    /** Messages fetched that were recent (<= 31 min old) vs. older history (kept out of every window). */
+    freshMessages: 0, historicalMessagesSkipped: 0, lastFreshMessageAt: null as number | null,
   };
 
   constructor(private readonly options: TelegramProviderOptions) {
@@ -205,6 +220,17 @@ export class TelegramSocialProvider implements SocialDataProvider {
         sourcesNoAccess: this.metrics.sourcesNoAccess,
         sourcesSkippedCap: this.metrics.sourcesSkippedCap,
         globalSearches: this.metrics.searches,
+        searchesWithHits: this.metrics.searchesWithHits,
+        searchHits: this.metrics.searchHits,
+        searchHitsRejected: this.metrics.searchHitsRejected,
+        sourcesByVia: this.metrics.sourcesByVia,
+        accessibleByVia: this.metrics.accessibleByVia,
+        verifiedSources: [...this.registry.values()].reduce((count, sources) => count + [...sources.values()].filter((record) => record.active && record.accessStatus === 'ACCESSIBLE').length, 0),
+        activeGroups: accessible.filter((buffer) => buffer.chat.type !== 'CHANNEL').length,
+        activeChannels: accessible.filter((buffer) => buffer.chat.type === 'CHANNEL').length,
+        freshMessages: this.metrics.freshMessages,
+        historicalMessagesSkipped: this.metrics.historicalMessagesSkipped,
+        lastFreshMessageAt: this.metrics.lastFreshMessageAt ? new Date(this.metrics.lastFreshMessageAt).toISOString() : null,
         processingLatencyMs: this.processing.summary(),
       },
     };
@@ -296,6 +322,8 @@ export class TelegramSocialProvider implements SocialDataProvider {
       this.registry.set(record.mint, sources);
     }
     sources.set(record.username, record);
+    this.metrics.sourcesByVia[record.via] += 1;
+    if (record.active && record.accessStatus === 'ACCESSIBLE') this.metrics.accessibleByVia[record.via] += 1;
     try {
       this.options.onSource?.({ ...record });
     } catch {
@@ -346,24 +374,37 @@ export class TelegramSocialProvider implements SocialDataProvider {
     return true;
   }
 
-  /** Official source (token metadata link) + budgeted mint-address search for community sources. */
-  private async discover(identity: SocialIdentity) {
+  /** A verified link (metadata of the mint / DEX Screener profile of the mint): resolved by public username, never joined. */
+  private async registerLink(mint: string, username: string, via: Exclude<TelegramDiscoveryVia, 'TELEGRAM_SEARCH'>) {
     const now = this.now();
-    const known = this.registry.get(identity.mint);
-    const official = identity.officialTelegram;
-    if (official && !known?.has(official)) {
-      const resolved = await this.resolveCached(official);
-      if (resolved.access !== 'ACCESSIBLE') this.metrics.sourcesNoAccess += 1;
-      this.setRecord({
-        mint: identity.mint, username: official, url: `https://t.me/${official}`, chat: resolved.chat,
-        // The link comes from the token's own metadata: the strongest identity signal after the mint itself.
-        officialStatus: 'OFFICIAL', matchBasis: 'OFFICIAL_SOCIAL_LINK', matchConfidence: 0.9,
-        accessStatus: resolved.access, discoveredAt: now, lastVerifiedAt: resolved.chat ? now : null, active: resolved.access === 'ACCESSIBLE',
-      });
+    const resolved = await this.resolveCached(username);
+    if (resolved.access !== 'ACCESSIBLE') this.metrics.sourcesNoAccess += 1;
+    const metadata = via === 'PUMP_FUN_METADATA';
+    this.setRecord({
+      mint, username, url: `https://t.me/${username}`, chat: resolved.chat,
+      // Metadata of the mint itself is the strongest identity signal after the mint; a DEX Screener profile is
+      // operator-submitted for that exact mint (paid, reviewed) but one step removed: PROBABLE_OFFICIAL.
+      officialStatus: metadata ? 'OFFICIAL' : 'PROBABLE_OFFICIAL', matchBasis: metadata ? 'OFFICIAL_SOCIAL_LINK' : 'DEXSCREENER_LINK', matchConfidence: metadata ? 0.9 : 0.8, via,
+      accessStatus: resolved.access, discoveredAt: now, lastVerifiedAt: resolved.chat ? now : null, active: resolved.access === 'ACCESSIBLE',
+    });
+  }
+
+  /**
+   * Discovery order: 1. official link from the mint's metadata, 2. verified DEX Screener link of the mint, 3. budgeted
+   * public search for the exact mint address (only while no verified source is readable). A name / ticker is never
+   * enough to attach a chat. Duplicates (same username via several routes) keep the strongest provenance.
+   */
+  private async discover(identity: SocialIdentity, links: TelegramLinkCandidate[] = []) {
+    const now = this.now();
+    const known = () => this.registry.get(identity.mint);
+    if (identity.officialTelegram && !known()?.has(identity.officialTelegram)) await this.registerLink(identity.mint, identity.officialTelegram, 'PUMP_FUN_METADATA');
+    for (const link of links) {
+      if (known()?.has(link.username)) continue;
+      await this.registerLink(identity.mint, link.username, link.via);
     }
     const perMinute = this.options.globalSearchPerMinute ?? 2;
-    const hasOfficial = [...(this.registry.get(identity.mint)?.values() ?? [])].some((record) => record.officialStatus === 'OFFICIAL' && record.active);
-    if (perMinute <= 0 || hasOfficial || now - (this.searchedAt.get(identity.mint) ?? 0) < SEARCH_REPEAT_MS) return;
+    const hasVerified = [...(known()?.values() ?? [])].some((record) => (record.officialStatus === 'OFFICIAL' || record.officialStatus === 'PROBABLE_OFFICIAL') && record.active);
+    if (perMinute <= 0 || hasVerified || now - (this.searchedAt.get(identity.mint) ?? 0) < SEARCH_REPEAT_MS) return;
     if (now - this.searchWindow.start >= 60_000) this.searchWindow = { start: now, used: 0 };
     if (this.searchWindow.used >= perMinute) return;
     this.searchWindow.used += 1;
@@ -371,14 +412,26 @@ export class TelegramSocialProvider implements SocialDataProvider {
     this.metrics.searches += 1;
     const hits = await this.call(() => this.options.gateway!.searchGlobal(identity.mint, 20));
     const chats = new Map<string, TelegramChat>();
-    // Only public chats (with a username) whose message contains the exact mint address.
-    for (const hit of hits) if (hit.chat.username && hit.message.text.includes(identity.mint)) chats.set(hit.chat.username.toLowerCase(), hit.chat);
+    // Only public chats (with a username) whose message contains the exact mint address; broadcast channels only
+    // announce (no community conversation) and are not attached as sources.
+    for (const hit of hits) {
+      if (!hit.message.text.includes(identity.mint)) this.metrics.searchHitsRejected.NO_EXACT_MINT += 1;
+      else if (!hit.chat.username) this.metrics.searchHitsRejected.NO_PUBLIC_USERNAME += 1;
+      else if (hit.chat.type === 'CHANNEL') this.metrics.searchHitsRejected.BROADCAST_CHANNEL += 1;
+      else chats.set(hit.chat.username.toLowerCase(), hit.chat);
+    }
+    this.metrics.searchHits += chats.size;
+    if (chats.size) this.metrics.searchesWithHits += 1;
     let added = 0;
     for (const [username, chat] of chats) {
-      if (added >= MAX_COMMUNITY_SOURCES_PER_TOKEN || this.registry.get(identity.mint)?.has(username)) continue;
+      if (known()?.has(username)) continue;
+      if (added >= MAX_COMMUNITY_SOURCES_PER_TOKEN) {
+        this.metrics.searchHitsRejected.PER_TOKEN_LIMIT += 1;
+        continue;
+      }
       added += 1;
       this.setRecord({
-        mint: identity.mint, username, url: `https://t.me/${username}`, chat, officialStatus: 'COMMUNITY', matchBasis: 'MINT_ADDRESS', matchConfidence: 0.6,
+        mint: identity.mint, username, url: `https://t.me/${username}`, chat, officialStatus: 'COMMUNITY', matchBasis: 'MINT_ADDRESS', matchConfidence: 0.6, via: 'TELEGRAM_SEARCH',
         accessStatus: 'ACCESSIBLE', discoveredAt: now, lastVerifiedAt: now, active: true,
       });
     }
@@ -402,6 +455,11 @@ export class TelegramSocialProvider implements SocialDataProvider {
       this.metrics.messagesReceived += fresh.length;
       this.metrics.lastMessageAt = Math.max(this.metrics.lastMessageAt ?? 0, fresh[fresh.length - 1].date);
       for (let index = 0; index < fresh.length; index += 1) this.receivedTimes.push(now);
+      // The first page of a chat is mostly history (possibly years old): counted apart, dropped below, never momentum.
+      const recent = fresh.filter((message) => now - message.date <= TELEGRAM_FRESH_MESSAGE_MS && message.date <= now + 60_000);
+      this.metrics.freshMessages += recent.length;
+      this.metrics.historicalMessagesSkipped += fresh.length - recent.length;
+      if (recent.length) this.metrics.lastFreshMessageAt = Math.max(this.metrics.lastFreshMessageAt ?? 0, ...recent.map((message) => message.date));
     }
     // Raw text retention: only the last 31 minutes (the longest window is 30 min) stay in memory.
     const cutoff = now - BUFFER_RETENTION_MS;
@@ -419,10 +477,10 @@ export class TelegramSocialProvider implements SocialDataProvider {
     }
   }
 
-  async fetchRecent(identity: SocialIdentity): Promise<FetchResult | null> {
+  async fetchRecent(identity: SocialIdentity, _sinceId: string | null = null, context: FetchContext = {}): Promise<FetchResult | null> {
     if (!this.mtprotoUsable) return null;
     try {
-      await this.discover(identity);
+      await this.discover(identity, context.telegramLinks ?? []);
       const records = this.registryFor(identity.mint).filter((record) => record.active && record.accessStatus === 'ACCESSIBLE').slice(0, MAX_SOURCES_PER_TOKEN);
       if (!records.length) return null;
       const now = this.now();
@@ -455,6 +513,8 @@ export class TelegramSocialProvider implements SocialDataProvider {
             createdAt: message.date, receivedAt: now, chatUsername: record.username, officialSource: record.officialStatus === 'OFFICIAL' || record.officialStatus === 'PROBABLE_OFFICIAL',
             forwarded: message.forwarded, forwards: message.forwards, replyToId: message.replyToId !== null ? `tg:${message.chatId}:${message.replyToId}` : null,
             likes: null, reposts: null, replies: null, views: message.views,
+            // Search-found groups discuss many tokens: only messages with the exact mint are attributed.
+            mintOnly: record.via === 'TELEGRAM_SEARCH',
           });
         }
         if (buffer.messages.length) this.consumers.set(key, buffer.messages[buffer.messages.length - 1].id);

@@ -39,6 +39,45 @@ export function createCommunityMlRouter(deps: Deps) {
     return res.json({ ok: true, data: { available: Boolean(health), health } });
   });
 
+  /**
+   * Telegram + metadata discovery diagnostics (worker health, credential-free) and the share of stored
+   * ML-FEATURES-COMMUNITY-v1 snapshots of the last 24 h that carry social (Telegram / X) data.
+   */
+  router.get('/community/telegram-health', async (_req: Request, res: Response) => {
+    try {
+      const [social, community, ml] = await Promise.all([
+        deps.readJson('social:health').catch(() => null),
+        deps.readJson('community:health').catch(() => null),
+        deps.readJson('ml:health').catch(() => null),
+      ]);
+      const providers = Array.isArray(social?.providers) ? social.providers as Array<Record<string, unknown>> : [];
+      const telegram = providers.find((provider) => provider.source === 'TELEGRAM') ?? null;
+      const since = new Date(Date.now() - 24 * HOUR);
+      const rows = await prisma.$queryRaw<Array<{ total: bigint; with_social: bigint }>>`
+        SELECT COUNT(*) AS total, COUNT(*) FILTER (WHERE "features"->>'mentions5m' IS NOT NULL) AS with_social
+        FROM "MlFeatureSnapshot" WHERE "featureVersion" = ${ML_COMMUNITY_FEATURE_VERSION} AND "snapshotAt" >= ${since.toISOString()}::timestamp`;
+      const total = Number(rows[0]?.total ?? 0);
+      const withSocial = Number(rows[0]?.with_social ?? 0);
+      return res.json({
+        ok: true,
+        data: {
+          available: Boolean(social),
+          telegram: telegram ? { state: telegram.state, enabled: telegram.enabled, configured: telegram.configured, lastError: telegram.lastError ?? null, rateLimitEvents: telegram.rateLimitEvents, details: telegram.details ?? null } : null,
+          metadata: social?.metadata ?? null,
+          externalTelegramLinks: social?.externalTelegramLinks ?? null,
+          coverage: social?.telegramCoverage ?? null,
+          messages: record(social?.messages).TELEGRAM ?? null,
+          community: community ? { assessmentsWithTelegram: record(community.metrics).assessmentsWithTelegram ?? null, assessments: record(community.metrics).assessments ?? null, telegramLinksForwarded: record(community.metrics).telegramLinksForwarded ?? null } : null,
+          mlLive: record(ml?.community),
+          mlSnapshots24h: { total, withSocialData: withSocial, share: total ? withSocial / total : null },
+        },
+      });
+    } catch (error) {
+      deps.logger.error({ err: error }, 'Telegram health failed');
+      return fail(res, 500, 'Telegram health failed');
+    }
+  });
+
   router.get('/community/ml-dashboard', async (req: Request, res: Response) => {
     try {
       const userId = req.user!.id;

@@ -73,10 +73,48 @@ const domainOf = (value: string | null) => {
   }
 };
 
+/** Telegram paths that are not public chats (stickers, sharing, proxies, private links, ...). */
+const TELEGRAM_RESERVED = new Set(['addstickers', 'addemoji', 'addtheme', 'addlist', 'share', 'iv', 'proxy', 'socks', 'login', 'setlanguage', 'bg', 'boost', 'invoice', 'joinchat', 'c', 'm', 'msg', 'confirmphone', 'contact', 's', 'telegram', 'durov', 'blog', 'apps', 'jobs', 'premium']);
+
+export type TelegramLinkRejection = 'EMPTY' | 'PRIVATE_INVITE' | 'NOT_TELEGRAM' | 'RESERVED_PATH' | 'INVALID_USERNAME' | 'BOT';
+
+/**
+ * Public Telegram chat username from a link / handle (t.me, telegram.me, tg://resolve, @name, bare name), lower case.
+ * Private invites (t.me/+..., joinchat, t.me/c/...) are never resolved or joined; other hosts, reserved paths, invalid
+ * usernames (Telegram: 5-32 chars, letter first, [a-z0-9_], no "__", no trailing "_") and bots are rejected.
+ */
+export function normalizeTelegramLink(value: string | null | undefined): { username: string; url: string } | { rejected: TelegramLinkRejection } {
+  const raw = (value ?? '').trim();
+  if (!raw) return { rejected: 'EMPTY' };
+  let candidate: string | null = null;
+  const tg = /^tg:\/\/resolve\?(?:.*&)?domain=([^&#]+)/i.exec(raw);
+  if (tg) candidate = decodeURIComponent(tg[1]);
+  else if (/^(?:https?:\/\/)?(?:www\.)?(?:t\.me|telegram\.me|telegram\.dog)(?:\/|$)/i.test(raw)) {
+    const path = raw.replace(/^(?:https?:\/\/)?(?:www\.)?(?:t\.me|telegram\.me|telegram\.dog)\/?/i, '').split(/[?#]/)[0];
+    if (/^(?:\+|joinchat\/|c\/)/i.test(path)) return { rejected: 'PRIVATE_INVITE' };
+    const segments = path.split('/').filter(Boolean);
+    const first = segments[0] === 's' && segments[1] ? segments[1] : segments[0];
+    if (!first) return { rejected: 'INVALID_USERNAME' };
+    if (TELEGRAM_RESERVED.has(first.toLowerCase()) && segments[0] !== 's') return { rejected: 'RESERVED_PATH' };
+    candidate = first;
+  } else if (/^[a-z][a-z0-9+.-]*:\/\//i.test(raw) || /\.[a-z]{2,}\//i.test(raw) || raw.includes('/')) return { rejected: 'NOT_TELEGRAM' };
+  else candidate = raw.replace(/^@/, '');
+  const username = candidate.replace(/^@/, '').toLowerCase();
+  if (!/^[a-z][a-z0-9_]{4,31}$/.test(username) || username.includes('__') || username.endsWith('_')) return { rejected: 'INVALID_USERNAME' };
+  if (TELEGRAM_RESERVED.has(username)) return { rejected: 'RESERVED_PATH' };
+  if (username.endsWith('bot')) return { rejected: 'BOT' };
+  return { username, url: `https://t.me/${username}` };
+}
+
+const telegramHandleOf = (value: string | null) => {
+  const normalized = normalizeTelegramLink(value);
+  return 'username' in normalized ? normalized.username : null;
+};
+
 /** Normalised official social identity from token metadata (pump.fun metadata JSON: twitter / telegram / website). */
 export function identityFromMetadata(mint: string, symbol: string | null, name: string | null, metadata: Record<string, unknown> | null): SocialIdentity {
   const text = (key: string) => (metadata && typeof metadata[key] === 'string' && (metadata[key] as string).trim() ? (metadata[key] as string).trim() : null);
-  return { mint, symbol, name, officialX: handleOf(text('twitter')), officialTelegram: handleOf(text('telegram')), website: domainOf(text('website')) };
+  return { mint, symbol, name, officialX: handleOf(text('twitter')), officialTelegram: telegramHandleOf(text('telegram')), website: domainOf(text('website')) };
 }
 
 /**

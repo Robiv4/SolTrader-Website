@@ -10,13 +10,13 @@
  */
 import { Prisma, type PrismaClient } from '@prisma/client';
 import {
-  computeSocialSnapshot, computeSocialWindows, identityFromMetadata, matchSocialText, MIN_MATCH_CONFIDENCE,
+  computeSocialSnapshot, computeSocialWindows, identityFromMetadata, matchSocialText, MIN_MATCH_CONFIDENCE, normalizeTelegramLink,
   type OnchainContext, type SocialEvent, type SocialIdentity, type SocialSnapshotResult, type SocialSource, type SourceStatus,
 } from '@soltrader/strategy-engine';
 import { RollingPercentiles } from '@soltrader/trading-engine';
 
-import { fetchTokenMetadata } from './metadata.js';
-import { USABLE_PROVIDER_STATES, type RawSocialPost, type SocialDataProvider } from './providers.js';
+import { METADATA_RETRY_DELAYS_MS, resolveTokenMetadata, type MetadataConfig, type MetadataFailure, type MetadataResult, type TokenMetadata } from './metadata.js';
+import { USABLE_PROVIDER_STATES, type RawSocialPost, type SocialDataProvider, type TelegramLinkCandidate } from './providers.js';
 import type { TelegramSourceRecord } from './telegram.js';
 
 export type SocialStage = 1 | 2 | 3;
@@ -24,7 +24,12 @@ export type SocialStage = 1 | 2 | 3;
 interface TrackedToken {
   identity: SocialIdentity;
   metadataUri: string | null;
-  metadataState: 'PENDING' | 'RESOLVED' | 'UNAVAILABLE';
+  /** PENDING = first attempt not done (no Telegram collection yet); RETRYING = transient failure, retry scheduled. */
+  metadataState: 'PENDING' | 'RESOLVED' | 'RETRYING' | 'UNAVAILABLE';
+  metadataAttempts: number;
+  metadataFailure: MetadataFailure | null;
+  /** Verified Telegram links from other sources than the metadata (DEX Screener profile of this mint). */
+  telegramLinks: TelegramLinkCandidate[];
   stage: SocialStage;
   trackedAt: number;
   lastSeenAt: number;
@@ -32,6 +37,11 @@ interface TrackedToken {
   ambiguous: SocialEvent[];
   seen: Set<string>;
   coverage: Partial<Record<SocialSource, number>>;
+  /**
+   * When the coverage became known (first successful read of a source). A snapshot for an earlier moment must not use
+   * the source: its messages were not known then, and treating it as covered would turn "unknown" into zero activity.
+   */
+  coverageKnownAt: Partial<Record<SocialSource, number>>;
   sinceId: Partial<Record<SocialSource, string | null>>;
   lastFetchAt: Partial<Record<SocialSource, number>>;
   lastSnapshot: SocialSnapshotResult | null;
@@ -51,7 +61,11 @@ export interface SocialServiceDeps {
   prisma: Pick<PrismaClient, 'socialSnapshot' | 'launchCandidate'> & Partial<Pick<PrismaClient, 'telegramSource' | 'token'>>;
   providers: SocialDataProvider[];
   logger: SocialServiceLogger;
-  fetchMetadata?: typeof fetchTokenMetadata;
+  /** Legacy test hook: identity fields or null (null = permanent failure). */
+  fetchMetadata?: (uri: string | null) => Promise<Record<string, unknown> | TokenMetadata | null>;
+  /** Metadata resolver (default: resolveTokenMetadata with `metadataConfig`). */
+  resolveMetadata?: (uri: string | null) => Promise<MetadataResult>;
+  metadataConfig?: MetadataConfig;
   now?: () => number;
   /** Optional AI social analysis (AI_SOCIAL_ANALYSIS_ENABLED, default false: zero LLM calls). Informational only. */
   aiEnabled?: boolean;
@@ -72,15 +86,26 @@ export function inRejectedSample(mint: string, percent = 10) {
   return hash % 100 < percent;
 }
 
+const METADATA_FAILURES: MetadataFailure[] = ['MISSING_URI', 'REJECTED_URL', 'DNS', 'PRIVATE_ADDRESS', 'HTTP', 'RATE_LIMITED', 'TIMEOUT', 'NETWORK', 'TOO_LARGE', 'JSON', 'REDIRECT_REJECTED'];
+
 export class SocialService {
   private readonly tokens = new Map<string, TrackedToken>();
   private metadataQueue: string[] = [];
+  /** Transient metadata failures waiting for their retry time. */
+  private metadataRetries: Array<{ mint: string; dueAt: number }> = [];
   private metadataInFlight = 0;
   private timer: ReturnType<typeof globalThis.setInterval> | null = null;
   private ticking = false;
   readonly metrics = {
     tokensTracked: 0, snapshotsPersisted: 0, metadataResolved: 0, metadataUnavailable: 0, assessLatency: new RollingPercentiles(), collectionLatency: new RollingPercentiles(),
     snapshotLatency: new RollingPercentiles(),
+    /** Metadata discovery: URI presence, outcome per failure class, retries, resolving host. */
+    metadata: {
+      withUri: 0, missingUri: 0, resolved: 0, retries: 0, failed: Object.fromEntries(METADATA_FAILURES.map((reason) => [reason, 0])) as Record<MetadataFailure, number>,
+      byHost: {} as Record<string, number>, withTelegramLink: 0, telegramLinkRejected: {} as Record<string, number>,
+    },
+    /** Telegram links received from DEX Screener (accepted / rejected by reason). */
+    externalTelegramLinks: { accepted: 0, rejected: {} as Record<string, number> },
     /** Per provider: messages received / attributed / duplicates (same stable id) / ambiguous (ticker only) / unrelated. */
     bySource: {} as Partial<Record<SocialSource, { received: number; processed: number; duplicates: number; ambiguous: number; unrelated: number }>>,
   };
@@ -106,15 +131,28 @@ export class SocialService {
     if (existing) {
       existing.lastSeenAt = now;
       if (input.stage > existing.stage) existing.stage = input.stage;
-      if (!existing.metadataUri && input.metadataUri) existing.metadataUri = input.metadataUri;
+      if (!existing.metadataUri && input.metadataUri) {
+        existing.metadataUri = input.metadataUri;
+        // The URI arrived after a MISSING_URI result: resolve it now.
+        if (existing.metadataFailure === 'MISSING_URI') {
+          existing.metadataState = 'PENDING';
+          existing.metadataFailure = null;
+          this.metadataQueue.push(input.mint);
+        }
+      }
       return;
     }
     this.tokens.set(input.mint, {
-      identity: identityFromMetadata(input.mint, input.symbol, input.name, null), metadataUri: input.metadataUri, metadataState: 'PENDING', stage: input.stage,
-      trackedAt: now, lastSeenAt: now, events: [], ambiguous: [], seen: new Set(), coverage: {}, sinceId: {}, lastFetchAt: {}, lastSnapshot: null, lastPersistAt: 0, windowCache: null, memberSamples: [],
+      identity: identityFromMetadata(input.mint, input.symbol, input.name, null), metadataUri: input.metadataUri, metadataState: 'PENDING', metadataAttempts: 0, metadataFailure: null, telegramLinks: [], stage: input.stage,
+      trackedAt: now, lastSeenAt: now, events: [], ambiguous: [], seen: new Set(), coverage: {}, coverageKnownAt: {}, sinceId: {}, lastFetchAt: {}, lastSnapshot: null, lastPersistAt: 0, windowCache: null, memberSamples: [],
     });
     this.metrics.tokensTracked += 1;
     this.metadataQueue.push(input.mint);
+  }
+
+  /** Research read for Community features: time-correct at `at`, no on-chain context, live state untouched. */
+  assessAt(mint: string, at: number) {
+    return this.assess(mint, null, at, { record: false });
   }
 
   /** Last computed snapshot (no recomputation, no I/O) - for the live monitor list. */
@@ -131,19 +169,23 @@ export class SocialService {
     return this.tokens.get(mint)?.identity ?? null;
   }
 
-  /** Synchronous: freshest snapshot recomputed with the caller's on-chain context (events already collected). */
   /**
    * Social assessment as of `at` (the caller's decision / snapshot moment; default: now). Only events received and
    * created at or before `at` are used, and the result is never dated after `at`, so a feature snapshot taken at `at`
    * can use it (no late data, nothing back-dated: a cached window from an earlier moment keeps its own, earlier time).
    */
-  assess(mint: string, onchain: OnchainContext | null, at?: number): SocialSnapshotResult | null {
+  assess(mint: string, onchain: OnchainContext | null, at?: number, options: { record?: boolean } = {}): SocialSnapshotResult | null {
     const token = this.tokens.get(mint);
     if (!token) return null;
     const started = globalThis.performance.now();
-    const sources = this.sourceStatuses(token);
-    let cache = token.windowCache;
     const now = at ?? this.now();
+    const sources = this.sourceStatuses(token, now);
+    // Research read (Community features): same time-correct computation, but the live state (cache / last snapshot
+    // used by the monitor list and persistence) is left untouched.
+    if (options.record === false) {
+      return computeSocialSnapshot({ events: token.events, ambiguousEvents: token.ambiguous, at: now, sources, onchain, memberSamples: token.memberSamples });
+    }
+    let cache = token.windowCache;
     // Window metrics only change with new events or time; within 1 s they are reused (per-user on-chain parts are cheap).
     // A cache computed after `now` (another caller, later clock) is never reused for an earlier moment.
     if (!cache || cache.eventCount !== token.events.length || now - cache.base.at >= 1_000 || cache.base.at > now) {
@@ -156,10 +198,11 @@ export class SocialService {
     return snapshot;
   }
 
-  private sourceStatuses(token: TrackedToken): SourceStatus[] {
+  private sourceStatuses(token: TrackedToken, at = this.now()): SourceStatus[] {
     return this.deps.providers.map((provider) => {
       const health = provider.health();
-      const coverageStart = token.coverage[provider.source] ?? null;
+      const knownAt = token.coverageKnownAt[provider.source];
+      const coverageStart = knownAt !== undefined && knownAt <= at ? token.coverage[provider.source] ?? null : null;
       const usable = health.enabled && health.configured && USABLE_PROVIDER_STATES.has(health.state);
       const available = usable && coverageStart !== null;
       // Why a source is missing (never counted as zero activity): disabled, not configured, disconnected, or no source for this token.
@@ -184,7 +227,8 @@ export class SocialService {
       const official = Boolean(options.officialChannel || post.officialSource);
       const match = matchSocialText(token.identity, post.text, official);
       // Unrelated messages are dropped; ticker-only matches are kept apart as ambiguous (reported, never counted).
-      if (match.basis === 'UNKNOWN') {
+      // Sources found by mint search (multi-token groups): only the exact mint address attributes a message.
+      if (match.basis === 'UNKNOWN' || (post.mintOnly && !official && match.basis !== 'MINT_ADDRESS')) {
         counters.unrelated += 1;
         continue;
       }
@@ -226,24 +270,72 @@ export class SocialService {
     }
   }
 
+  private resolver(): (uri: string | null) => Promise<MetadataResult> {
+    if (this.deps.resolveMetadata) return this.deps.resolveMetadata;
+    const legacy = this.deps.fetchMetadata;
+    if (legacy) {
+      return async (uri) => {
+        const metadata = await legacy(uri);
+        return metadata ? { status: 'RESOLVED', metadata: metadata as TokenMetadata, host: 'test', attempts: 1 } : { status: 'FAILED', reason: 'HTTP', transient: false, detail: null, attempts: 1 };
+      };
+    }
+    return (uri) => resolveTokenMetadata(uri, this.deps.metadataConfig ?? {});
+  }
+
   private async resolveMetadata() {
-    const fetcher = this.deps.fetchMetadata ?? fetchTokenMetadata;
+    const resolve = this.resolver();
+    const now = this.now();
+    // Due retries go back to the queue (bounded: METADATA_RETRY_DELAYS_MS.length retries per token).
+    const due = this.metadataRetries.filter((entry) => entry.dueAt <= now);
+    if (due.length) {
+      this.metadataRetries = this.metadataRetries.filter((entry) => entry.dueAt > now);
+      this.metadataQueue.push(...due.map((entry) => entry.mint));
+    }
     while (this.metadataQueue.length && this.metadataInFlight < 3) {
       const mint = this.metadataQueue.shift()!;
       const token = this.tokens.get(mint);
-      if (!token) continue;
+      if (!token || token.metadataState === 'RESOLVED') continue;
+      if (token.metadataAttempts === 0) {
+        if (token.metadataUri) this.metrics.metadata.withUri += 1;
+        else this.metrics.metadata.missingUri += 1;
+      }
+      token.metadataAttempts += 1;
+      if (token.metadataAttempts > 1) this.metrics.metadata.retries += 1;
       this.metadataInFlight += 1;
-      void fetcher(token.metadataUri).then(async (metadata) => {
-        token.metadataState = metadata ? 'RESOLVED' : 'UNAVAILABLE';
-        if (metadata) {
-          token.identity = identityFromMetadata(mint, token.identity.symbol ?? (metadata.symbol as string | null), token.identity.name ?? (metadata.name as string | null), metadata);
-          this.metrics.metadataResolved += 1;
-          const image = typeof metadata.image === 'string' ? metadata.image : null;
-          const links = { twitter: token.identity.officialX, telegram: token.identity.officialTelegram, website: token.identity.website, image, resolvedAt: new Date().toISOString() };
-          await this.deps.prisma.launchCandidate.updateMany({ where: { mint }, data: { socialLinks: links as Prisma.InputJsonValue } }).catch(() => undefined);
-          // Token logo for the UI (served through the API image proxy); a provider logo already stored wins.
-          if (image) await this.deps.prisma.token?.updateMany({ where: { address: mint, imageUrl: null }, data: { imageUrl: image } }).catch(() => undefined);
-        } else this.metrics.metadataUnavailable += 1;
+      void resolve(token.metadataUri).then(async (result) => {
+        if (result.status === 'FAILED') {
+          token.metadataFailure = result.reason;
+          this.metrics.metadata.failed[result.reason] = (this.metrics.metadata.failed[result.reason] ?? 0) + 1;
+          const delay = result.transient ? METADATA_RETRY_DELAYS_MS[token.metadataAttempts - 1] : undefined;
+          if (delay !== undefined) {
+            token.metadataState = 'RETRYING';
+            this.metadataRetries.push({ mint, dueAt: this.now() + delay });
+          } else {
+            token.metadataState = 'UNAVAILABLE';
+            this.metrics.metadataUnavailable += 1;
+          }
+          return;
+        }
+        const metadata = result.metadata;
+        token.metadataState = 'RESOLVED';
+        token.metadataFailure = null;
+        this.metrics.metadata.resolved += 1;
+        this.metrics.metadata.byHost[result.host] = (this.metrics.metadata.byHost[result.host] ?? 0) + 1;
+        token.identity = identityFromMetadata(mint, token.identity.symbol ?? (metadata.symbol as string | null), token.identity.name ?? (metadata.name as string | null), metadata as unknown as Record<string, unknown>);
+        if (token.identity.officialTelegram) this.metrics.metadata.withTelegramLink += 1;
+        else if (typeof metadata.telegram === 'string' && metadata.telegram.trim()) {
+          const normalized = normalizeTelegramLink(metadata.telegram);
+          const reason = 'rejected' in normalized ? normalized.rejected : 'UNKNOWN';
+          this.metrics.metadata.telegramLinkRejected[reason] = (this.metrics.metadata.telegramLinkRejected[reason] ?? 0) + 1;
+        }
+        // A DEX Screener link equal to the official one adds nothing.
+        token.telegramLinks = token.telegramLinks.filter((link) => link.username !== token.identity.officialTelegram);
+        this.metrics.metadataResolved += 1;
+        const image = typeof metadata.image === 'string' ? metadata.image : null;
+        const links = { twitter: token.identity.officialX, telegram: token.identity.officialTelegram, website: token.identity.website, image, resolvedAt: new Date().toISOString() };
+        await this.deps.prisma.launchCandidate.updateMany({ where: { mint }, data: { socialLinks: links as Prisma.InputJsonValue } }).catch(() => undefined);
+        // Token logo for the UI (served through the API image proxy); a provider logo already stored wins.
+        if (image) await this.deps.prisma.token?.updateMany({ where: { address: mint, imageUrl: null }, data: { imageUrl: image } }).catch(() => undefined);
       }).catch(() => {
         token.metadataState = 'UNAVAILABLE';
         this.metrics.metadataUnavailable += 1;
@@ -268,7 +360,10 @@ export class SocialService {
           const fromOfficial = posts.filter((post) => official && post.chatUsername === official);
           const others = posts.filter((post) => !(official && post.chatUsername === official));
           if (fromOfficial.length) {
-            token.coverage[provider.source] ??= Math.min(...fromOfficial.map((post) => post.createdAt));
+            if (token.coverage[provider.source] === undefined) {
+              token.coverage[provider.source] = Math.min(...fromOfficial.map((post) => post.createdAt));
+              token.coverageKnownAt[provider.source] = this.now();
+            }
             this.ingest(token.identity.mint, fromOfficial, { officialChannel: true });
           }
           if (others.length) this.ingest(token.identity.mint, others);
@@ -282,7 +377,7 @@ export class SocialService {
           .slice(0, 5);
         for (const token of due) {
           token.lastFetchAt[provider.source] = now;
-          const result = await provider.fetchRecent(token.identity, token.sinceId[provider.source] ?? null);
+          const result = await provider.fetchRecent(token.identity, token.sinceId[provider.source] ?? null, { telegramLinks: token.telegramLinks });
           if (!result) continue;
           token.sinceId[provider.source] = result.newestId;
           if (result.memberCount != null) {
@@ -295,6 +390,7 @@ export class SocialService {
             // Complete history -> covered since the token existed; a truncated page -> only from its oldest post.
             const oldest = result.posts.length ? Math.min(...result.posts.map((post) => post.createdAt)) : now;
             token.coverage[provider.source] = result.complete ? Math.min(token.trackedAt - 3_600_000, oldest) : oldest;
+            token.coverageKnownAt[provider.source] = this.now();
           }
         }
       }
@@ -323,6 +419,24 @@ export class SocialService {
         this.metrics.snapshotsPersisted += 1;
       }).catch((error: unknown) => this.deps.logger.warn({ err: error instanceof Error ? error.message : String(error), mint: token.identity.mint }, 'Social snapshot persist failed'));
     }
+  }
+
+  /**
+   * Verified Telegram link from another source (DEX Screener profile whose pair base token IS this mint). Read-only
+   * hand-over from the Community service: normalised, de-duplicated, never a ticker / name guess. Unknown token = ignored.
+   */
+  addTelegramLink(mint: string, link: string, via: TelegramLinkCandidate['via'], receivedAt: number) {
+    const token = this.tokens.get(mint);
+    if (!token) return false;
+    const normalized = normalizeTelegramLink(link);
+    if ('rejected' in normalized) {
+      this.metrics.externalTelegramLinks.rejected[normalized.rejected] = (this.metrics.externalTelegramLinks.rejected[normalized.rejected] ?? 0) + 1;
+      return false;
+    }
+    if (token.telegramLinks.some((item) => item.username === normalized.username) || token.identity.officialTelegram === normalized.username) return false;
+    token.telegramLinks = [...token.telegramLinks, { username: normalized.username, via, receivedAt }].slice(-3);
+    this.metrics.externalTelegramLinks.accepted += 1;
+    return true;
   }
 
   /** Telegram source registry persistence (upsert by mint + username; best effort, never blocks collection). */
@@ -371,15 +485,36 @@ export class SocialService {
       snapshotLatencyMs: this.metrics.snapshotLatency.summary(),
       tokensTracked: this.tokens.size, stages, metadataQueue: this.metadataQueue.length,
       metadataResolved: this.metrics.metadataResolved, metadataUnavailable: this.metrics.metadataUnavailable, snapshotsPersisted: this.metrics.snapshotsPersisted,
+      metadata: { ...this.metrics.metadata, retryQueue: this.metadataRetries.length, states: this.metadataStates() },
+      externalTelegramLinks: this.metrics.externalTelegramLinks,
       assessLatencyMs: this.metrics.assessLatency.summary(), collectionLatencyMs: this.metrics.collectionLatency.summary(),
     };
   }
 
-  /** Telegram coverage of the monitored (stage >= 2) tokens: with a readable source / with FRESH Telegram data. */
+  private metadataStates() {
+    return [...this.tokens.values()].reduce<Record<string, number>>((counts, token) => ({ ...counts, [token.metadataState]: (counts[token.metadataState] ?? 0) + 1 }), {});
+  }
+
+  /** Telegram coverage of the monitored (stage >= 2) tokens: with a readable source / with FRESH Telegram data, per token. */
   private telegramCoverage() {
+    const now = this.now();
     const tokens = [...this.tokens.values()].filter((token) => token.stage >= 2);
     const covered = tokens.filter((token) => token.coverage.TELEGRAM !== undefined);
-    const fresh = covered.filter((token) => token.lastSnapshot?.perSource.TELEGRAM?.freshness === 'FRESH');
-    return { monitoredTokens: tokens.length, withSource: covered.length, fresh: fresh.length };
+    const lastEventAt = (token: TrackedToken) => token.events.filter((event) => event.source === 'TELEGRAM').reduce<number | null>((max, event) => Math.max(max ?? 0, event.createdAt), null);
+    const fresh = covered.filter((token) => {
+      const last = lastEventAt(token);
+      return last !== null && now - last <= 5 * 60_000;
+    });
+    return {
+      monitoredTokens: tokens.length,
+      withOfficialLink: tokens.filter((token) => token.identity.officialTelegram).length,
+      withDexScreenerLink: tokens.filter((token) => token.telegramLinks.length > 0).length,
+      withSource: covered.length,
+      fresh: fresh.length,
+      tokens: covered.slice(0, 50).map((token) => ({
+        mint: token.identity.mint, symbol: token.identity.symbol, coverageStart: new Date(token.coverage.TELEGRAM!).toISOString(),
+        messages: token.events.filter((event) => event.source === 'TELEGRAM').length, lastMessageAt: lastEventAt(token) ? new Date(lastEventAt(token)!).toISOString() : null,
+      })),
+    };
   }
 }

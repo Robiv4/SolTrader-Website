@@ -16,6 +16,8 @@ const IMAGE_HOSTS = [
   /^dd\.dexscreener\.com$/, /^cdn\.dexscreener\.com$/,
   /^ipfs\.io$/, /^cf-ipfs\.com$/, /^gateway\.pinata\.cloud$/, /\.mypinata\.cloud$/, /^arweave\.net$/, /\.arweave\.net$/, /^dweb\.link$/, /\.ipfs\.dweb\.link$/,
   /^nftstorage\.link$/, /\.ipfs\.nftstorage\.link$/, /^ipfs\.pump\.fun$/, /^metadata\.pump\.fun$/, /^pump\.mypinata\.cloud$/,
+  // Gateway the worker rewrites IPFS logo URLs to (ipfs.io answers HTTP 429 to every path request).
+  /^ipfs\.filebase\.io$/,
 ];
 const MAX_TOKEN_IMAGE_BYTES = 1_500_000;
 export const MAX_AVATAR_BYTES = 200_000;

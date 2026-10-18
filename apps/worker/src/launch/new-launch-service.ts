@@ -516,11 +516,15 @@ export class NewLaunchService {
   /** Registers the launch for staged social collection and returns the current social assessment (synchronous). */
   private socialFor(launch: TrackedLaunch, user: UserContext, result: NewLaunchStrategyResult, now: number): SocialSnapshotResult | null {
     const service = this.deps.social;
-    if (!service || !user.settings.socialIntelligenceEnabled || user.settings.socialDecisionMode === 'OFF') return null;
+    if (!service) return null;
     // Stage 3 once a launch passed the basic security / liquidity / age checks; early rejects only via a ~10% sample.
     const early = result.status === 'BLOCKED' || result.reasons.some((reason) => ['LAUNCH_TOO_YOUNG', 'LAUNCH_WINDOW_EXPIRED', 'LIQUIDITY_BELOW_MINIMUM', 'CRITICAL_LIQUIDITY', 'CREATOR_SELLING'].includes(reason));
     const stage = !early ? 3 : inRejectedSample(launch.mint) ? 2 : 1;
+    // Research collection (Community ML training data) does not depend on any user's social settings: the token is
+    // tracked for every evaluated launch. Collection only - nothing below changes for users with social OFF.
     service.track({ mint: launch.mint, symbol: launch.symbol, name: launch.name, metadataUri: launch.metadataUri, stage });
+    // The user's own social result (decision display / ML-FEATURES-v1 inputs) stays tied to the user's settings.
+    if (!user.settings.socialIntelligenceEnabled || user.settings.socialDecisionMode === 'OFF') return null;
     const f = result.features;
     return service.assess(launch.mint, {
       launchScore: result.score, launchMomentumScore: result.launchMomentumScore, exhaustionScore: result.exhaustionScore,

@@ -50,6 +50,8 @@ export interface DexProfileObservation {
   profilePresent: boolean;
   websites: number;
   socials: { twitter: boolean; telegram: boolean; discord: boolean; other: number };
+  /** Raw Telegram links of the identity-confirmed pair profile (validated / normalised by the Telegram discovery). */
+  telegramLinks?: string[];
   /** `boosts.active` of the pair (null = not exposed). */
   activeBoosts: number | null;
   /** Paid orders (token profile, community takeover, ads) with their payment time. */

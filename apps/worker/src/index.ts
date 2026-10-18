@@ -110,6 +110,7 @@ const socialService = env.SOCIAL_COLLECTION_ENABLED ? new SocialService({
   prisma,
   logger,
   aiEnabled: env.AI_SOCIAL_ANALYSIS_ENABLED,
+  metadataConfig: { ipfsGateways: env.SOCIAL_IPFS_GATEWAYS, extraHosts: env.SOCIAL_METADATA_EXTRA_HOSTS, timeoutMs: env.SOCIAL_METADATA_TIMEOUT_MS },
   providers: [
     telegramProvider,
     new XSocialProvider({ enabled: env.X_SOCIAL_ENABLED, bearerToken: env.X_SOCIAL_ENABLED ? env.X_API_BEARER_TOKEN?.trim() || null : null, maxRequestsPer15Min: env.X_API_MAX_REQUESTS_PER_15MIN }),
@@ -130,6 +131,12 @@ const communityService = env.COMMUNITY_INTELLIGENCE_ENABLED ? (() => {
     prisma,
     logger,
     onchainEnabled: env.HELIUS_COMMUNITY_ENABLED,
+    // Telegram / X data for the Community features comes from the research collection (independent of user settings).
+    social: socialService ? { assessAt: (mint, at) => socialService.assessAt(mint, at) } : undefined,
+    // Verified DEX Screener Telegram links feed the Telegram discovery (no extra request: data already collected).
+    onTelegramLinks: socialService ? (mint, links, receivedAt) => {
+      for (const link of links) socialService.addTelegramLink(mint, link, 'DEXSCREENER', receivedAt);
+    } : undefined,
     dex: { http: dexHttp, client: new DexScreenerClient(dexHttp), cacheTtlMs: env.DEXSCREENER_CACHE_TTL_MS },
     lunar: { http: lunarHttp, client: new LunarCrushClient(lunarHttp, lunarKey), cacheTtlMs: env.LUNARCRUSH_CACHE_TTL_MS },
   });

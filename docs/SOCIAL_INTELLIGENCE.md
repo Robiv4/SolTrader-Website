@@ -46,9 +46,16 @@ Engine status: `HEALTHY` (all enabled providers usable), `PARTIAL`, `DEGRADED`, 
 - **Connection states:** `DISABLED`, `NOT_CONFIGURED`, `CONNECTING`, `CONNECTED`, `DEGRADED`, `RATE_LIMITED`, `DISCONNECTED`.
 - **Reconnect:** exponential back-off 5 s to 5 min; an unauthorized session retries every 10 min (run `telegram:login` again).
 - **FLOOD_WAIT:** GramJS never sleeps internally (`floodSleepThreshold: 0`); the provider makes no request until the wait (+1 s) has passed.
-- **Sources (registry `TelegramSource`):** the official link from the token metadata (`OFFICIAL`, `OFFICIAL_SOCIAL_LINK`, 0.9), and, under a budget, public chats whose message contains the exact mint (`COMMUNITY`, `MINT_ADDRESS`). Private invite links (`t.me/+…`, `joinchat`) are never resolved or joined; inaccessible chats are stored as `NO_ACCESS`.
+- **Discovery order (registry `TelegramSource`, provenance in `matchBasis`):**
+  1. the official link from the mint's metadata (`OFFICIAL`, `OFFICIAL_SOCIAL_LINK`, 0.9, via `PUMP_FUN_METADATA`);
+  2. a Telegram link from the DEX Screener profile of a pair whose **base token is the mint** (`PROBABLE_OFFICIAL`, `DEXSCREENER_LINK`, 0.8, via `DEXSCREENER`). The link is handed over read-only from the Community service (no extra request);
+  3. only while no verified source is readable: a budgeted public search for the exact mint (`COMMUNITY`, `MINT_ADDRESS`, 0.6, via `TELEGRAM_SEARCH`). Only public groups whose message contains the exact mint are attached (max 2 per token). Broadcast channels, chats without a public username and ticker / name-only hits are rejected and counted. Messages from such groups count only when they contain the exact mint (`mintOnly`): call groups discuss many tokens.
+
+  A name or ticker never attaches a chat. Links are normalised (`normalizeTelegramLink`: t.me / telegram.me / telegram.dog / tg://resolve / @handle). Rejected: private invites (`t.me/+…`, `joinchat`, `t.me/c/…`, never resolved or joined), reserved paths, other hosts, invalid usernames and bots. Inaccessible chats are stored as `NO_ACCESS`.
 - **Subscriptions:** one buffer per chat shared by all tokens (one history request per chat per 5 s), per-token cursors, released when the token is no longer tracked.
 - **Messages:** stable id `tg:<chat>:<message>` (deduplicated), SHA-256 hashed sender, reply / forward / forwards / views. Raw text stays in memory only for 31 minutes (the longest window is 30 min); stored snapshots contain features only.
+- **History vs. fresh:** the first page of a chat is mostly history (possibly years old). Messages older than 31 minutes at fetch time are counted as `historicalMessagesSkipped` and are never in any window. `freshMessages` / `lastFreshMessageAt` show real live activity.
+- **Time correctness:** a source is only available to snapshots taken at or after the moment it was first read (`coverageKnownAt`). An earlier moment reports "no source" (null), never zero activity.
 - **Broadcast channels** are admin announcements, not community activity: they contribute member counts only (no message coverage).
 - **Member growth** is computed only from real member-count samples (1 / 5 / 15 min); otherwise `null`.
 
@@ -59,9 +66,25 @@ Engine status: `HEALTHY` (all enabled providers usable), `PARTIAL`, `DEGRADED`, 
 | Telegram (MTProto) | Public channels / groups by public username and chats the configured account already belongs to. | `NO_ACCESS`; nothing is joined or scraped. |
 | X (optional, off by default) | Official API v2 recent search with a server-side `X_API_BEARER_TOKEN`. The request budget is set by `X_API_MAX_REQUESTS_PER_15MIN`, with back-off on HTTP 429 using `x-rate-limit-reset`. The query uses the mint address and the official X account / website, never a bare ticker. | `NOT_CONFIGURED`: no requests, no data. |
 | Telegram bot inbox (optional) | Only groups this project's bot was **added** to. The API's bot (long polling) forwards those group messages to a short-lived Redis list (`social:telegram:inbox`, TTL 1 h). The author is stored only as a SHA-256 hash. To see all group messages, the bot's privacy mode must be disabled in BotFather. | Private groups are never read; nothing is scraped. |
-| Token metadata | The pump.fun `uri` gives the official `twitter` / `telegram` / `website`. Fetches are restricted (SSRF protection): HTTPS only, an IPFS / Arweave gateway allowlist, no redirects, a 64 KB cap, a 3 s timeout. | — |
+| Token metadata | The pump.fun `uri` gives the official `twitter` / `telegram` / `website`. Fetches are restricted (SSRF protection), see below. | `MISSING_URI` / `REJECTED_URL` / … counted per class. |
+| DEX Screener profile | Telegram links of the identity-confirmed pair (base token = mint), from the Community service's existing requests. | No link. |
 
 Secrets stay server-side environment variables. They are never logged and never sent to the frontend.
+
+## Token metadata resolution
+
+Root cause of the 2026-10 coverage gap (2 of 142 tokens resolved): most pump.fun metadata URIs are
+`https://ipfs.io/ipfs/<CID>`. The public path gateways ipfs.io / dweb.link (and w3s.link / nftstorage.link, which
+redirect there) now answer **every** request with HTTP 429 "switching to a service worker gateway only".
+cf-ipfs.com / ipfs.pump.fun / metadata.pump.fun no longer resolve. The old fetcher also refused every redirect, used a
+3 s timeout (gateway.pinata.cloud needs 3–4.5 s), and rejected the launch-tool hosts that serve about a third of the URIs.
+
+- **IPFS:** the CID is taken from any IPFS-style URL (`ipfs://`, `/ipfs/<cid>` on a known gateway, `<cid>.ipfs.<gateway>`) and fetched from `SOCIAL_IPFS_GATEWAYS` in order (default `ipfs.filebase.io`, `gateway.pinata.cloud`). Content is addressed by its CID, so the gateway cannot change it.
+- **Other hosts:** allowlist `arweave.net`, `metadata.j7tracker.io`, `meta.uxento.io`, `m.rapidlaunch.io`, plus `SOCIAL_METADATA_EXTRA_HOSTS`.
+- **SSRF protection:** https only, no credentials / ports / IP literals. Every resolved address must be public (private, loopback, link-local, CGNAT, ULA and mapped addresses are refused). Redirects are followed manually (max 3) and every target passes the same checks. 64 KiB cap, `SOCIAL_METADATA_TIMEOUT_MS` (6 s), JSON object only, identity fields only.
+- **Failure classes:** `MISSING_URI`, `REJECTED_URL`, `DNS`, `PRIVATE_ADDRESS`, `HTTP`, `RATE_LIMITED`, `TIMEOUT`, `NETWORK`, `TOO_LARGE`, `JSON`, `REDIRECT_REJECTED`. Transient failures (timeout, network, 5xx, 429, `EAI_AGAIN`) are retried after 30 s / 2 min / 8 min, then given up. Telegram search may run meanwhile.
+- **Research collection:** every evaluated launch is tracked for collection, independent of the users' social settings. A user's own social result, `socialBlocksEntry` and the ML-FEATURES-v1 inputs stay tied to that user's settings. The Community features read the research collection (`SocialService.assessAt`, side-effect free).
+- Metadata is untrusted: it only feeds social identity, never a trading decision.
 
 ## Identity resolution
 

@@ -29,6 +29,25 @@ export interface RawSocialPost {
   forwarded?: boolean;
   forwards?: number | null;
   replyToId?: string | null;
+  /**
+   * Only count the message when it contains the token's exact mint address (sources found by mint search, e.g. call
+   * groups that discuss many tokens: a ticker / name match there is not reliable enough).
+   */
+  mintOnly?: boolean;
+}
+
+/** How a Telegram source of a token was found (provenance, strongest first). */
+export type TelegramDiscoveryVia = 'PUMP_FUN_METADATA' | 'DEXSCREENER' | 'TELEGRAM_SEARCH';
+
+/** Telegram links of a token from verified sources (metadata of the mint itself / DEX Screener profile of the mint). */
+export interface TelegramLinkCandidate {
+  username: string;
+  via: Exclude<TelegramDiscoveryVia, 'TELEGRAM_SEARCH'>;
+  receivedAt: number;
+}
+
+export interface FetchContext {
+  telegramLinks?: TelegramLinkCandidate[];
 }
 
 export interface ProviderHealth {
@@ -70,7 +89,7 @@ export interface SocialDataProvider {
   readonly source: SocialSource;
   health(): ProviderHealth;
   /** Pull providers: recent posts for one token (null = request not made: budget, backoff, not configured). */
-  fetchRecent?(identity: SocialIdentity, sinceId: string | null): Promise<FetchResult | null>;
+  fetchRecent?(identity: SocialIdentity, sinceId: string | null, context?: FetchContext): Promise<FetchResult | null>;
   /** Push providers: posts received since the last drain. */
   drain?(): Promise<RawSocialPost[]>;
   /** Periodic housekeeping (connect / reconnect); never throws. */

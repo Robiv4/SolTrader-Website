@@ -40,6 +40,13 @@ interface TrackedCommunityToken {
 
 export interface CommunityServiceDeps {
   prisma?: Pick<PrismaClient, 'communitySnapshot'>;
+  /**
+   * Research social read (Social Intelligence collected independently of any user's social settings). Used when the
+   * caller passes no social snapshot; must be time-correct for `at` and side-effect free.
+   */
+  social?: { assessAt(mint: string, at: number): SocialSnapshotResult | null };
+  /** Read-only hand-over of the Telegram links found in an identity-confirmed DEX Screener profile. Must not throw. */
+  onTelegramLinks?: (mint: string, links: string[], receivedAt: number) => void;
   dex: { client: DexScreenerClient; http: HttpBudget; cacheTtlMs: number } | null;
   lunar: { client: LunarCrushClient; http: HttpBudget; cacheTtlMs: number } | null;
   onchainEnabled: boolean;
@@ -65,7 +72,7 @@ export class CommunityService {
   private readonly tokens = new Map<string, TrackedCommunityToken>();
   private ticking = false;
   private timer: ReturnType<typeof globalThis.setInterval> | null = null;
-  readonly metrics = { tracked: 0, assessments: 0, snapshotsPersisted: 0, persistFailures: 0, tickFailures: 0, dexObservations: 0, lunarObservations: 0, identityMismatches: 0, notListed: 0 };
+  readonly metrics = { tracked: 0, assessments: 0, snapshotsPersisted: 0, persistFailures: 0, tickFailures: 0, dexObservations: 0, lunarObservations: 0, identityMismatches: 0, notListed: 0, assessmentsWithTelegram: 0, telegramLinksForwarded: 0 };
 
   constructor(private readonly deps: CommunityServiceDeps) {}
 
@@ -120,8 +127,16 @@ export class CommunityService {
     this.metrics.assessments += 1;
     const dex = knownAt(token.dex, at);
     if (dex && this.deps.dex) this.deps.dex.http.stats.cacheHits += 1;
+    let socialAt = social;
+    if (!socialAt && this.deps.social) {
+      try {
+        socialAt = this.deps.social.assessAt(mint, at);
+      } catch {
+        socialAt = null;
+      }
+    }
     const result = computeCommunitySnapshot({
-      at, mint, social,
+      at, mint, social: socialAt,
       dex,
       // On-chain stats are computed AT `at` from the trades received by then.
       onchain: this.deps.onchainEnabled ? computeOnchainCommunityStats(token.trades, at) : null,
@@ -129,6 +144,7 @@ export class CommunityService {
       providers: this.providerStatus(),
     });
     if (!token.last || token.last.at <= at) token.last = result;
+    if (result.sources.TELEGRAM.status === 'OK' || result.sources.TELEGRAM.status === 'WEAK') this.metrics.assessmentsWithTelegram += 1;
     return result;
   }
 
@@ -179,6 +195,14 @@ export class CommunityService {
         const observation = parseDexPairs(token.mint, pairs.get(token.mint) ?? [], receivedAt, token.orders?.value ?? null);
         if (observation.pairFound && !observation.identityConfirmed) this.metrics.identityMismatches += 1;
         if (!observation.pairFound) this.metrics.notListed += 1;
+        if (observation.identityConfirmed && observation.telegramLinks?.length && this.deps.onTelegramLinks) {
+          try {
+            this.deps.onTelegramLinks(token.mint, observation.telegramLinks, receivedAt);
+            this.metrics.telegramLinksForwarded += observation.telegramLinks.length;
+          } catch {
+            // hand-over is best effort
+          }
+        }
         token.dex.push(observation);
         if (token.dex.length > 4) token.dex.splice(0, token.dex.length - 4);
         this.metrics.dexObservations += 1;

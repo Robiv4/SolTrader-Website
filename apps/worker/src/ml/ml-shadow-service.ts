@@ -137,7 +137,7 @@ export class MlShadowService {
     candidatesSeen: 0, candidatesEligible: 0, candidatesIneligible: 0, snapshotsCreated: 0, snapshotsMissedPoint: 0, leakageViolations: 0,
     trackingStarted: 0, trackingDropped: 0, trackingCompleted: 0, outcomeUpdates: 0, streamGaps: 0, streamDisconnects: 0,
     resumedPaths: 0, finalizedOnResume: 0, resumeFailures: 0, finalWriteRetries: 0, finalWriteGiveUps: 0, orphansFinalized: 0, sweepFailures: 0,
-    predictions: 0, predictionFailures: 0, lateDataExcluded: 0, communitySnapshots: 0, communitySnapshotFailures: 0, communityLateExcluded: 0, writeFailures: 0, writesDropped: 0, additionalMarketDataRequests: 0, additionalRpcRequests: 0,
+    predictions: 0, predictionFailures: 0, lateDataExcluded: 0, communitySnapshots: 0, communitySnapshotsWithTelegram: 0, communitySnapshotFailures: 0, communityLateExcluded: 0, writeFailures: 0, writesDropped: 0, additionalMarketDataRequests: 0, additionalRpcRequests: 0,
     inferenceLatency: new RollingPercentiles(), snapshotLatency: new RollingPercentiles(),
   };
 
@@ -302,6 +302,8 @@ export class MlShadowService {
     let built: ReturnType<typeof buildLaunchMlSnapshotFor> | null = null;
     try {
       const community = this.deps.community?.assess(mint, best?.social ?? null, at) ?? null;
+      // Share of community feature rows with usable (on-time, identity-checked) Telegram data.
+      if (community && (community.sources.TELEGRAM.status === 'OK' || community.sources.TELEGRAM.status === 'WEAK')) this.metrics.communitySnapshotsWithTelegram += 1;
       built = buildLaunchMlSnapshotFor(ML_COMMUNITY_FEATURE_VERSION, { at, launch, state, security, riskScore: best?.riskScore ?? null, riskObservedAt: best ? best.at : null, social: best?.social ?? null, community });
     } catch (error) {
       this.metrics.communitySnapshotFailures += 1;
@@ -711,6 +713,7 @@ export class MlShadowService {
       predictions: m.predictions, predictionFailures: m.predictionFailures, inferenceLatencyMs: m.inferenceLatency.summary(), snapshotLatencyMs: m.snapshotLatency.summary(),
       writeQueueDepth: this.writeQueue.length, writeFailures: m.writeFailures, writesDropped: m.writesDropped,
       additionalRpcRequests: m.additionalRpcRequests, additionalMarketDataRequests: m.additionalMarketDataRequests,
+      community: { snapshots: m.communitySnapshots, withTelegram: m.communitySnapshotsWithTelegram, failures: m.communitySnapshotFailures, lateExcluded: m.communityLateExcluded },
     };
   }
 }

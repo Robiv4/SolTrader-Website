@@ -31,11 +31,56 @@ function Comparison({ title, stats }: { title: string; stats: any }) {
   </Panel>;
 }
 
+const METADATA_FAILURE_TEXT: Record<string, string> = {
+  MISSING_URI: 'nincs URI', REJECTED_URL: 'biztonsági okból elutasított URL', DNS: 'DNS-hiba', PRIVATE_ADDRESS: 'privát cím (SSRF-védelem)', HTTP: 'HTTP-hiba', RATE_LIMITED: 'HTTP 429',
+  TIMEOUT: 'időtúllépés', NETWORK: 'hálózati hiba', TOO_LARGE: 'túl nagy', JSON: 'JSON-hiba', REDIRECT_REJECTED: 'elutasított átirányítás',
+};
+const VIA_TEXT: Record<string, string> = { PUMP_FUN_METADATA: 'Pump.fun metadata', DEXSCREENER: 'DEX Screener', TELEGRAM_SEARCH: 'Telegram-keresés' };
+
+/** Telegram + metadata discovery health (worker, credential-free) and the Telegram share of the Community ML snapshots. */
+function TelegramPanel({ data }: { data: any }) {
+  if (!data) return <Panel title="Telegram Intelligence"><LoadingState /></Panel>;
+  const t = data.telegram;
+  const d = t?.details ?? {};
+  const m = data.metadata;
+  const failed: Record<string, number> = m?.failed ?? {};
+  return <Panel title="Telegram Intelligence és metadata-felderítés" description="MONITOR_ONLY: csak adatgyűjtés és Community feature-ök; kereskedési döntést nem változtat. Titkot, sessiont, telefonszámot és nyers üzenetet nem tartalmaz.">
+    {!data.available ? <EmptyState message="Nincs friss social állapotjelentés a workertől." /> : <>
+      <div className="metric-grid">
+        <Metric label="Telegram állapot" value={t ? t.state : 'nincs'} note={t?.lastError ?? undefined} />
+        <Metric label="Keresések / találatos" value={`${fmt(d.globalSearches ?? 0, 0)} / ${fmt(d.searchesWithHits ?? 0, 0)}`} note={`elfogadott találat: ${fmt(d.searchHits ?? 0, 0)}`} />
+        <Metric label="Elutasított találat" value={fmt(Object.values(d.searchHitsRejected ?? {}).reduce((sum: number, value: any) => sum + Number(value), 0), 0)} note={Object.entries(d.searchHitsRejected ?? {}).filter(([, value]) => Number(value) > 0).map(([key, value]) => `${key}: ${value}`).join(' · ') || undefined} />
+        <Metric label="Ellenőrzött forrás" value={fmt(d.verifiedSources ?? 0, 0)} note={Object.entries(d.accessibleByVia ?? {}).map(([key, value]) => `${VIA_TEXT[key] ?? key}: ${value}`).join(' · ')} />
+        <Metric label="Aktívan figyelt csoport / csatorna" value={`${fmt(d.activeGroups ?? 0, 0)} / ${fmt(d.activeChannels ?? 0, 0)}`} />
+        <Metric label="Friss / régi (kihagyott) üzenet" value={`${fmt(d.freshMessages ?? 0, 0)} / ${fmt(d.historicalMessagesSkipped ?? 0, 0)}`} note={d.lastFreshMessageAt ? `utolsó friss: ${date(d.lastFreshMessageAt)}` : 'még nincs friss üzenet'} />
+        <Metric label="Tokenek Telegram-forrással" value={`${fmt(data.coverage?.withSource ?? 0, 0)} / ${fmt(data.coverage?.monitoredTokens ?? 0, 0)}`} note={`friss (5 p): ${fmt(data.coverage?.fresh ?? 0, 0)} · hivatalos link: ${fmt(data.coverage?.withOfficialLink ?? 0, 0)} · DEX link: ${fmt(data.coverage?.withDexScreenerLink ?? 0, 0)}`} />
+        <Metric label="Community ML snapshot social adattal (24 ó)" value={pct(data.mlSnapshots24h?.share)} note={`${fmt(data.mlSnapshots24h?.withSocialData ?? 0, 0)} / ${fmt(data.mlSnapshots24h?.total ?? 0, 0)} · élő: ${fmt(data.mlLive?.withTelegram ?? 0, 0)} / ${fmt(data.mlLive?.snapshots ?? 0, 0)}`} />
+      </div>
+      {m ? <>
+        <h4 className="section-title">Token metadata</h4>
+        <div className="metric-grid">
+          <Metric label="Metadata URI-val" value={fmt(m.withUri ?? 0, 0)} note={`hiányzó URI: ${fmt(m.missingUri ?? 0, 0)}`} />
+          <Metric label="Sikeres feloldás" value={fmt(m.resolved ?? 0, 0)} note={`újrapróbálás: ${fmt(m.retries ?? 0, 0)} · sorban: ${fmt(m.retryQueue ?? 0, 0)}`} />
+          <Metric label="Telegram-link a metadatában" value={fmt(m.withTelegramLink ?? 0, 0)} note={Object.entries(m.telegramLinkRejected ?? {}).map(([key, value]) => `elutasítva ${key}: ${value}`).join(' · ') || undefined} />
+          <Metric label="DEX Screener Telegram-link" value={fmt(data.externalTelegramLinks?.accepted ?? 0, 0)} note={Object.entries(data.externalTelegramLinks?.rejected ?? {}).map(([key, value]) => `elutasítva ${key}: ${value}`).join(' · ') || undefined} />
+        </div>
+        <DataTable headers={['Hibaosztály', 'Darab']}>
+          {Object.entries(failed).filter(([, value]) => Number(value) > 0).map(([key, value]) => <tr key={key}><td>{METADATA_FAILURE_TEXT[key] ?? key}</td><td>{fmt(Number(value), 0)}</td></tr>)}
+        </DataTable>
+      </> : null}
+      {(data.coverage?.tokens ?? []).length ? <DataTable headers={['Token', 'Lefedés kezdete', 'Üzenet (memóriában)', 'Utolsó üzenet']}>
+        {data.coverage.tokens.map((row: any) => <tr key={row.mint}><td>{row.symbol ?? '—'}<small className="sfield-help" style={{ display: 'block' }}>{row.mint.slice(0, 6)}…{row.mint.slice(-4)}</small></td><td>{date(row.coverageStart)}</td><td>{fmt(row.messages, 0)}</td><td>{row.lastMessageAt ? date(row.lastMessageAt) : '—'}</td></tr>)}
+      </DataTable> : null}
+    </>}
+  </Panel>;
+}
+
 /** Community Intelligence + Community ML PAPER model: provider status, decisions with the community data of that moment, hourly funnel, comparison, stuck positions. */
 export function CommunityTab() {
   const dashboard = useApi<{ data: any }>('/api/community/ml-dashboard?hours=24');
   const health = useApi<{ data: any }>('/api/community/health');
   const stuck = useApi<{ data: any }>('/api/positions/stuck-diagnostics');
+  const telegram = useApi<{ data: any }>('/api/community/telegram-health');
   if (dashboard.loading && !dashboard.data) return <LoadingState />;
   if (dashboard.error) return <ErrorState message={dashboard.error} />;
   const d = dashboard.data?.data;
@@ -62,6 +107,8 @@ export function CommunityTab() {
       </DataTable>}
       <p className="sfield-help">Telegram: a meglévő Social Intelligence integrációból. X: opcionális, hivatalos API nélkül nem gyűjt. LunarCrush: csak API-kulccsal, és csak ha a válasz a mint-címet tartalmazza.</p>
     </Panel>
+
+    <TelegramPanel data={telegram.data?.data} />
 
     <Panel title="Community modellek" description="Csak a meglévő kapukon át választható: SHADOW_READY, minimális SHADOW-predikciószám, artifact-checksum, dataset-kompatibilitás és külön admin jóváhagyás.">
       {(d.communityModels ?? []).length === 0 ? <EmptyState message="Még nincs betanított Community modell. Ehhez valós, időhelyes community snapshotok és lezárt kimenetek kellenek (pnpm ml:dataset --feature-version ML-FEATURES-COMMUNITY-v1)." /> : <DataTable wide headers={['Modell', 'Állapot', 'Készenlét', 'Dataset', 'Tanítás', 'Community lefedettség', 'SHADOW predikció', 'PAPER jóváhagyás']}>

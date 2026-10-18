@@ -16,8 +16,11 @@ const logger = { info: () => undefined, warn: () => undefined };
 
 describe('social collection service', () => {
   it('metadata fetching is restricted to public IPFS / Arweave gateways over https (SSRF protection)', () => {
-    expect(safeMetadataUrl('https://ipfs.io/ipfs/QmAbc')).toBe('https://ipfs.io/ipfs/QmAbc');
-    expect(safeMetadataUrl('ipfs://QmAbc')).toBe('https://ipfs.io/ipfs/QmAbc');
+    const cid = 'QmZWEuvDH5HJLfrria691TTk8GzsoC6A3h77wLudahR24Z';
+    // ipfs.io (public path gateway retired: HTTP 429 on every request) is rewritten to a working gateway by CID.
+    expect(safeMetadataUrl(`https://ipfs.io/ipfs/${cid}`)).toBe(`https://ipfs.filebase.io/ipfs/${cid}`);
+    expect(safeMetadataUrl(`ipfs://${cid}`)).toBe(`https://ipfs.filebase.io/ipfs/${cid}`);
+    expect(safeMetadataUrl('https://ipfs.io/ipfs/QmAbc')).toBeNull();
     expect(safeMetadataUrl('http://ipfs.io/ipfs/QmAbc')).toBeNull();
     expect(safeMetadataUrl('https://localhost/x')).toBeNull();
     expect(safeMetadataUrl('https://169.254.169.254/latest/meta-data')).toBeNull();

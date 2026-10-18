@@ -51,6 +51,8 @@ export function parseDexPairs(mint: string, pairs: unknown, receivedAt: number, 
       discord: socials.some((social) => type(social.type) === 'discord'),
       other: socials.filter((social) => !['twitter', 'x', 'telegram', 'discord'].includes(type(social.type))).length,
     },
+    // Only from the pair whose BASE token is the mint (identity confirmed); a quote-side pair contributes nothing.
+    telegramLinks: [...new Set(socials.filter((social) => type(social.type) === 'telegram' && typeof social.url === 'string' && social.url.trim()).map((social) => social.url!.trim().slice(0, 200)))].slice(0, 3),
     activeBoosts: best ? finite(best.boosts?.active) ?? 0 : null,
     paidOrders: (orders?.orders ?? []).map((order) => ({ type: String(order.type ?? 'unknown'), status: String(order.status ?? 'unknown'), paymentTimestamp: finite(order.paymentTimestamp) })),
     boostPayments: (orders?.boosts ?? []).map((boost) => ({ amount: finite(boost.amount), paymentTimestamp: finite(boost.paymentTimestamp) })),
