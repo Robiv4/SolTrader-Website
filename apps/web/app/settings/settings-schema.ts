@@ -82,7 +82,7 @@ export const CARDS: CardDef[] = [
     id: 'trading-mode', group: 'bot', title: 'Kereskedési mód', description: 'A New Launch kizárólag PAPER módban nyit pozíciót.',
     fields: [{ source: 'bot', key: 'tradingMode', label: 'Kereskedési mód', kind: 'select', apply: 'immediate', options: [{ value: 'PAPER', label: 'PAPER – automatikus szimulált kereskedés' }, { value: 'SEMI_AUTO', label: 'SEMI_AUTO – jóváhagyással (New Launch nem nyit)' }], help: 'LIVE módot csak a biztonsági kapu kezel; ez a lista nem tudja bekapcsolni.' }],
   },
-  { id: 'paper-strategy', group: 'bot', title: 'Kereskedési stratégia', description: 'Ki dönt a New Launch PAPER belépésekről: az alapstratégia vagy egy admin által jóváhagyott ML-modell. Alapértelmezés: alapstratégia.', custom: 'paper-strategy', keywords: 'stratégia alapstratégia ml modell machine learning küszöb paper jóváhagyás default model threshold', apply: 'immediate' },
+  { id: 'paper-strategy', group: 'bot', title: 'Aktív kereskedési ML modell', description: 'Melyik jóváhagyott Autonomous ML modell kereskedik PAPER módban. Modell nélkül a rendszer csak adatot gyűjt.', custom: 'paper-strategy', keywords: 'aktív modell ml modell machine learning autonomous paper jóváhagyás adatgyűjtés szüneteltetés kockázat model', apply: 'immediate' },
   { id: 'paper-account', group: 'bot', title: 'PAPER számla', custom: 'paper-account', keywords: 'paper számla egyenleg kezdőtőke visszaállítás reset usdc', apply: 'immediate' },
   { id: 'live-safety', group: 'bot', title: 'LIVE biztonsági kapu', description: 'A LIVE kereskedés tiltva marad; a kapu állapota itt ellenőrizhető.', custom: 'live-safety', keywords: 'live biztonság kapu vészleállítás emergency', apply: 'immediate' },
 

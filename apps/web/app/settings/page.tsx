@@ -14,7 +14,7 @@ import { PaperAccountPanel } from '../paper-account-panel';
 import { ProfilePicturePanel } from '../profile-picture-panel';
 import { TelegramPanel } from '../telegram-panel';
 
-import { PaperStrategyCard } from './paper-strategy-card';
+import { ActiveModelCard } from './active-model-card';
 import { type Apply, APPLY_LABELS, type CardDef, cardMatches, CARDS, type FieldDef, fieldMatches, type GroupId, GROUPS, LEGACY_HASHES, normalize, type Source } from './settings-schema';
 
 type Values = Record<string, any>;
@@ -315,7 +315,7 @@ export default function SettingsPage() {
   const renderCustom = (card: CardDef): ReactNode => {
     switch (card.custom) {
       case 'bot-status': return <BotStatusCard general={general} />;
-      case 'paper-strategy': return <PaperStrategyCard />;
+      case 'paper-strategy': return <ActiveModelCard />;
       case 'paper-account': return <PaperAccountPanel />;
       case 'live-safety': return <LiveSafetyControls onChange={() => void load()} />;
       case 'nl-security': return <ul className="locked-rules">{(drafts.nl.mandatorySecurity ?? []).map((rule) => <li key={rule}><Lock size={15} aria-hidden="true" /> {SECURITY_LABELS[rule] ?? rule}</li>)}</ul>;

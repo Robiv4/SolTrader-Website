@@ -41,6 +41,11 @@ DEFAULT_SIZING = {'method': 'EDGE_OVER_DOWNSIDE', 'baseFractionPct': 2.0, 'maxFr
 NEVER_BUY = {'minProbability': 1.01, 'minExpectedNetPct': 1e6, 'minDownsideNetPct': 0.0, 'waitMinProbability': 1.01}
 
 
+def emit(stage: str, **details):
+    """Real pipeline stage for the web progress view (one JSON line on stdout; the final line is the result)."""
+    print(json.dumps({'event': 'STAGE', 'stage': stage, **details}), flush=True)
+
+
 def load_autonomous(directory: Path):
     manifest = json.loads((directory / 'manifest.json').read_text(encoding='utf-8'))
     frame = pd.read_csv(directory / 'dataset.csv', dtype={'row_id': str, 'group_id': str, 'kind': str, 'origin': str, 'market_regime': str}, keep_default_na=True)
@@ -172,6 +177,7 @@ def main(argv=None):
 
     meta = {'featureVersion': manifest['featureVersion'], 'labelVersion': manifest['labelVersion']}
     components, metrics = {}, {'entry': {}, 'exit': {}}
+    emit('ENTRY_MODELS', entryRows=int(len(entry)))
 
     # ---------------- entry components
     tr, va, te, boundaries_entry, purged_entry = group_safe_split(entry, args.embargo_ms)
@@ -237,6 +243,7 @@ def main(argv=None):
         components[name] = artifact
 
     # ---------------- exit components
+    emit('EXIT_MODELS', positionRows=int(len(position)))
     tr, va, te, boundaries_exit, purged_exit = group_safe_split(position, args.embargo_ms)
     pcols = build_columns(schema, position.iloc[tr], 'lightgbm', exclude_groups=EXCLUDED_GROUPS)
     px = vectorize(position, pcols, 'lightgbm')
@@ -261,6 +268,9 @@ def main(argv=None):
         artifact['objective'] = objective
         components[name] = artifact
 
+    # ---------------- sizing (v1: deterministic policy over the outputs, not a learned model) + validation
+    emit('POSITION_SIZING', method=DEFAULT_SIZING['method'], learned=False)
+    emit('VALIDATION')
     # ---------------- parity: exported trees == LightGBM (the TypeScript runtime replays the same trees)
     parity = 0.0
     for name, model, matrix in [('entryReturn', m_ret, x), ('entryProfit', m_prof, x), ('exitAdvantage', m_adv, px)]:
@@ -284,6 +294,7 @@ def main(argv=None):
         'format': BUNDLE_FORMAT, 'bundleVersion': version, 'featureVersion': manifest['featureVersion'], 'labelVersion': manifest['labelVersion'], 'datasetVersion': manifest['version'],
         'createdAt': trained_at, 'components': components, 'policy': {'entry': entry_policy, 'exit': exit_policy}, 'sizing': dict(DEFAULT_SIZING),
     }
+    emit('SAVING', readiness=readiness)
     model_dir.mkdir(parents=True, exist_ok=True)
     text = json.dumps(bundle, separators=(',', ':'))
     (model_dir / 'bundle.json').write_text(text, encoding='utf-8')

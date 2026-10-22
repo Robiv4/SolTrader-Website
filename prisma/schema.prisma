@@ -1780,3 +1780,37 @@ model MlAutonomousFill {
   @@index([accountId, at])
 }
 
+/// Web-started ML training job (durable state; the separate ml-trainer process runs it, never the trading worker).
+model MlTrainingJob {
+  id              String    @id @default(cuid())
+  /// AUTONOMOUS
+  kind            String    @default("AUTONOMOUS")
+  /// Optional display name (the bundle version is generated)
+  name            String?
+  /// QUEUED | PREPARING_DATASET | TRAINING | VALIDATING | SAVING | COMPLETED | FAILED | CANCELLED
+  status          String    @default("QUEUED")
+  /// Last real stage reported by the pipeline (e.g. ENTRY_MODELS, EXIT_MODELS, POLICY_AND_SIZING)
+  stage           String?
+  /// "ACTIVE" while the job is not finished: at most one active training at a time (double clicks -> same job)
+  activeKey       String?   @unique
+  /// Requested dataset version (null = build a new dataset from the current data)
+  datasetVersion  String?
+  bundleVersion   String?
+  readiness       String?
+  requestedBy     String
+  requestedAt     DateTime  @default(now())
+  startedAt       DateTime?
+  finishedAt      DateTime?
+  heartbeatAt     DateTime?
+  leaseOwner      String?
+  cancelRequested Boolean   @default(false)
+  error           String?
+  /// Credential-free progress log [{at, stage, message}] (bounded)
+  log             Json      @default("[]")
+  /// Real counts reported by the pipeline (rows, coverage, readiness)
+  result          Json?
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  @@index([status, requestedAt])
+}

@@ -19,7 +19,7 @@ import { fileURLToPath } from 'node:url';
 
 import { Prisma, type PrismaClient } from '@prisma/client';
 import {
-  effectiveMlMinLiquidityUsd, isSupportedFeatureVersion, ML_AUTONOMOUS_STRATEGY, ML_TRAINING_KEY, resolveEntryAuthority, selectableStrategies, ML_HONEYPOT_CODES, ML_MIN_LIQUIDITY_FLOOR_USD, ML_MIN_LIQUIDITY_MAX_USD, ML_MIN_LIQUIDITY_SUGGESTED_USD, ML_PAPER_SNAPSHOT_POINTS,
+  DEFAULT_AUTONOMOUS_PROTECTION, effectiveMlMinLiquidityUsd, isSupportedFeatureVersion, ML_AUTONOMOUS_STRATEGY, ML_TRAINING_KEY, resolveEntryAuthority, selectableStrategies, ML_HONEYPOT_CODES, ML_MIN_LIQUIDITY_FLOOR_USD, ML_MIN_LIQUIDITY_MAX_USD, ML_MIN_LIQUIDITY_SUGGESTED_USD, ML_PAPER_SNAPSHOT_POINTS,
   ML_PAPER_THRESHOLD_MAX, ML_PAPER_THRESHOLD_MIN, ML_PAPER_WINDOW_MAX_SECONDS, mlBlockerCategory, mlBlockerGroup, resolveNewLaunchSettings,
 } from '@soltrader/strategy-engine';
 import { type Request, type Response, Router } from 'express';
@@ -183,6 +183,28 @@ export function createMlPaperRouter(deps: MlPaperDeps) {
   });
 
   // ---------------------------------------------------------------- per-user strategy selection
+  async function autonomousView(userId: string, selectedVersion: string | null) {
+    const [approved, health, risk, selected] = await Promise.all([
+      prisma.mlAutonomousModelBundle.findMany({ where: { paperApproved: true, status: { not: 'RETIRED' } }, orderBy: { trainedAt: 'desc' }, select: { version: true, readiness: true, trainedAt: true, datasetVersion: true } }),
+      deps.readJson('ml:autonomous:health').catch(() => null),
+      prisma.riskConfig.findUnique({ where: { userId } }).catch(() => null),
+      selectedVersion ? prisma.mlAutonomousModelBundle.findUnique({ where: { version: selectedVersion }, select: { version: true, status: true, paperApproved: true, readiness: true } }) : null,
+    ]);
+    const loaded = Array.isArray(health?.bundles) ? (health.bundles as Array<{ version: string; loaded: boolean; error: string | null }>).find((bundle) => bundle.version === selectedVersion) ?? null : null;
+    const limit = (fallback: number, value: unknown) => Math.min(fallback, value === null || value === undefined ? Number.POSITIVE_INFINITY : Number(value));
+    return {
+      approvedModels: approved,
+      selected: selected ? { ...selected, usable: selected.paperApproved && selected.status !== 'RETIRED' } : null,
+      workerReport: health ? { at: health.at ?? null, loaded: loaded ? loaded.loaded : null, error: loaded?.error ?? null } : null,
+      // Same rule as the engine: the stricter of the autonomous defaults and the user's risk limits.
+      riskLimits: {
+        maxPositionPctOfEquity: limit(DEFAULT_AUTONOMOUS_PROTECTION.maxPositionPctOfEquity, risk?.maxPositionPercent), maxExposurePctOfEquity: limit(DEFAULT_AUTONOMOUS_PROTECTION.maxExposurePctOfEquity, risk?.maxTotalExposurePercent),
+        dailyLossLimitPct: limit(DEFAULT_AUTONOMOUS_PROTECTION.dailyLossLimitPct, risk?.dailyLossLimitPercent), maxOpenPositions: limit(DEFAULT_AUTONOMOUS_PROTECTION.maxOpenPositions, risk?.maxConcurrentPositions),
+        maxImpactPct: DEFAULT_AUTONOMOUS_PROTECTION.maxImpactPct, hardMaxLossPct: DEFAULT_AUTONOMOUS_PROTECTION.hardMaxLossPct, technicalMaxHoldMinutes: DEFAULT_AUTONOMOUS_PROTECTION.technicalMaxHoldMinutes,
+      },
+    };
+  }
+
   async function settingsView(userId: string, isAdmin: boolean) {
     const [row, bot, approved, decisions, lastPrediction, health, newLaunch] = await Promise.all([
       prisma.mlPaperSettings.findUnique({ where: { userId } }),
@@ -223,6 +245,8 @@ export function createMlPaperRouter(deps: MlPaperDeps) {
       tradingPaused: Boolean(row?.tradingPaused),
       /** strategyMode ML_AUTONOMOUS: the selected Autonomous bundle (separate virtual PAPER account). */
       autonomousBundleVersion: row?.autonomousBundleVersion ?? null,
+      /** Simplified UI: the active Autonomous model, its load state in the worker, the selectable models, the risk limits. */
+      autonomous: await autonomousView(userId, row?.autonomousBundleVersion ?? null),
       pausedAt: row?.pausedAt ?? null,
       modelVersion: row?.modelVersion ?? null,
       buyThreshold: row ? Number(row.buyThreshold) : 0.7,
@@ -353,9 +377,9 @@ export function createMlPaperRouter(deps: MlPaperDeps) {
     }
   });
 
-  /** ML-only: deselect the trading model -> DATA_COLLECTION (no entries; open positions keep their model and exits). */
+  /** Deselect the trading model -> DATA_COLLECTION (no entries; open positions keep their model and exits). */
   router.post('/settings/ml-paper/clear-model', async (req: Request, res: Response) => {
-    if (!deps.mlOnly?.()) return fail(res, 409, 'Csak az ML-only architektúrában érhető el (régi mód: DEFAULT stratégia választás).');
+    // "Nincs modell – csak adatgyűjtés": also in legacy mode an explicit no-model selection never buys (no DEFAULT).
     const userId = req.user!.id;
     try {
       const current = await prisma.mlPaperSettings.findUnique({ where: { userId } });

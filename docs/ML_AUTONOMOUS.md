@@ -138,3 +138,44 @@ pnpm ml:autonomous:status
 - **Sizing** is a deterministic policy over the model outputs (no learned sizing model yet).
 - **Execution** is simulated with the PAPER cost model (no partial fills, no latency model in the autonomous ledger).
 - **SHADOW decisions** exist for entries only (no shadow exit decisions without positions).
+
+## Web training (Machine Learning → „+ Új ML modell tanítása”)
+
+**Flow:**
+1. The modal shows the real data state (`GET /api/ml/autonomous/dataset-readiness`) and what is missing.
+2. **Indítás** creates a durable `MlTrainingJob` (`POST /api/ml/autonomous/training-jobs`, admin only, audited).
+3. The separate **ml-trainer** process (`pnpm --dir apps/worker training`, Docker service `ml-trainer`) claims the job and runs:
+   - `PREPARING_DATASET`: a new immutable AUTO-DATASET, or the chosen one, hash verified;
+   - `TRAINING`: Python, with real stage events ENTRY_MODELS, EXIT_MODELS, POSITION_SIZING;
+   - `VALIDATING`: export parity, backtests, stress tests, readiness;
+   - `SAVING` → `COMPLETED`: checksum verified, new TRAINED row.
+
+   It can also end `FAILED` or `CANCELLED`.
+
+**Guarantees:**
+- At most one active job (`activeKey` is unique): a double click returns the running job (409).
+- Every training input is validated: no path, shell command or CLI argument ever reaches the trainer.
+- A heartbeat and lease hold the job. After a restart, a job that was running becomes `FAILED` (`INTERRUPTED`), never `COMPLETED`.
+- Cancel kills the Python child process.
+- The child process gets no database URL and no secrets. It runs with `nice` (Linux), 1 numeric thread and a timeout; the container `cpus` / `mem_limit` apply.
+- Never in the trading worker, never during an HTTP request, no trading side effect. A trained model is TRAINED only.
+
+**After training:**
+1. „Modell ellenőrzése” (`POST /api/ml/autonomous/models/:v/check`) is allowed for SHADOW_READY models only; research models stay research models.
+2. The model then decides without executing until ≥ 500 check decisions exist.
+3. Then follows the admin approval, and finally activation in Settings → „Aktív kereskedési ML modell”: e-mail confirmation, audited. The options are „Nincs modell – csak adatgyűjtés” or the approved models.
+
+| Variable | Default | |
+| --- | --- | --- |
+| `ML_PYTHON` | `ml/.venv/...` (Docker: `/opt/ml-venv/bin/python`) | Python with the pinned requirements |
+| `ML_TRAINER_TIMEOUT_MIN` | 120 | the job fails after this |
+| `ML_TRAINER_NICE` | 10 | CPU priority (Linux) |
+| `ML_TRAINER_THREADS` | 1 | numeric library threads |
+| `ML_TRAINER_CPUS` / `ML_TRAINER_MEMORY` | 1.0 / 2g | compose limits of the ml-trainer container |
+
+**Docker:**
+- The `ml-trainer` image target is Debian slim with `python3` and a venv, because LightGBM wheels need glibc and the node images are Alpine.
+- `ml/autonomous-datasets` and `ml/autonomous-models` are bind-mounted into worker, api and ml-trainer, so they survive rebuilds.
+- Inside the containers the database is reached on the compose network (`DATABASE_URL_DOCKER`, `postgres:5432`). From a host terminal use the host-mapped port instead; do not change the container URL for that.
+- A VPS override (`docker-compose.vps.yml`) must add the same `ml-trainer` service and volumes if it does not extend this file.
+

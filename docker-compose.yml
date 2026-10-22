@@ -64,6 +64,9 @@ services:
     ports:
       - "3001:3001"
     command: pnpm --dir apps/api dev
+    volumes:
+      - ./ml/autonomous-datasets:/app/ml/autonomous-datasets
+      - ./ml/autonomous-models:/app/ml/autonomous-models
 
   web:
     build:
@@ -97,3 +100,38 @@ services:
       redis:
         condition: service_healthy
     command: pnpm --dir apps/worker dev
+    volumes:
+      # Autonomous ML datasets / bundles survive image rebuilds (shared with ml-trainer and api).
+      - ./ml/autonomous-datasets:/app/ml/autonomous-datasets
+      - ./ml/autonomous-models:/app/ml/autonomous-models
+
+  # Web-started ML training jobs (separate process: never trades, never blocks the worker / Exit Engine).
+  ml-trainer:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: ml-trainer
+    container_name: soltrader-ml-trainer
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      TRADING_MODE: PAPER
+      LIVE_TRADING_ENABLED: false
+      # Inside Docker the database is reached on the compose network (postgres:5432), not via the host port.
+      DATABASE_URL: ${DATABASE_URL_DOCKER:?DATABASE_URL_DOCKER must be set}
+      REDIS_URL: redis://redis:6379
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?REDIS_PASSWORD must be set}
+      ML_PYTHON: /opt/ml-venv/bin/python
+      ML_TRAINER_TIMEOUT_MIN: ${ML_TRAINER_TIMEOUT_MIN:-120}
+      ML_TRAINER_NICE: ${ML_TRAINER_NICE:-10}
+      ML_TRAINER_THREADS: ${ML_TRAINER_THREADS:-1}
+    cpus: ${ML_TRAINER_CPUS:-1.0}
+    mem_limit: ${ML_TRAINER_MEMORY:-2g}
+    volumes:
+      - ./ml/autonomous-datasets:/app/ml/autonomous-datasets
+      - ./ml/autonomous-models:/app/ml/autonomous-models
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy

@@ -29,14 +29,14 @@ import { fileURLToPath } from 'node:url';
 
 import { Prisma, PrismaClient } from '@prisma/client';
 import {
-  buildAutonomousDataset, buildMlDataset, isSupportedFeatureVersion, labelEntry, labelPosition, AUTONOMOUS_LABEL_VERSION, ML_AUTONOMOUS_FEATURE_VERSION, mlAutonomousFeatureSchemaJson, ML_COMMUNITY_FEATURE_VERSION, ML_FEATURE_VERSION, ML_LABEL_VERSION, ML_TARGETS, mlCommunityFeatureSchemaJson, mlFeatureSchemaJson,
+  buildMlDataset, isSupportedFeatureVersion, ML_AUTONOMOUS_FEATURE_VERSION, mlAutonomousFeatureSchemaJson, ML_COMMUNITY_FEATURE_VERSION, ML_FEATURE_VERSION, ML_LABEL_VERSION, ML_TARGETS, mlCommunityFeatureSchemaJson, mlFeatureSchemaJson,
   type CandidateOutcomeResult, type MlDatasetSourceRow, type MlFeatures, type OutcomePathState,
 } from '@soltrader/strategy-engine';
 import { createClient } from 'redis';
 
-import { loadLiveSources, loadReplaySources } from '../src/autonomous/dataset-source.js';
 import { chunk, indexPaperTrades, loadAllPages, loadPaperTradesInBatches, matchPaperTrade, paperProvenance } from '../src/ml/dataset-source.js';
-import { ML_TRAINING_KEY, registerAutonomousBundle, registerTrainedModel } from '../src/ml/model-registration.js';
+import { ML_TRAINING_KEY, registerTrainedModel } from '../src/ml/model-registration.js';
+import { buildAutonomousDatasetVersion, defaultPython, registerTrainerOutput, runAutonomousTrainer } from '../src/training/pipeline.js';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
 // Server-side configuration (DATABASE_URL, REDIS_URL) from the repository .env; values are never printed.
@@ -267,28 +267,9 @@ function test() {
 async function autonomousDataset() {
   const prisma = new PrismaClient();
   try {
-    const now = Date.now();
-    const { sources, paths } = await loadReplaySources(prisma);
-    const live = await loadLiveSources(prisma, paths, now);
-    const existing = await prisma.mlDatasetVersion.count({ where: { featureVersion: ML_AUTONOMOUS_FEATURE_VERSION } });
-    const version = option('version', `AUTO-DATASET-v${existing + 1}`);
-    const directory = path.join(ML_DIR, 'autonomous-datasets', version);
-    if (existsSync(directory)) throw new Error(`Dataset ${version} already exists (immutable)`);
-    const built = buildAutonomousDataset({ version, replay: sources, live });
-    mkdirSync(directory, { recursive: true });
-    writeFileSync(path.join(directory, 'dataset.csv'), built.csv);
-    const fileHash = sha256(built.csv);
-    const manifest = { ...built.manifest, createdAt: new Date().toISOString(), fileHash, sources: { replay: sources.length, live: live.length } };
-    writeFileSync(path.join(directory, 'manifest.json'), `${JSON.stringify(manifest, null, 2)}\n`);
-    // Label audit of live snapshots (never back-dated; one row per snapshot).
-    const outcomes = live.map((row) => {
-      const label = row.kind === 'ENTRY' ? labelEntry(row.path, row.at) : row.position ? labelPosition(row.path, row.at, row.position) : null;
-      return { snapshotId: row.id, labelVersion: AUTONOMOUS_LABEL_VERSION, status: label?.status ?? 'EXCLUDED', labels: (label ?? {}) as Prisma.InputJsonValue, uncertainty: { horizonResolutionMs: label?.horizonResolutionMs ?? null, liquidityAssumed: label?.liquidityAssumed ?? null } as Prisma.InputJsonValue, exclusionReason: label ? label.exclusion : 'POSITION_STATE_MISSING', labelEndAt: new Date(label?.labelEndAt ?? row.at) };
-    });
-    for (let index = 0; index < outcomes.length; index += 1_000) await prisma.mlAutonomousOutcome.createMany({ data: outcomes.slice(index, index + 1_000), skipDuplicates: true });
-    await prisma.mlDatasetVersion.create({ data: { version, featureVersion: ML_AUTONOMOUS_FEATURE_VERSION, labelVersion: AUTONOMOUS_LABEL_VERSION, target: 'AUTONOMOUS_NET_PNL', config: { version, kinds: ['ENTRY', 'POSITION'] } as Prisma.InputJsonValue, manifest: manifest as unknown as Prisma.InputJsonValue, rowCount: built.rows.length, filePath: path.relative(ROOT, path.join(directory, 'dataset.csv')).replace(/\\/g, '/'), fileHash, createdBy: actor } });
-    await audit(prisma, 'ml_autonomous_dataset_created', { version, rows: built.rows.length, fileHash });
-    console.log(JSON.stringify({ version, rows: built.rows.length, coverage: (manifest.coverage as Record<string, unknown>), directory: path.relative(ROOT, directory) }, (key, value) => (key === 'featureNullShare' ? undefined : value), 2));
+    const built = await buildAutonomousDatasetVersion(prisma, { rootDir: ROOT, actor, version: args.includes('--version') ? option('version', '') : undefined });
+    await audit(prisma, 'ml_autonomous_dataset_created', { version: built.version, rows: built.rows, fileHash: built.fileHash });
+    console.log(JSON.stringify({ version: built.version, rows: built.rows, coverage: built.manifest.coverage, directory: path.relative(ROOT, built.directory) }, (key, value) => (key === 'featureNullShare' ? undefined : value), 2));
   } finally {
     await prisma.$disconnect();
   }
@@ -304,26 +285,20 @@ async function autonomousTrain() {
     const directory = path.join(ML_DIR, 'autonomous-datasets', version);
     if (!datasetRow || datasetRow.featureVersion !== ML_AUTONOMOUS_FEATURE_VERSION || !existsSync(path.join(directory, 'dataset.csv'))) throw new Error(`Autonomous dataset ${version} not found`);
     if (sha256(readFileSync(path.join(directory, 'dataset.csv'))) !== datasetRow.fileHash) throw new Error('Dataset file hash mismatch (modified after creation)');
-    if (!existsSync(PYTHON)) throw new Error('Python environment missing: run pnpm ml:setup');
+    const python = defaultPython(ROOT);
+    if (!existsSync(python)) throw new Error('Python environment missing: run pnpm ml:setup');
     const marker = await trainingMarker({ dataset: version, kind: 'AUTONOMOUS', startedAt: new Date().toISOString(), by: actor });
-    const extra = args.includes('--allow-small') ? ['--allow-small'] : [];
-    const run = spawnSync(PYTHON, ['-m', 'soltrader_ml.autonomous', '--dataset', directory, '--out', path.join(ML_DIR, 'autonomous-models'), '--seed', option('seed', '42'), ...extra], { cwd: ML_DIR, encoding: 'utf8' });
+    const result = await runAutonomousTrainer({ python, rootDir: ROOT, datasetDir: directory, seed: Number(option('seed', '42')), timeoutMs: 6 * 3_600_000, allowSmall: args.includes('--allow-small'), onStage: (stage) => console.error(`stage: ${stage}`) });
     await marker.clear();
-    process.stderr.write(run.stderr ?? '');
-    const result = JSON.parse((run.stdout ?? '').trim().split('\n').at(-1) ?? '{}') as { status: string; failures?: string[]; dir?: string };
-    await audit(prisma, 'ml_autonomous_training_run', { dataset: version, status: result.status, failures: result.failures ?? null, exitCode: run.status });
-    if (run.status !== 0 || result.status !== 'TRAINED' || !result.dir) {
-      console.log(JSON.stringify(result, null, 2));
-      process.exitCode = run.status || 1;
+    await audit(prisma, 'ml_autonomous_training_run', { dataset: version, status: result.status, failures: result.failures, exitCode: result.exitCode });
+    if (result.status !== 'TRAINED' || !result.dir) {
+      console.log(JSON.stringify({ status: result.status, failures: result.failures, stderr: result.stderrTail.slice(-500) }, null, 2));
+      process.exitCode = result.exitCode || 1;
       return;
     }
-    const metadata = JSON.parse(readFileSync(path.join(result.dir, 'metadata.json'), 'utf8'));
-    const artifactPath = path.relative(ROOT, path.join(result.dir, 'bundle.json')).replace(/\\/g, '/');
-    const artifactHash = sha256(readFileSync(path.join(result.dir, 'bundle.json')));
-    if (artifactHash !== metadata.artifactHash) throw new Error(`Bundle hash mismatch for ${metadata.bundleVersion}`);
-    await registerAutonomousBundle(prisma, { version: metadata.bundleVersion, readiness: metadata.readiness, featureVersion: metadata.featureVersion, labelVersion: metadata.labelVersion, datasetVersion: version, artifactPath, artifactHash, policy: metadata.policy, metrics: metadata.metrics, trainedAt: metadata.trainedAt, actor });
-    await audit(prisma, 'ml_autonomous_bundle_registered', { bundleVersion: metadata.bundleVersion, readiness: metadata.readiness, artifactHash });
-    console.log(`registered ${metadata.bundleVersion} readiness=${metadata.readiness} (TRAINED: not approved, not selected, not trading)`);
+    const registered = await registerTrainerOutput(prisma, { rootDir: ROOT, dir: result.dir, datasetVersion: version, actor });
+    await audit(prisma, 'ml_autonomous_bundle_registered', registered);
+    console.log(`registered ${registered.bundleVersion} readiness=${registered.readiness} (TRAINED: not approved, not selected, not trading)`);
   } finally {
     await prisma.$disconnect();
   }

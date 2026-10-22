@@ -11,7 +11,8 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "telegram:login": "tsx scripts/telegram-login.ts",
-    "ml": "tsx scripts/ml-cli.ts"
+    "ml": "tsx scripts/ml-cli.ts",
+    "training": "tsx src/training/main.ts"
   },
   "dependencies": {
     "@prisma/client": "^5.22.0",

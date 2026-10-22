@@ -70,13 +70,15 @@ describe('ML-only settings API', () => {
     expect(audits).toEqual(expect.arrayContaining(['ml_trading_paused', 'ml_trading_resumed']));
   });
 
-  it('deselecting the model -> DATA_COLLECTION; not available in legacy mode', async () => {
+  it('deselecting the model -> DATA_COLLECTION; in legacy mode too (never a DEFAULT fallback)', async () => {
     await prisma.mlPaperSettings.update({ where: { userId: ids.user }, data: { strategyMode: 'ML', modelVersion: 'SOME-REVOKED-MODEL' } });
     const unavailable = await request(app(true, 'USER')).get('/api/settings/ml-paper');
     expect(unavailable.body.data.tradingState).toMatchObject({ state: 'MODEL_UNAVAILABLE', mayOpenEntries: false });
     const cleared = await request(app(true, 'USER')).post('/api/settings/ml-paper/clear-model').send({});
     expect(cleared.body.data).toMatchObject({ modelVersion: null, tradingState: { state: 'DATA_COLLECTION' } });
-    expect((await request(app(false, 'USER')).post('/api/settings/ml-paper/clear-model').send({})).status).toBe(409);
+    const legacy = await request(app(false, 'USER')).post('/api/settings/ml-paper/clear-model').send({});
+    expect(legacy.status).toBe(200);
+    expect(legacy.body.data.tradingState).toMatchObject({ state: 'DATA_COLLECTION', mayOpenEntries: false });
   });
 
   it('legacy mode (flag off): DEFAULT stays selectable and works as before', async () => {

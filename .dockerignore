@@ -15,3 +15,6 @@ coverage
 postgres-data
 redis-data
 *.log
+ml/.venv
+**/__pycache__
+.pytest_cache
