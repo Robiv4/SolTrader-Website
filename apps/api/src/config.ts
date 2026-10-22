@@ -17,6 +17,8 @@ const envSchema = z.object({
   HOST: z.string().default('0.0.0.0'),
   LOG_LEVEL: z.string().default('info'),
   TRADING_MODE: z.enum(['PAPER', 'SEMI_AUTO', 'LIVE']).default('PAPER'),
+  /** SolTrader 3.0 ML-only architecture (default OFF = legacy DEFAULT / ML selector unchanged). */
+  ML_ONLY_ARCHITECTURE_ENABLED: z.string().optional().transform((value) => value === 'true'),
   LIVE_TRADING_ENABLED: booleanFromEnv.default(false),
   SESSION_SECRET: z.string().min(32),
   SESSION_TTL_SECONDS: z.coerce.number().int().min(30).max(86400).default(1800),

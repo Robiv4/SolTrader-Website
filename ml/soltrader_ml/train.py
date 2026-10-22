@@ -139,6 +139,13 @@ def main(argv=None):
         print(json.dumps({'status': 'DATA_QUALITY_GATE_FAILED', 'failures': quality['failures'], 'report': str(report_path)}))
         return 3
 
+    # Models are immutable: a version that already has files (e.g. the active model) is never overwritten. Retraining
+    # needs a new dataset version or another seed (new model version); nothing is written in that case.
+    existing = [f"ML-{short}-{manifest['version']}-s{args.seed}" for short in ALGORITHMS.values() if any((out_root / f"ML-{short}-{manifest['version']}-s{args.seed}").glob('*'))]
+    if existing:
+        print(json.dumps({'status': 'MODEL_VERSION_EXISTS', 'failures': [f'{version} already exists (immutable)' for version in existing]}))
+        return 4
+
     times = frame['snapshot_at_ms'].to_numpy(dtype=np.int64)
     label_end = frame['label_end_ms'].to_numpy(dtype=np.int64)
     groups = frame['candidate_id'].to_numpy()

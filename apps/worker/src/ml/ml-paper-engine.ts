@@ -29,12 +29,14 @@ export interface MlPaperUserConfig {
   decisionWindowSeconds: number;
   /** Saved ML PAPER minimum liquidity (USD); null = not set (the DEFAULT minimum stays in force). */
   minLiquidityUsd: number | null;
+  /** ML-only architecture: no new entries while paused. */
+  tradingPaused?: boolean;
 }
 
 export const DEFAULT_ML_PAPER_CONFIG: MlPaperUserConfig = { mode: 'DEFAULT', modelVersion: null, buyThreshold: 0.7, decisionWindowSeconds: 10, minLiquidityUsd: null };
 
 /** Normalises a MlPaperSettings row (missing row = DEFAULT strategy). */
-export function toMlPaperConfig(row: { strategyMode: string; modelVersion: string | null; buyThreshold: unknown; decisionWindowSeconds: number; minLiquidityUsd?: unknown } | null | undefined): MlPaperUserConfig {
+export function toMlPaperConfig(row: { strategyMode: string; modelVersion: string | null; buyThreshold: unknown; decisionWindowSeconds: number; minLiquidityUsd?: unknown; tradingPaused?: boolean | null } | null | undefined): MlPaperUserConfig {
   if (!row) return DEFAULT_ML_PAPER_CONFIG;
   return {
     mode: row.strategyMode === 'ML' ? 'ML' : 'DEFAULT',
@@ -42,6 +44,7 @@ export function toMlPaperConfig(row: { strategyMode: string; modelVersion: strin
     buyThreshold: Number(row.buyThreshold),
     decisionWindowSeconds: row.decisionWindowSeconds,
     minLiquidityUsd: row.minLiquidityUsd === null || row.minLiquidityUsd === undefined || !Number.isFinite(Number(row.minLiquidityUsd)) ? null : Number(row.minLiquidityUsd),
+    tradingPaused: Boolean(row.tradingPaused),
   };
 }
 

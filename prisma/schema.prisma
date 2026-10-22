@@ -1470,6 +1470,10 @@ model MlPaperSettings {
   minLiquidityUsd       Decimal? @db.Decimal(14, 2)
   enabledAt             DateTime?
   enabledBy             String?
+  /// ML-only architecture: no NEW entries while paused (data collection and exit protection of open positions continue)
+  tradingPaused         Boolean  @default(false)
+  pausedAt              DateTime?
+  pausedBy              String?
   createdAt             DateTime @default(now())
   updatedAt             DateTime @updatedAt
 

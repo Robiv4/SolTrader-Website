@@ -46,6 +46,11 @@ const envSchema = z.object({
   PAPER_EXIT_LATENCY_P75_MS: z.coerce.number().min(0).optional(),
   PAPER_EXIT_LATENCY_P95_MS: z.coerce.number().min(0).optional(),
   /** Social Intelligence collection (deterministic, no AI). Off = no provider requests at all. */
+  /**
+   * SolTrader 3.0 ML-only architecture (default OFF = legacy behaviour unchanged). ON: the rule-based DEFAULT strategy
+   * never opens entries; only the user's selected, PAPER-approved model may; no model = data collection only.
+   */
+  ML_ONLY_ARCHITECTURE_ENABLED: z.string().optional().transform((value) => value === 'true'),
   SOCIAL_COLLECTION_ENABLED: z.string().optional().transform((value) => value !== 'false'),
   /** X is OPTIONAL (default off): with X_SOCIAL_ENABLED=false the X provider is DISABLED and makes zero requests. */
   X_SOCIAL_ENABLED: z.string().optional().transform((value) => value === 'true'),

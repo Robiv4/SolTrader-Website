@@ -5,3 +5,4 @@ export * from './model.js';
 export * from './outcomes.js';
 export * from './paper.js';
 export * from './exit-simulation.js';
+export * from './strategy-contract.js';

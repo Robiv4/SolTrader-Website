@@ -628,7 +628,7 @@ app.get('/api/users/:id/avatar', async (req, res) => {
 });
 
 // Machine Learning (shadow research; read for every signed-in user, model status: admin + e-mail code).
-app.use('/api', createMlPaperRouter({ prisma, readJson: (key) => readJsonKey<Record<string, unknown>>(key), logAuditEvent, stepUp, logger, serverTradingMode: () => env.TRADING_MODE }));
+app.use('/api', createMlPaperRouter({ prisma, readJson: (key) => readJsonKey<Record<string, unknown>>(key), logAuditEvent, stepUp, logger, serverTradingMode: () => env.TRADING_MODE, mlOnly: () => env.ML_ONLY_ARCHITECTURE_ENABLED }));
 app.use('/api', createCommunityMlRouter({ prisma, readJson: (key) => readJsonKey<Record<string, unknown>>(key), logger }));
 app.use('/api/ml', createMlRouter({ prisma, readJson: (key) => readJsonKey<Record<string, unknown>>(key), logAuditEvent, stepUp, logger }));
 

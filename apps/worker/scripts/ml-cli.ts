@@ -29,6 +29,7 @@ import {
 import { createClient } from 'redis';
 
 import { chunk, indexPaperTrades, loadAllPages, loadPaperTradesInBatches, matchPaperTrade, paperProvenance } from '../src/ml/dataset-source.js';
+import { ML_TRAINING_KEY, registerTrainedModel } from '../src/ml/model-registration.js';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
 // Server-side configuration (DATABASE_URL, REDIS_URL) from the repository .env; values are never printed.
@@ -149,8 +150,11 @@ async function train() {
     if (!datasetRow || !existsSync(path.join(directory, 'dataset.csv'))) throw new Error(`Dataset ${version} not found`);
     if (sha256(readFileSync(path.join(directory, 'dataset.csv'))) !== datasetRow.fileHash) throw new Error('Dataset file hash mismatch (modified after creation)');
     if (!existsSync(PYTHON)) throw new Error('Python environment missing: run pnpm ml:setup');
+    // Operating state MODEL_TRAINING (informational; data collection and trading continue untouched).
+    const marker = await trainingMarker({ dataset: version, startedAt: new Date().toISOString(), by: actor });
     const run = spawnSync(PYTHON, ['-m', 'soltrader_ml.train', '--dataset', directory, '--out', path.join(ML_DIR, 'models'), '--seed', option('seed', '42')], { cwd: ML_DIR, encoding: 'utf8' });
     process.stderr.write(run.stderr ?? '');
+    await marker.clear();
     const lastLine = (run.stdout ?? '').trim().split('\n').at(-1) ?? '{}';
     const result = JSON.parse(lastLine) as { status: string; failures?: string[]; models?: Array<{ dir: string }> };
     await audit(prisma, 'ml_training_run', { dataset: version, status: result.status, failures: result.failures ?? null, exitCode: run.status });
@@ -164,13 +168,10 @@ async function train() {
       const artifactPath = path.relative(ROOT, path.join(model.dir, 'model.json')).replace(/\\/g, '/');
       const artifactHash = sha256(readFileSync(path.join(model.dir, 'model.json')));
       if (artifactHash !== metadata.artifactHash) throw new Error(`Artifact hash mismatch for ${metadata.modelVersion}`);
-      await prisma.mlModelVersion.create({
-        data: {
-          version: metadata.modelVersion, algorithm: metadata.algorithm, status: 'TRAINED', readiness: metadata.readiness, featureVersion: metadata.featureVersion,
-          labelVersion: metadata.labelVersion, target: metadata.target, datasetVersion: version, config: metadata.config, artifactPath, artifactHash,
-          metrics: { metrics: metadata.metrics, walkForward: metadata.walkForward, walkForwardAucStd: metadata.walkForwardAucStd, overfittingRisk: metadata.overfittingRisk, featureImportance: metadata.featureImportance, socialAblation: metadata.socialAblation, bySource: metadata.bySource, calibration: metadata.calibration, quality: metadata.quality, split: metadata.split, periods: metadata.periods, packages: metadata.packages } as Prisma.InputJsonValue,
-          statusHistory: [{ status: 'TRAINED', at: new Date().toISOString(), by: actor }] as Prisma.InputJsonValue, createdBy: actor, trainedAt: new Date(metadata.trainedAt),
-        },
+      // New immutable TRAINED row only: no approval, no selection change for any user (see model-registration.ts).
+      await registerTrainedModel(prisma, {
+        metadata, datasetVersion: version, artifactPath, artifactHash, actor,
+        extraMetrics: { metrics: metadata.metrics, walkForward: metadata.walkForward, walkForwardAucStd: metadata.walkForwardAucStd, overfittingRisk: metadata.overfittingRisk, featureImportance: metadata.featureImportance, socialAblation: metadata.socialAblation, bySource: metadata.bySource, calibration: metadata.calibration, quality: metadata.quality, split: metadata.split, periods: metadata.periods, packages: metadata.packages },
       });
       await audit(prisma, 'ml_model_registered', { modelVersion: metadata.modelVersion, readiness: metadata.readiness, artifactHash });
       console.log(`registered ${metadata.modelVersion} (${metadata.algorithm}) readiness=${metadata.readiness} testAUC=${metadata.metrics.test.rocAuc ?? '—'}`);
@@ -178,6 +179,21 @@ async function train() {
   } finally {
     await prisma.$disconnect();
   }
+}
+
+/** Redis marker of a running training (TTL 6 h; Redis problems never block training). */
+async function trainingMarker(value: Record<string, unknown>) {
+  const redis = createClient({ url: process.env.REDIS_URL, ...(process.env.REDIS_PASSWORD ? { password: process.env.REDIS_PASSWORD } : {}), socket: { connectTimeout: 3_000, reconnectStrategy: false } });
+  redis.on('error', () => undefined);
+  const connected = await redis.connect().then(() => true).catch(() => false);
+  if (connected) await redis.set(ML_TRAINING_KEY, JSON.stringify(value), { EX: 6 * 3_600 }).catch(() => undefined);
+  return {
+    async clear() {
+      if (!connected) return;
+      await redis.del(ML_TRAINING_KEY).catch(() => undefined);
+      await redis.quit().catch(() => undefined);
+    },
+  };
 }
 
 /** Redis target without credentials (host:port/db only). */

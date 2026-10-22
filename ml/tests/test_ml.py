@@ -124,3 +124,18 @@ def test_unknown_feature_version_is_refused():
     from soltrader_ml.data import load_schema
     with pytest.raises(SystemExit):
         load_schema(feature_version='ML-FEATURES-v999')
+
+
+def test_training_never_overwrites_an_existing_model_version(tmp_path):
+    directory = make_synthetic_dataset(tmp_path / 'ds-immutable', rows=1200, seed=7)
+    out = tmp_path / 'models-immutable'
+    assert train_main(['--dataset', str(directory), '--out', str(out), '--seed', '42']) == 0
+    artifact = next(out.glob('ML-LGBM-*/model.json'))
+    before = artifact.read_bytes()
+    artifact.write_bytes(before + b' ')  # marker: any rewrite would remove it
+    assert train_main(['--dataset', str(directory), '--out', str(out), '--seed', '42']) == 4
+    assert artifact.read_bytes() == before + b' '
+    # Another seed is a new version and trains next to it.
+    assert train_main(['--dataset', str(directory), '--out', str(out), '--seed', '43']) == 0
+    assert artifact.read_bytes() == before + b' '
+

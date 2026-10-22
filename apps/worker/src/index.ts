@@ -177,6 +177,7 @@ const tradeCandles = new TradeCandleAggregator({ store: { hSet: (key, values) =>
 
 const newLaunch = new NewLaunchService({
   mlPaper: mlPaperEngine,
+  mlOnly: env.ML_ONLY_ARCHITECTURE_ENABLED,
   candles: tradeCandles,
   social: socialService ?? undefined,
   community: communityService ?? undefined,
@@ -204,6 +205,7 @@ const newLaunch = new NewLaunchService({
 });
 
 const paperExecution = new PaperExecutionCoordinator({
+  mlOnly: env.ML_ONLY_ARCHITECTURE_ENABLED,
   getLaunchQuote: (mint) => newLaunch.quote(mint, 15_000),
   publishLaunchEvent: async (payload) => {
     await eventPublisher.publish('bot:launches', JSON.stringify({ type: 'launch_update', payload, timestamp: new Date().toISOString() }));

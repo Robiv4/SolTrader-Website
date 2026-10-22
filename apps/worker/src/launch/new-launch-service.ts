@@ -1,7 +1,7 @@
 import { Prisma, type PrismaClient } from '@prisma/client';
 import type { TokenDataProvider } from '@soltrader/market-data';
 import { assessRisk, DEFAULT_RISK_THRESHOLDS, type RiskFactorInput } from '@soltrader/risk-engine';
-import { buyerTrendFromObservations, effectiveMlMinLiquidityUsd, evaluateNewLaunch, ML_FEATURE_VERSION, mlEntrySafetyBlockers, socialBlocksEntry, evaluateQualityGate, socialSummary, type LaunchSecurity, type LaunchState, type NewLaunchStrategyResult, type QualityGateResult, type SocialSnapshotResult } from '@soltrader/strategy-engine';
+import { buyerTrendFromObservations, effectiveMlMinLiquidityUsd, evaluateNewLaunch, isSupportedFeatureVersion, ML_FEATURE_VERSION, mlEntrySafetyBlockers, resolveEntryAuthority, socialBlocksEntry, evaluateQualityGate, socialSummary, type EntryAuthority, type LaunchSecurity, type LaunchState, type NewLaunchStrategyResult, type QualityGateResult, type SocialSnapshotResult } from '@soltrader/strategy-engine';
 import { toRiskEngineConfig } from '@soltrader/token-discovery';
 
 import type { CommunityService } from '../community/community-service.js';
@@ -70,6 +70,11 @@ export interface NewLaunchServiceDependencies {
    * rule stays mandatory. Fail-closed: any ML failure means no entry for that candidate (no fallback buy).
    */
   mlPaper?: Pick<MlPaperEntryEngine, 'step' | 'markSignaled' | 'resolved'>;
+  /**
+   * ML_ONLY_ARCHITECTURE_ENABLED: the rule-based strategy never opens entries; only the user's selected, PAPER-approved
+   * model may. Without a model the user is in DATA_COLLECTION (no entries). Off = legacy behaviour, unchanged.
+   */
+  mlOnly?: boolean;
   /** Real-trade OHLCV for the charts (display only; synchronous, isolated, never affects trading). */
   candles?: Pick<TradeCandleAggregator, 'record'>;
   tickMs?: number;
@@ -84,6 +89,8 @@ interface UserContext {
   intendedOrderUsd: number | null;
   /** Entry strategy of this user: DEFAULT (rule-based) or ML (approved model). Exactly one of them can buy. */
   strategy: MlPaperUserConfig;
+  /** ML-only architecture: who may open new entries and the user's operating state (see strategy-contract.ts). */
+  authority: EntryAuthority;
 }
 
 interface DecisionMemory {
@@ -115,6 +122,9 @@ export class NewLaunchService {
   private ticking = false;
   private readonly decisions = new Map<string, DecisionMemory>();
   private readonly security = new Map<string, SecurityMemory>();
+  /** Default New Launch settings for the research evaluation (collection priority only, never trading). */
+  private readonly researchSettings = resolveNewLaunchSettings(null);
+  readonly metrics = { researchCollected: 0 };
   private readonly candidateIds = new Map<string, string>();
   private readonly lastPersistedSnapshot = new Map<string, number>();
   private readonly lastExternalFetch = new Map<string, number>();
@@ -245,6 +255,11 @@ export class NewLaunchService {
     } catch (error) {
       this.deps.logger.warn({ err: error instanceof Error ? error.message : String(error) }, 'Strategy selection unreadable: New Launch entries paused this cycle');
     }
+    // Registry rows of the selected models (ML-only authority: approved, not retired, supported feature version).
+    const selectedVersions = [...new Set([...(strategies?.values() ?? [])].map((strategy) => strategy.modelVersion).filter((version): version is string => Boolean(version)))];
+    const models = this.deps.mlOnly && selectedVersions.length && this.deps.prisma.mlModelVersion?.findMany
+      ? new Map((await this.deps.prisma.mlModelVersion.findMany({ where: { version: { in: selectedVersions } }, select: { version: true, paperApproved: true, status: true, featureVersion: true } }).catch(() => [])).map((row) => [row.version, row]))
+      : new Map<string, { version: string; paperApproved: boolean; status: string; featureVersion: string }>();
     const users: UserContext[] = [];
     for (const config of configs) {
       const scan = scanSettings.find((entry) => entry.userId === config.userId);
@@ -253,8 +268,16 @@ export class NewLaunchService {
       if (!scan || bot?.tradingMode !== 'PAPER') continue;
       const account = await this.deps.prisma.paperAccount.findUnique({ where: { userId: config.userId }, select: { equity: true } }).catch(() => null);
       const settings = resolveNewLaunchSettings(config as unknown as Record<string, unknown>);
-      const strategy = strategies ? strategies.get(config.userId) ?? DEFAULT_ML_PAPER_CONFIG : { ...DEFAULT_ML_PAPER_CONFIG, mode: 'ML' as const };
-      users.push({ userId: config.userId, settings, riskPolicy: scan.riskPolicy, riskConfig: toRiskEngineConfig(scan), intendedOrderUsd: account ? Number(account.equity) * settings.maxPositionPercent / 100 : null, strategy });
+      const stored = strategies?.get(config.userId) ?? null;
+      let strategy = strategies ? stored ?? DEFAULT_ML_PAPER_CONFIG : { ...DEFAULT_ML_PAPER_CONFIG, mode: 'ML' as const };
+      const authority = resolveEntryAuthority({
+        mlOnly: Boolean(this.deps.mlOnly), settingsReadable: strategies !== null,
+        settings: stored ? { strategyMode: stored.mode, modelVersion: stored.modelVersion, tradingPaused: stored.tradingPaused } : null,
+        model: stored?.modelVersion ? models.get(stored.modelVersion) ?? null : null, supportedFeatureVersion: isSupportedFeatureVersion, tradingMode: bot?.tradingMode ?? null,
+      });
+      // ML-only: the user is always an ML user (never a DEFAULT buyer); without an authorised model no ML step runs at all.
+      if (this.deps.mlOnly) strategy = { ...strategy, mode: 'ML', modelVersion: authority.authorizedModelVersion };
+      users.push({ userId: config.userId, settings, riskPolicy: scan.riskPolicy, riskConfig: toRiskEngineConfig(scan), intendedOrderUsd: account ? Number(account.equity) * settings.maxPositionPercent / 100 : null, strategy, authority });
     }
     this.userCache = { at: now, users };
     return users;
@@ -273,6 +296,8 @@ export class NewLaunchService {
       await this.refreshKeepAlive(now);
       await this.refreshExternal(now);
       this.tracker.observe(now);
+      // Data collection first: independent of users, models, BUY signals and any strategy threshold.
+      for (const launch of this.tracker.launches.values()) await this.collectResearch(launch, now).catch(() => undefined);
       const users = await this.users();
       for (const launch of this.tracker.launches.values()) {
         if (users.length === 0) break;
@@ -292,6 +317,25 @@ export class NewLaunchService {
     } finally {
       this.ticking = false;
     }
+  }
+
+  /**
+   * Research collection for one launch (no decision row, no signal, no user involved): mandatory security facts for the
+   * ML snapshots, Social / Telegram and Community tracking. Rejected or skipped tokens are collected too; their later
+   * price path is recorded by the ML outcome tracking. Collection priority uses the research (default-settings)
+   * evaluation; it never gates trading.
+   */
+  private async collectResearch(launch: TrackedLaunch, now: number) {
+    if (now - (launch.createdAt ?? launch.detectedAt) > ML_EVALUATION_WINDOW_MS) return;
+    if (launch.buyCount + launch.sellCount === 0 && !launch.external) return;
+    const security = await this.securityFor(launch, this.researchSettings.minObservedSellers, now);
+    const state = this.tracker.state(launch.mint, null);
+    if (!state) return;
+    const research = evaluateNewLaunch(state, security.security, { riskScore: null, classification: null, hardBlockReasons: [] }, this.researchSettings, now);
+    const early = research.status === 'BLOCKED' || research.reasons.some((reason) => ['LAUNCH_TOO_YOUNG', 'LAUNCH_WINDOW_EXPIRED', 'LIQUIDITY_BELOW_MINIMUM', 'CRITICAL_LIQUIDITY', 'CREATOR_SELLING'].includes(reason));
+    this.mlSafe(() => this.deps.social?.track({ mint: launch.mint, symbol: launch.symbol, name: launch.name, metadataUri: launch.metadataUri, stage: !early ? 3 : inRejectedSample(launch.mint) ? 2 : 1 }));
+    this.mlSafe(() => this.deps.community?.track(launch.mint, research.status === 'BLOCKED' || research.reasons.some((reason) => reason === 'CREATOR_SELLING' || reason === 'CRITICAL_LIQUIDITY') ? 1 : 3));
+    this.metrics.researchCollected += 1;
   }
 
   /** Open NEW_LAUNCH positions keep their tokens tracked (also re-created after a worker restart). */
@@ -465,7 +509,8 @@ export class NewLaunchService {
       const reasonKey = `${result.decision}|${result.status}|${result.reasons.join(',')}|${gate ? `${gate.mode}:${gate.reasons.join(',')}` : ''}`;
       // Copy of the decision for the ML learning pipeline (read-only; the decision above is already final).
       this.mlSafe(() => this.deps.ml?.onEvaluation({ userId: user.userId, mint: launch.mint, at: now, decision: result.decision, status: result.status, reasons: result.reasons, score: result.score, riskScore: risk.riskScore, configVersion: user.settings.configVersion ?? null, social }));
-      if (mlUser) {
+      // ML-only: the ML step runs only for an authorised model (no model / paused / unavailable = data collection only).
+      if (mlUser && (!this.deps.mlOnly || user.authority.mayOpenEntries)) {
         try {
           await this.mlPaperStep({ launch, user, result, risk, security, state, social, now, getCandidateId: async () => (candidateId ??= await this.ensureCandidate(launch)) });
         } catch (error) {
@@ -504,8 +549,8 @@ export class NewLaunchService {
         this.deps.logger.info({ event: 'new_launch_social_blocked', userId: user.userId, mint: launch.mint, warnings: social?.warnings }, 'new_launch_social_blocked');
         continue;
       }
-      // ML strategy users never get a rule-based entry (one strategy buys, never both).
-      if (!mlUser && result.decision === 'BUY' && risk.riskScore !== null && risk.classification) {
+      // ML strategy users never get a rule-based entry (one strategy buys, never both); in ML-only mode nobody does.
+      if (!mlUser && !this.deps.mlOnly && result.decision === 'BUY' && risk.riskScore !== null && risk.classification) {
         const signalId = await this.createBuySignal(launch, user, result, risk, decisionRow.id, security.completedAt, now, state, security.security, gate, social);
         const current = this.decisions.get(key);
         if (current) current.signaled = Boolean(signalId);

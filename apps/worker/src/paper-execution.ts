@@ -9,7 +9,7 @@ import {
   type RiskPolicyName,
 } from '@soltrader/risk-engine';
 import type { RealtimeEventType } from '@soltrader/shared';
-import { mlRiskConviction, newLaunchEntryConfig, newLaunchExitConfig } from '@soltrader/strategy-engine';
+import { authorizeEntry, isSupportedFeatureVersion, mlRiskConviction, newLaunchEntryConfig, newLaunchExitConfig, resolveEntryAuthority } from '@soltrader/strategy-engine';
 import {
   debitPaperCash,
   effectiveDailyLossLimit,
@@ -124,6 +124,11 @@ export interface PaperExecutionSummary {
 
 export interface PaperExecutionDependencies {
   prisma: PrismaClient;
+  /**
+   * ML_ONLY_ARCHITECTURE_ENABLED: only the user's selected, PAPER-approved model may open entries (DEFAULT signals and
+   * signals of any other model are rejected here, even if they were created earlier). Exits are never affected.
+   */
+  mlOnly?: boolean;
   provider: TokenDataProvider;
   publishEvent: (type: RealtimeEventType, payload: Record<string, unknown>) => Promise<void>;
   /** Mirrors persisted audit decisions to the live log stream. */
@@ -433,6 +438,17 @@ export class PaperExecutionCoordinator {
         if (user.tradingMode !== 'PAPER') return this.rejectCandidate(candidate, 'NEW_LAUNCH_PAPER_ONLY', policy);
         // Exactly one entry strategy may buy: the signal's strategy must still be the user's active one at execution.
         const strategy = this.deps.prisma.mlPaperSettings?.findUnique ? await this.deps.prisma.mlPaperSettings.findUnique({ where: { userId: candidate.userId } }) : null;
+        if (this.deps.mlOnly) {
+          // ML-only contract: one authorised model per user; no DEFAULT entries, no fallback, paused = no entries.
+          const selectedVersion = strategy?.strategyMode === 'ML' ? strategy.modelVersion : null;
+          const selectedModel = selectedVersion && this.deps.prisma.mlModelVersion?.findUnique ? await this.deps.prisma.mlModelVersion.findUnique({ where: { version: selectedVersion }, select: { version: true, paperApproved: true, status: true, featureVersion: true } }) : null;
+          const authority = resolveEntryAuthority({
+            mlOnly: true, settings: strategy ? { strategyMode: strategy.strategyMode, modelVersion: strategy.modelVersion, tradingPaused: (strategy as { tradingPaused?: boolean }).tradingPaused } : null,
+            model: selectedModel, supportedFeatureVersion: isSupportedFeatureVersion, tradingMode: user.tradingMode,
+          });
+          const verdict = authorizeEntry(authority, { entryStrategy: candidate.entryStrategy, modelVersion: typeof candidate.ml?.modelVersion === 'string' ? candidate.ml.modelVersion : null });
+          if (!verdict.allowed) return this.rejectCandidate(candidate, verdict.reason, policy);
+        }
         const activeStrategy = strategy?.strategyMode === 'ML' ? 'ML' : 'DEFAULT';
         if (candidate.entryStrategy !== activeStrategy) return this.rejectCandidate(candidate, 'ENTRY_STRATEGY_NOT_ACTIVE', policy);
         if (candidate.entryStrategy === 'ML') {

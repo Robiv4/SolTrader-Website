@@ -8,6 +8,9 @@
  *  - Switching a user to ML (or changing the model) requires an administrator + e-mail confirmation and an approved model.
  *    Switching back to DEFAULT is always allowed for the owner (it can only reduce automation).
  *  - A revoked / retired model stops ML entries immediately; users stay on ML without entries (no silent fallback buying).
+ *  - ML-only architecture (ML_ONLY_ARCHITECTURE_ENABLED): DEFAULT cannot be selected; without a model the user is in
+ *    DATA_COLLECTION; the operating state comes from the shared contract (resolveEntryAuthority). Pausing stops new
+ *    entries only (open positions stay protected by the Exit Engine).
  */
 import { createHash } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
@@ -16,7 +19,7 @@ import { fileURLToPath } from 'node:url';
 
 import { Prisma, type PrismaClient } from '@prisma/client';
 import {
-  effectiveMlMinLiquidityUsd, isSupportedFeatureVersion, ML_HONEYPOT_CODES, ML_MIN_LIQUIDITY_FLOOR_USD, ML_MIN_LIQUIDITY_MAX_USD, ML_MIN_LIQUIDITY_SUGGESTED_USD, ML_PAPER_SNAPSHOT_POINTS,
+  effectiveMlMinLiquidityUsd, isSupportedFeatureVersion, ML_TRAINING_KEY, resolveEntryAuthority, selectableStrategies, ML_HONEYPOT_CODES, ML_MIN_LIQUIDITY_FLOOR_USD, ML_MIN_LIQUIDITY_MAX_USD, ML_MIN_LIQUIDITY_SUGGESTED_USD, ML_PAPER_SNAPSHOT_POINTS,
   ML_PAPER_THRESHOLD_MAX, ML_PAPER_THRESHOLD_MIN, ML_PAPER_WINDOW_MAX_SECONDS, mlBlockerCategory, mlBlockerGroup, resolveNewLaunchSettings,
 } from '@soltrader/strategy-engine';
 import { type Request, type Response, Router } from 'express';
@@ -41,6 +44,8 @@ export interface MlPaperDeps {
   logger: { error(payload: unknown, message?: string): void };
   /** Server trading mode (env TRADING_MODE); ML PAPER is refused unless it is PAPER. */
   serverTradingMode: () => string;
+  /** ML_ONLY_ARCHITECTURE_ENABLED (default false). */
+  mlOnly?: () => boolean;
   /** Test hook: artifact reader (default: repository file, sha256 verified by the caller). */
   readArtifact?: (artifactPath: string) => Promise<Buffer>;
 }
@@ -193,6 +198,13 @@ export function createMlPaperRouter(deps: MlPaperDeps) {
     const selected = row?.modelVersion ? await prisma.mlModelVersion.findUnique({ where: { version: row.modelVersion } }) : null;
     const models = await Promise.all(approved.map(async (model) => modelSummary(model, await snapshotKindOf(prisma, model.datasetVersion))));
     const mode = row?.strategyMode === 'ML' ? 'ML' : 'DEFAULT';
+    const mlOnly = Boolean(deps.mlOnly?.());
+    const training = await deps.readJson(ML_TRAINING_KEY).catch(() => null);
+    const authority = resolveEntryAuthority({
+      mlOnly, settings: row ? { strategyMode: row.strategyMode, modelVersion: row.modelVersion, tradingPaused: row.tradingPaused } : null,
+      model: selected ? { version: selected.version, paperApproved: selected.paperApproved, status: selected.status, featureVersion: selected.featureVersion } : null,
+      supportedFeatureVersion: isSupportedFeatureVersion, trainingInProgress: Boolean(training), tradingMode: bot?.tradingMode ?? null, liveEnabled: Boolean(bot?.isLiveEnabled) || deps.serverTradingMode() !== 'PAPER',
+    });
     const selectedHealth = row?.modelVersion ? record(record(health?.models)[row.modelVersion]) : {};
     const enableBlockers: string[] = [];
     if (!isAdmin) enableBlockers.push('ADMIN_REQUIRED');
@@ -201,6 +213,13 @@ export function createMlPaperRouter(deps: MlPaperDeps) {
     if (deps.serverTradingMode() !== 'PAPER') enableBlockers.push('SERVER_NOT_PAPER');
     return {
       strategyMode: mode,
+      mlOnly,
+      /** ML-only: no DEFAULT selector. */
+      selectableStrategies: selectableStrategies(mlOnly),
+      /** Operating state (DATA_COLLECTION | MODEL_TRAINING | ML_PAPER_ACTIVE | TRADING_PAUSED | MODEL_UNAVAILABLE) and why. */
+      tradingState: { state: authority.state, mayOpenEntries: authority.mayOpenEntries, entryStrategy: authority.entryStrategy, authorizedModelVersion: authority.authorizedModelVersion, reasons: authority.reasons, components: authority.components, training: training ?? null },
+      tradingPaused: Boolean(row?.tradingPaused),
+      pausedAt: row?.pausedAt ?? null,
       modelVersion: row?.modelVersion ?? null,
       buyThreshold: row ? Number(row.buyThreshold) : 0.7,
       decisionWindowSeconds: row?.decisionWindowSeconds ?? 10,
@@ -254,6 +273,7 @@ export function createMlPaperRouter(deps: MlPaperDeps) {
     try {
       const current = await prisma.mlPaperSettings.findUnique({ where: { userId } });
       const data = parsed.data;
+      if (data.strategyMode === 'DEFAULT' && deps.mlOnly?.()) return fail(res, 400, 'A DEFAULT stratégia az ML-only architektúrában nem választható. Modell nélkül a rendszer csak adatot gyűjt.', { code: 'DEFAULT_STRATEGY_DISABLED' });
       if (data.strategyMode === 'DEFAULT') {
         // Back to the rule-based strategy: always allowed for the owner (no ML entries afterwards). Model / threshold kept.
         const row = await prisma.mlPaperSettings.upsert({ where: { userId }, update: { strategyMode: 'DEFAULT' }, create: { userId, strategyMode: 'DEFAULT' } });
@@ -285,6 +305,43 @@ export function createMlPaperRouter(deps: MlPaperDeps) {
     } catch (error) {
       deps.logger.error({ err: error }, 'ML PAPER settings update failed');
       return fail(res, 500, 'ML PAPER settings update failed');
+    }
+  });
+
+  // ---------------------------------------------------------------- ML-only: pause / resume, clear the trading model
+  const pauseSchema = z.object({ paused: z.boolean() }).strict();
+  router.post('/settings/ml-paper/pause', async (req: Request, res: Response) => {
+    const body = { ...(req.body ?? {}) } as Record<string, unknown>;
+    delete body.verification;
+    const parsed = pauseSchema.safeParse(body);
+    if (!parsed.success) return fail(res, 400, 'Érvénytelen kérés', parsed.error.issues);
+    const userId = req.user!.id;
+    try {
+      // Pausing only reduces automation (owner). Resuming re-allows entries of the selected model: administrator.
+      if (!parsed.data.paused && req.user!.role !== 'ADMIN') return fail(res, 403, 'A kereskedés folytatása adminisztrátori jogosultságot igényel.');
+      const current = await prisma.mlPaperSettings.findUnique({ where: { userId } });
+      const data = parsed.data.paused ? { tradingPaused: true, pausedAt: new Date(), pausedBy: req.user!.email } : { tradingPaused: false, pausedAt: null, pausedBy: null };
+      await prisma.mlPaperSettings.upsert({ where: { userId }, update: data, create: { userId, strategyMode: deps.mlOnly?.() ? 'ML' : 'DEFAULT', ...data } });
+      await deps.logAuditEvent(parsed.data.paused ? 'ml_trading_paused' : 'ml_trading_resumed', userId, { modelVersion: current?.modelVersion ?? null });
+      return res.json({ ok: true, data: await settingsView(userId, req.user!.role === 'ADMIN') });
+    } catch (error) {
+      deps.logger.error({ err: error }, 'ML trading pause failed');
+      return fail(res, 500, 'ML trading pause failed');
+    }
+  });
+
+  /** ML-only: deselect the trading model -> DATA_COLLECTION (no entries; open positions keep their model and exits). */
+  router.post('/settings/ml-paper/clear-model', async (req: Request, res: Response) => {
+    if (!deps.mlOnly?.()) return fail(res, 409, 'Csak az ML-only architektúrában érhető el (régi mód: DEFAULT stratégia választás).');
+    const userId = req.user!.id;
+    try {
+      const current = await prisma.mlPaperSettings.findUnique({ where: { userId } });
+      await prisma.mlPaperSettings.upsert({ where: { userId }, update: { strategyMode: 'ML', modelVersion: null }, create: { userId, strategyMode: 'ML', modelVersion: null } });
+      await deps.logAuditEvent('ml_trading_model_cleared', userId, { previousModelVersion: current?.modelVersion ?? null });
+      return res.json({ ok: true, data: await settingsView(userId, req.user!.role === 'ADMIN') });
+    } catch (error) {
+      deps.logger.error({ err: error }, 'ML model clear failed');
+      return fail(res, 500, 'ML model clear failed');
     }
   });
 

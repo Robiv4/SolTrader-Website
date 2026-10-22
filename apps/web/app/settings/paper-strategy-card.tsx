@@ -15,6 +15,15 @@ const BLOCKER_LABELS: Record<string, string> = {
 
 const pct = (value: number | null | undefined, digits = 3) => (value == null ? '—' : fmt(value, digits));
 
+/** ML-only operating states (shared contract, see strategy-contract.ts). */
+const STATE_LABELS: Record<string, { text: string; tone: string; help: string }> = {
+  DATA_COLLECTION: { text: 'ADATGYŰJTÉS', tone: 'neutral', help: 'Nincs kiválasztott kereskedési modell: a rendszer csak adatot gyűjt, új pozíciót nem nyit.' },
+  MODEL_TRAINING: { text: 'MODELL TANUL', tone: 'info', help: 'A háttérben új modell tanul; az adatgyűjtés fut, kereskedési modell nincs kiválasztva.' },
+  ML_PAPER_ACTIVE: { text: 'ML PAPER AKTÍV', tone: 'positive', help: 'A kiválasztott, jóváhagyott modell önállóan dönt a PAPER belépésekről; a kötelező biztonsági ellenőrzések mindig érvényesek.' },
+  TRADING_PAUSED: { text: 'KERESKEDÉS SZÜNETEL', tone: 'warning', help: 'Nincs új belépés. Az adatgyűjtés és a nyitott pozíciók kilépésvédelme folytatódik.' },
+  MODEL_UNAVAILABLE: { text: 'MODELL NEM ELÉRHETŐ', tone: 'danger', help: 'A kiválasztott modell nem használható (visszavonva, kivezetve vagy hiányzik): új pozíció nem nyílik, alapstratégiára nincs visszaváltás.' },
+};
+
 /** "Aktív PAPER stratégia": DEFAULT (rule-based) or an admin-approved ML model. PAPER only; LIVE is never reachable. */
 export function PaperStrategyCard() {
   const { data, error, loading, refresh } = useApi<{ data: any }>('/api/settings/ml-paper');
@@ -30,7 +39,7 @@ export function PaperStrategyCard() {
 
   useEffect(() => {
     if (!settings) return;
-    setMode(settings.strategyMode);
+    setMode(settings.mlOnly ? 'ML' : settings.strategyMode);
     setModelVersion(
       (settings.approvedModels ?? []).some(
         (model: { version: string }) => model.version === settings.modelVersion
@@ -48,7 +57,9 @@ export function PaperStrategyCard() {
   if (!settings) return null;
 
   const model = (settings.approvedModels ?? []).find((item: any) => item.version === modelVersion) ?? (settings.selectedModel?.version === modelVersion ? settings.selectedModel : null);
-  const active = settings.strategyMode === 'ML';
+  const mlOnly = Boolean(settings.mlOnly);
+  const active = settings.strategyMode === 'ML' && (!mlOnly || Boolean(settings.modelVersion));
+  const state = settings.tradingState ? STATE_LABELS[settings.tradingState.state] ?? { text: settings.tradingState.state, tone: 'neutral', help: '' } : null;
   const thresholdValid = threshold >= settings.limits.thresholdMin && threshold <= settings.limits.thresholdMax;
   const health = settings.health?.model;
   const liquidity = settings.minLiquidity ?? { savedUsd: null, effectiveUsd: null, defaultStrategyUsd: null, suggestedUsd: 3000, floorUsd: 1250, maxUsd: 1_000_000 };
@@ -56,12 +67,12 @@ export function PaperStrategyCard() {
   const minLiquidityValid = minLiquidityValue === null || (Number.isFinite(minLiquidityValue) && minLiquidityValue >= liquidity.floorUsd && minLiquidityValue <= liquidity.maxUsd);
   const usdText = (value: number | null | undefined) => (value == null ? '—' : `${fmt(value, 0)} USD`);
 
-  const save = async (body: Record<string, unknown>, done: string) => {
+  const save = async (body: Record<string, unknown>, done: string, path = '/api/settings/ml-paper', method = 'PUT') => {
     setBusy(true);
     setMessage({ text: 'Mentés…', tone: 'info' });
     try {
       // Enabling ML / changing the model asks for the e-mailed confirmation code (handled by apiRequest).
-      await apiRequest('/api/settings/ml-paper', { method: 'PUT', body: JSON.stringify(body) });
+      await apiRequest(path, { method, body: JSON.stringify(body) });
       setMessage({ text: done, tone: 'success' });
       refresh();
     } catch (saveError) {
@@ -73,7 +84,10 @@ export function PaperStrategyCard() {
 
   return <div className="paper-strategy">
     <div className="status-list">
-      <div className="status-row"><span>Aktív PAPER stratégia</span><Status tone={active ? 'info' : 'positive'}>{active ? `ML-MODELL · ${settings.modelVersion}` : 'ALAPSTRATÉGIA'}</Status></div>
+      {mlOnly && state ? <div className="status-row"><span>Működési állapot</span><Status tone={state.tone}>{state.text}</Status></div> : null}
+      {mlOnly && state ? <p className="sfield-help">{state.help}{settings.tradingState?.reasons?.length ? ` (${settings.tradingState.reasons.join(', ')})` : ''}</p> : null}
+      {mlOnly && settings.tradingState?.training ? <p className="sfield-help">Tanítás folyamatban: {settings.tradingState.training.dataset} · {date(settings.tradingState.training.startedAt)} – az aktív modellt nem módosítja.</p> : null}
+      <div className="status-row"><span>Aktív PAPER stratégia</span><Status tone={active ? 'info' : 'positive'}>{active ? `ML-MODELL · ${settings.modelVersion}` : mlOnly ? 'NINCS KERESKEDÉSI MODELL' : 'ALAPSTRATÉGIA'}</Status></div>
       {active ? <div className="status-row"><span>Kereskedési mód</span><Status tone="info">ML BELÉPÉS + SZABÁLYALAPÚ KILÉPÉS</Status></div> : null}
       {active ? <div className="status-row"><span>ML minimális likviditás</span><span>{usdText(liquidity.effectiveUsd)}{liquidity.savedUsd == null ? ' (az alapstratégia minimuma – nincs külön ML érték mentve)' : ''}</span></div> : null}
       {active ? <div className="status-row"><span>Modell állapota</span>{settings.selectedModel?.usable ? <Status tone={health?.status === 'LOADED' ? 'positive' : 'warning'}>{health?.status === 'LOADED' ? 'BETÖLTVE' : health ? 'NEM ELÉRHETŐ' : 'NINCS JELENTÉS'}</Status> : <Status tone="danger">VISSZAVONVA – NINCS ML BELÉPÉS</Status>}</div> : null}
@@ -83,11 +97,11 @@ export function PaperStrategyCard() {
       <div className="status-row"><span>ML döntések (24 óra)</span><span>BUY {settings.decisions24h?.ML_BUY ?? 0} · SKIP {settings.decisions24h?.ML_SKIP ?? 0} · hiba {settings.decisions24h?.ML_ERROR ?? 0}</span></div>
     </div>
 
-    <fieldset className="strategy-choice">
+    {mlOnly ? <p className="sfield-help"><strong>ML-only:</strong> egyetlen kereskedési döntéshozó a kiválasztott, PAPER-jóváhagyott ML modell. Modell nélkül nincs új belépés; a tanítás és az adatgyűjtés a háttérben folytatódik, és új modell betanítása nem cseréli le a kiválasztottat.</p> : <fieldset className="strategy-choice">
       <legend className="sfield-label">Stratégia kiválasztása</legend>
       <label className={`choice${mode === 'DEFAULT' ? ' selected' : ''}`}><input type="radio" name="paper-strategy" checked={mode === 'DEFAULT'} onChange={() => setMode('DEFAULT')} /><span><strong>Alapstratégia</strong><small>A jelenlegi szabályalapú New Launch BUY / WATCH / REJECT logika. Az ML a háttérben SHADOW módban gyűjt és előrejelez.</small></span></label>
       <label className={`choice${mode === 'ML' ? ' selected' : ''}`}><input type="radio" name="paper-strategy" checked={mode === 'ML'} onChange={() => setMode('ML')} /><span><strong>ML-modell</strong><small>ML belépés + szabályalapú kilépés. A vételi döntést kizárólag egy admin által PAPER-re jóváhagyott modell hozza (az alapstratégia BUY / WATCH / REJECT döntése, pontszám-küszöbei, időablaka, minőségi szűrője és közösségi szűrője nem vétózhatja meg). A csalás- és honeypotvédelem (eladhatóság, honeypot-jelek, mint / freeze authority, Token-2022 korlátozások, rug-pull és likviditásvesztés) mindig kötelező és nem kapcsolható ki; ugyanígy a piaci / végrehajtási feltételek, a kockázati és számlalimitek és az Exit Engine. ML-alapú eladás nincs.</small></span></label>
-    </fieldset>
+    </fieldset>}
 
     {mode === 'ML' ? <>
       {!settings.canEnable && !active ? settings.enableBlockers.map((reason: string) => <p key={reason} className="settings-warning">{BLOCKER_LABELS[reason] ?? reason}</p>) : null}
@@ -128,9 +142,11 @@ export function PaperStrategyCard() {
     <div className="card-toolbar sgrid-spaced">
       <p className="sfield-help">Csak PAPER: ezzel a funkcióval LIVE kereskedés semmilyen módon nem kapcsolható be. A kilépéseket mindkét módban a közös Exit Engine kezeli; modellhiba esetén is. Részletes összehasonlítás: <Link className="table-link" href="/machine-learning">Machine Learning → PAPER stratégiák</Link>.</p>
       <div className="header-actions">
-        {active ? <button type="button" className="secondary-button" disabled={busy} onClick={() => void save({ strategyMode: 'DEFAULT' }, 'Visszaváltva az alapstratégiára. Az ML SHADOW adatgyűjtés tovább fut.')}>Visszaváltás az alapstratégiára</button> : null}
+        {active && !mlOnly ? <button type="button" className="secondary-button" disabled={busy} onClick={() => void save({ strategyMode: 'DEFAULT' }, 'Visszaváltva az alapstratégiára. Az ML SHADOW adatgyűjtés tovább fut.')}>Visszaváltás az alapstratégiára</button> : null}
+        {mlOnly && active ? <button type="button" className="secondary-button" disabled={busy} onClick={() => void save({}, 'A modell leválasztva: csak adatgyűjtés, új belépés nincs. A nyitott pozíciók kilépésvédelme fut.', '/api/settings/ml-paper/clear-model', 'POST')}>Modell leválasztása (csak adatgyűjtés)</button> : null}
+        {mlOnly ? <button type="button" className="secondary-button" disabled={busy} onClick={() => void save({ paused: !settings.tradingPaused }, settings.tradingPaused ? 'Kereskedés folytatva (a modell kapuk továbbra is érvényesek).' : 'Kereskedés szüneteltetve: új belépés nincs, a kilépésvédelem és az adatgyűjtés fut.', '/api/settings/ml-paper/pause', 'POST')}>{settings.tradingPaused ? 'Kereskedés folytatása' : 'Kereskedés szüneteltetése'}</button> : null}
         {mode === 'ML' ? <button type="button" className="primary-button" disabled={busy || !modelVersion || !thresholdValid || !minLiquidityValid || (!active && !settings.canEnable)} onClick={() => void save({ strategyMode: 'ML', modelVersion, buyThreshold: threshold, decisionWindowSeconds: windowSeconds, minLiquidityUsd: minLiquidityValue }, active ? 'ML PAPER beállítások elmentve.' : 'ML PAPER stratégia bekapcsolva.')}>{active ? 'ML beállítások mentése' : 'ML PAPER engedélyezése'}</button> : null}
-        {mode === 'DEFAULT' && !active ? <span className="sfield-help">Az alapstratégia aktív.</span> : null}
+        {mode === 'DEFAULT' && !active && !mlOnly ? <span className="sfield-help">Az alapstratégia aktív.</span> : null}
       </div>
     </div>
   </div>;

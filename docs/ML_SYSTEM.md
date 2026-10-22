@@ -376,3 +376,44 @@ them. The v1 SHADOW model is still chosen among `ML-FEATURES-v1` models only.
   plus `DATASET_FEATURE_VERSION_MISMATCH`).
 - **UI**: Machine Learning → Community ML (provider status, community models, Community vs v3, hourly funnel, per-token
   decisions with the community data known at decision time, stuck-position diagnostics).
+
+## ML-only trading architecture (SolTrader 3.0, `ML_ONLY_ARCHITECTURE_ENABLED`)
+
+Feature flag, default `false`: the legacy DEFAULT / ML selection keeps working unchanged until the flag is switched on
+(worker + API). The DEFAULT strategy code and every historical trade stay in place.
+
+**Contract** (`packages/strategy-engine/src/ml/strategy-contract.ts`, pure): `resolveEntryAuthority(input)` returns the
+operating state, whether new entries may be opened and the ONE authorised model; `authorizeEntry(authority, signal)` is
+the execution-time check; `selectableStrategies(mlOnly)` drives the UI.
+
+| State | Meaning | New entries |
+| --- | --- | --- |
+| `DATA_COLLECTION` | no trading model selected (also an old DEFAULT selection) | no |
+| `MODEL_TRAINING` | no trading model, a training run is in progress (`ml:training:active`) | no |
+| `ML_PAPER_ACTIVE` | the selected, PAPER-approved, non-retired model with a supported feature version | that model only |
+| `TRADING_PAUSED` | user pause (`MlPaperSettings.tradingPaused`), emergency stop, unreadable selection, not PAPER / LIVE | no |
+| `MODEL_UNAVAILABLE` | selected model missing / revoked / retired / unsupported | no (no DEFAULT fallback) |
+
+Data collection, training and trading are separate components. Collection (launch tracking, market stream, on-chain,
+security facts, Social / Telegram, Community, ML snapshots + outcomes, including rejected / skipped tokens) runs for
+every launch in the ML window, also without any user, model, BUY or DEFAULT threshold
+(`NewLaunchService.collectResearch`). Missing data stays null; nothing is back-filled.
+
+**Enforcement (defence in depth):**
+- New Launch service: in ML-only mode no DEFAULT signal is created, and the ML step runs only for an authorised model.
+- PAPER execution: `authorizeEntry` rejects DEFAULT signals (`DEFAULT_STRATEGY_DISABLED`) and signals of any other model (`ML_MODEL_NOT_SELECTED`), as well as paused or unavailable states.
+- The mandatory safety checks (honeypot / sellability, authorities, sell route, liquidity / impact, size, exposure, daily loss, emergency stop, stale market data) are unchanged and apply on top.
+- Open positions keep their model version (`Trade.mlModelVersion`, immutable) and are protected by the Exit Engine in every state.
+
+**Training never changes the selection:**
+- `registerTrainedModel` only creates a new TRAINED, unapproved row and refuses an existing version.
+- `train.py` refuses to write into an existing model directory (exit 4 `MODEL_VERSION_EXISTS`). Previously, retraining the same dataset + seed overwrote the artifact of an existing model, for example the active one.
+
+**API:**
+- `GET /settings/ml-paper`: `mlOnly`, `selectableStrategies`, `tradingState`, `tradingPaused`.
+- `PUT` with `DEFAULT` returns 400 `DEFAULT_STRATEGY_DISABLED` in ML-only mode.
+- `POST /settings/ml-paper/pause {paused}`: pausing is for the owner, resuming needs an administrator.
+- `POST /settings/ml-paper/clear-model`: ML-only only; the user goes to `DATA_COLLECTION`.
+
+**Migration:** `20261022141535_ml_only_trading_pause`, additive: `MlPaperSettings.tradingPaused` (default false), `pausedAt`, `pausedBy`.
+
