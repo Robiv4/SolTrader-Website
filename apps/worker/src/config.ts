@@ -51,6 +51,13 @@ const envSchema = z.object({
    * never opens entries; only the user's selected, PAPER-approved model may; no model = data collection only.
    */
   ML_ONLY_ARCHITECTURE_ENABLED: z.string().optional().transform((value) => value === 'true'),
+  /**
+   * Autonomous ML engine (ML_AUTONOMOUS strategy): decision-snapshot collection runs for every launch; trading only for
+   * users who explicitly selected a PAPER-approved bundle, in a separate virtual PAPER account. false = off entirely.
+   */
+  AUTONOMOUS_ML_ENABLED: z.string().optional().transform((value) => value !== 'false'),
+  AUTONOMOUS_ML_MAX_SNAPSHOTS_PER_MIN: z.coerce.number().int().min(0).max(2_000).default(120),
+  AUTONOMOUS_PAPER_INITIAL_BALANCE: z.coerce.number().min(10).max(1_000_000).default(1_000),
   SOCIAL_COLLECTION_ENABLED: z.string().optional().transform((value) => value !== 'false'),
   /** X is OPTIONAL (default off): with X_SOCIAL_ENABLED=false the X provider is DISABLED and makes zero requests. */
   X_SOCIAL_ENABLED: z.string().optional().transform((value) => value === 'true'),

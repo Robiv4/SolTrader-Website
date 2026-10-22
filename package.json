@@ -29,7 +29,10 @@
     "ml:dataset": "pnpm --silent --filter @soltrader/worker run ml dataset",
     "ml:train": "pnpm --silent --filter @soltrader/worker run ml train",
     "ml:status": "pnpm --silent --filter @soltrader/worker run ml status",
-    "ml:test": "pnpm --silent --filter @soltrader/worker run ml test"
+    "ml:test": "pnpm --silent --filter @soltrader/worker run ml test",
+    "ml:autonomous:dataset": "pnpm --silent --filter @soltrader/worker run ml autonomous-dataset",
+    "ml:autonomous:train": "pnpm --silent --filter @soltrader/worker run ml autonomous-train",
+    "ml:autonomous:status": "pnpm --silent --filter @soltrader/worker run ml autonomous-status"
   },
   "devDependencies": {
     "@eslint/js": "^9.16.0",

@@ -11,6 +11,12 @@
  *                                       train baseline + LightGBM offline, register models as TRAINED
  *   pnpm ml:status                      shadow collection / model status
  *   pnpm ml:test                        Python tests (split / purge / reproducibility / export parity)
+ *   pnpm ml:autonomous:dataset          Autonomous ML dataset (ML-FEATURES-AUTONOMOUS-v1, AUTO-LABELS-v1): replayed entries /
+ *                                       positions from outcome paths + labelled live decision snapshots
+ *   pnpm ml:autonomous:train [--dataset AUTO-DATASET-vN] [--seed 42]
+ *                                       train the Autonomous bundle (entry value / downside / profit, exit value / hold),
+ *                                       register it as TRAINED (never approved, selected or activated automatically)
+ *   pnpm ml:autonomous:status           bundles, snapshots, decisions, accounts
  *
  * Model promotion (TRAINED -> VALIDATED -> SHADOW) is an explicit admin action in the UI (e-mail confirmed).
  */
@@ -23,13 +29,14 @@ import { fileURLToPath } from 'node:url';
 
 import { Prisma, PrismaClient } from '@prisma/client';
 import {
-  buildMlDataset, isSupportedFeatureVersion, ML_COMMUNITY_FEATURE_VERSION, ML_FEATURE_VERSION, ML_LABEL_VERSION, ML_TARGETS, mlCommunityFeatureSchemaJson, mlFeatureSchemaJson,
+  buildAutonomousDataset, buildMlDataset, isSupportedFeatureVersion, labelEntry, labelPosition, AUTONOMOUS_LABEL_VERSION, ML_AUTONOMOUS_FEATURE_VERSION, mlAutonomousFeatureSchemaJson, ML_COMMUNITY_FEATURE_VERSION, ML_FEATURE_VERSION, ML_LABEL_VERSION, ML_TARGETS, mlCommunityFeatureSchemaJson, mlFeatureSchemaJson,
   type CandidateOutcomeResult, type MlDatasetSourceRow, type MlFeatures, type OutcomePathState,
 } from '@soltrader/strategy-engine';
 import { createClient } from 'redis';
 
+import { loadLiveSources, loadReplaySources } from '../src/autonomous/dataset-source.js';
 import { chunk, indexPaperTrades, loadAllPages, loadPaperTradesInBatches, matchPaperTrade, paperProvenance } from '../src/ml/dataset-source.js';
-import { ML_TRAINING_KEY, registerTrainedModel } from '../src/ml/model-registration.js';
+import { ML_TRAINING_KEY, registerAutonomousBundle, registerTrainedModel } from '../src/ml/model-registration.js';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
 // Server-side configuration (DATABASE_URL, REDIS_URL) from the repository .env; values are never printed.
@@ -49,7 +56,7 @@ async function audit(prisma: PrismaClient, action: string, details: Record<strin
 }
 
 function writeSchema() {
-  for (const [file, schema, version] of [['features-v1.json', mlFeatureSchemaJson(), ML_FEATURE_VERSION], ['features-community-v1.json', mlCommunityFeatureSchemaJson(), ML_COMMUNITY_FEATURE_VERSION]] as const) {
+  for (const [file, schema, version] of [['features-v1.json', mlFeatureSchemaJson(), ML_FEATURE_VERSION], ['features-community-v1.json', mlCommunityFeatureSchemaJson(), ML_COMMUNITY_FEATURE_VERSION], ['features-autonomous-v1.json', mlAutonomousFeatureSchemaJson(), ML_AUTONOMOUS_FEATURE_VERSION]] as const) {
     const target = path.join(ML_DIR, 'schema', file);
     mkdirSync(path.dirname(target), { recursive: true });
     writeFileSync(target, `${JSON.stringify(schema, null, 2)}\n`);
@@ -257,8 +264,89 @@ function test() {
   process.exitCode = run.status ?? 1;
 }
 
+async function autonomousDataset() {
+  const prisma = new PrismaClient();
+  try {
+    const now = Date.now();
+    const { sources, paths } = await loadReplaySources(prisma);
+    const live = await loadLiveSources(prisma, paths, now);
+    const existing = await prisma.mlDatasetVersion.count({ where: { featureVersion: ML_AUTONOMOUS_FEATURE_VERSION } });
+    const version = option('version', `AUTO-DATASET-v${existing + 1}`);
+    const directory = path.join(ML_DIR, 'autonomous-datasets', version);
+    if (existsSync(directory)) throw new Error(`Dataset ${version} already exists (immutable)`);
+    const built = buildAutonomousDataset({ version, replay: sources, live });
+    mkdirSync(directory, { recursive: true });
+    writeFileSync(path.join(directory, 'dataset.csv'), built.csv);
+    const fileHash = sha256(built.csv);
+    const manifest = { ...built.manifest, createdAt: new Date().toISOString(), fileHash, sources: { replay: sources.length, live: live.length } };
+    writeFileSync(path.join(directory, 'manifest.json'), `${JSON.stringify(manifest, null, 2)}\n`);
+    // Label audit of live snapshots (never back-dated; one row per snapshot).
+    const outcomes = live.map((row) => {
+      const label = row.kind === 'ENTRY' ? labelEntry(row.path, row.at) : row.position ? labelPosition(row.path, row.at, row.position) : null;
+      return { snapshotId: row.id, labelVersion: AUTONOMOUS_LABEL_VERSION, status: label?.status ?? 'EXCLUDED', labels: (label ?? {}) as Prisma.InputJsonValue, uncertainty: { horizonResolutionMs: label?.horizonResolutionMs ?? null, liquidityAssumed: label?.liquidityAssumed ?? null } as Prisma.InputJsonValue, exclusionReason: label ? label.exclusion : 'POSITION_STATE_MISSING', labelEndAt: new Date(label?.labelEndAt ?? row.at) };
+    });
+    for (let index = 0; index < outcomes.length; index += 1_000) await prisma.mlAutonomousOutcome.createMany({ data: outcomes.slice(index, index + 1_000), skipDuplicates: true });
+    await prisma.mlDatasetVersion.create({ data: { version, featureVersion: ML_AUTONOMOUS_FEATURE_VERSION, labelVersion: AUTONOMOUS_LABEL_VERSION, target: 'AUTONOMOUS_NET_PNL', config: { version, kinds: ['ENTRY', 'POSITION'] } as Prisma.InputJsonValue, manifest: manifest as unknown as Prisma.InputJsonValue, rowCount: built.rows.length, filePath: path.relative(ROOT, path.join(directory, 'dataset.csv')).replace(/\\/g, '/'), fileHash, createdBy: actor } });
+    await audit(prisma, 'ml_autonomous_dataset_created', { version, rows: built.rows.length, fileHash });
+    console.log(JSON.stringify({ version, rows: built.rows.length, coverage: (manifest.coverage as Record<string, unknown>), directory: path.relative(ROOT, directory) }, (key, value) => (key === 'featureNullShare' ? undefined : value), 2));
+  } finally {
+    await prisma.$disconnect();
+  }
+}
+
+async function autonomousTrain() {
+  const prisma = new PrismaClient();
+  try {
+    const latest = await prisma.mlDatasetVersion.findFirst({ where: { featureVersion: ML_AUTONOMOUS_FEATURE_VERSION }, orderBy: { createdAt: 'desc' } });
+    const version = option('dataset', latest?.version ?? '');
+    if (!version) throw new Error('No autonomous dataset. Run pnpm ml:autonomous:dataset first.');
+    const datasetRow = await prisma.mlDatasetVersion.findUnique({ where: { version } });
+    const directory = path.join(ML_DIR, 'autonomous-datasets', version);
+    if (!datasetRow || datasetRow.featureVersion !== ML_AUTONOMOUS_FEATURE_VERSION || !existsSync(path.join(directory, 'dataset.csv'))) throw new Error(`Autonomous dataset ${version} not found`);
+    if (sha256(readFileSync(path.join(directory, 'dataset.csv'))) !== datasetRow.fileHash) throw new Error('Dataset file hash mismatch (modified after creation)');
+    if (!existsSync(PYTHON)) throw new Error('Python environment missing: run pnpm ml:setup');
+    const marker = await trainingMarker({ dataset: version, kind: 'AUTONOMOUS', startedAt: new Date().toISOString(), by: actor });
+    const extra = args.includes('--allow-small') ? ['--allow-small'] : [];
+    const run = spawnSync(PYTHON, ['-m', 'soltrader_ml.autonomous', '--dataset', directory, '--out', path.join(ML_DIR, 'autonomous-models'), '--seed', option('seed', '42'), ...extra], { cwd: ML_DIR, encoding: 'utf8' });
+    await marker.clear();
+    process.stderr.write(run.stderr ?? '');
+    const result = JSON.parse((run.stdout ?? '').trim().split('\n').at(-1) ?? '{}') as { status: string; failures?: string[]; dir?: string };
+    await audit(prisma, 'ml_autonomous_training_run', { dataset: version, status: result.status, failures: result.failures ?? null, exitCode: run.status });
+    if (run.status !== 0 || result.status !== 'TRAINED' || !result.dir) {
+      console.log(JSON.stringify(result, null, 2));
+      process.exitCode = run.status || 1;
+      return;
+    }
+    const metadata = JSON.parse(readFileSync(path.join(result.dir, 'metadata.json'), 'utf8'));
+    const artifactPath = path.relative(ROOT, path.join(result.dir, 'bundle.json')).replace(/\\/g, '/');
+    const artifactHash = sha256(readFileSync(path.join(result.dir, 'bundle.json')));
+    if (artifactHash !== metadata.artifactHash) throw new Error(`Bundle hash mismatch for ${metadata.bundleVersion}`);
+    await registerAutonomousBundle(prisma, { version: metadata.bundleVersion, readiness: metadata.readiness, featureVersion: metadata.featureVersion, labelVersion: metadata.labelVersion, datasetVersion: version, artifactPath, artifactHash, policy: metadata.policy, metrics: metadata.metrics, trainedAt: metadata.trainedAt, actor });
+    await audit(prisma, 'ml_autonomous_bundle_registered', { bundleVersion: metadata.bundleVersion, readiness: metadata.readiness, artifactHash });
+    console.log(`registered ${metadata.bundleVersion} readiness=${metadata.readiness} (TRAINED: not approved, not selected, not trading)`);
+  } finally {
+    await prisma.$disconnect();
+  }
+}
+
+async function autonomousStatus() {
+  const prisma = new PrismaClient();
+  try {
+    const [bundles, snapshots, decisions, accounts, open] = await Promise.all([
+      prisma.mlAutonomousModelBundle.findMany({ orderBy: { trainedAt: 'desc' }, take: 10, select: { version: true, status: true, readiness: true, paperApproved: true, trainedAt: true } }),
+      prisma.mlAutonomousDecisionSnapshot.groupBy({ by: ['kind'], _count: { _all: true } }),
+      prisma.mlAutonomousDecision.groupBy({ by: ['mode', 'action', 'executionStatus'], _count: { _all: true } }),
+      prisma.mlAutonomousAccount.count(),
+      prisma.mlAutonomousPosition.count({ where: { status: 'OPEN' } }),
+    ]);
+    console.log(JSON.stringify({ bundles, snapshots, decisions, accounts, openPositions: open }, null, 2));
+  } finally {
+    await prisma.$disconnect();
+  }
+}
+
 const command = process.argv[2];
-const commands: Record<string, () => unknown> = { setup, schema: writeSchema, dataset, train, status, test };
+const commands: Record<string, () => unknown> = { setup, schema: writeSchema, dataset, train, status, test, 'autonomous-dataset': autonomousDataset, 'autonomous-train': autonomousTrain, 'autonomous-status': autonomousStatus };
 if (!commands[command]) {
   console.error(`Usage: ml-cli <${Object.keys(commands).join('|')}>`);
   process.exit(1);

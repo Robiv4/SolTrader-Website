@@ -20,7 +20,8 @@ import {
   type MlFeatureSnapshotResult, type MlModelArtifact,
 } from '@soltrader/strategy-engine';
 
-export type MlStrategyMode = 'DEFAULT' | 'ML';
+/** NONE = no New Launch entries at all (Autonomous ML users trade in their own account; unknown modes). */
+export type MlStrategyMode = 'DEFAULT' | 'ML' | 'NONE';
 
 export interface MlPaperUserConfig {
   mode: MlStrategyMode;
@@ -39,7 +40,8 @@ export const DEFAULT_ML_PAPER_CONFIG: MlPaperUserConfig = { mode: 'DEFAULT', mod
 export function toMlPaperConfig(row: { strategyMode: string; modelVersion: string | null; buyThreshold: unknown; decisionWindowSeconds: number; minLiquidityUsd?: unknown; tradingPaused?: boolean | null } | null | undefined): MlPaperUserConfig {
   if (!row) return DEFAULT_ML_PAPER_CONFIG;
   return {
-    mode: row.strategyMode === 'ML' ? 'ML' : 'DEFAULT',
+    // Only an explicit DEFAULT row is rule-based buying; ML_AUTONOMOUS / unknown modes never reach DEFAULT entries.
+    mode: row.strategyMode === 'ML' ? 'ML' : row.strategyMode === 'DEFAULT' ? 'DEFAULT' : 'NONE',
     modelVersion: row.modelVersion,
     buyThreshold: Number(row.buyThreshold),
     decisionWindowSeconds: row.decisionWindowSeconds,

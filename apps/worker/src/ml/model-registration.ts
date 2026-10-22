@@ -36,3 +36,20 @@ export async function registerTrainedModel(
     },
   });
 }
+
+/** Autonomous ML bundle registration: a new immutable TRAINED row, never approved, selected or activated. */
+export async function registerAutonomousBundle(
+  prisma: Pick<PrismaClient, 'mlAutonomousModelBundle'>,
+  input: { version: string; readiness: string; featureVersion: string; labelVersion: string; datasetVersion: string; artifactPath: string; artifactHash: string; policy: unknown; metrics: unknown; trainedAt: string; actor: string },
+) {
+  const existing = await prisma.mlAutonomousModelBundle.findUnique({ where: { version: input.version }, select: { version: true } });
+  if (existing) throw new Error(`Bundle ${input.version} already registered (immutable): train with a new dataset version or seed`);
+  return prisma.mlAutonomousModelBundle.create({
+    data: {
+      version: input.version, status: 'TRAINED', readiness: input.readiness, featureVersion: input.featureVersion, labelVersion: input.labelVersion, datasetVersion: input.datasetVersion,
+      artifactPath: input.artifactPath, artifactHash: input.artifactHash, policy: input.policy as Prisma.InputJsonValue, metrics: input.metrics as Prisma.InputJsonValue,
+      statusHistory: [{ status: 'TRAINED', at: new Date().toISOString(), by: input.actor }] as Prisma.InputJsonValue, createdBy: input.actor, trainedAt: new Date(input.trainedAt), paperApproved: false,
+    },
+  });
+}
+

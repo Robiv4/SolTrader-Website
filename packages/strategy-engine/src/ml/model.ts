@@ -5,7 +5,7 @@
  * the same ML_FEATURE_SCHEMA: identical preprocessing in training and serving (verified by a parity test).
  */
 import { featureSchemaFor } from './community-features.js';
-import type { MlFeatures } from './features.js';
+import type { MlFeatureSpec, MlFeatures } from './features.js';
 
 export const ML_ARTIFACT_FORMAT = 'soltrader-ml-model-v1';
 
@@ -45,6 +45,8 @@ export interface MlModelArtifact {
   /** Platt scaling fitted on validation data: p = sigmoid(a * rawScore + b). */
   calibration?: { method: 'platt'; a: number; b: number } | null;
   decisionThreshold: number;
+  /** binary (default): raw score -> probability; regression: the raw score IS the prediction (Autonomous components). */
+  objective?: 'binary' | 'regression';
 }
 
 export interface MlPrediction {
@@ -108,17 +110,29 @@ function evalTree(node: LgbNode, x: number[]): number {
 }
 
 /** Validates an artifact against the current schema before use (corrupt / foreign artifacts are rejected). */
-export function validateArtifact(artifact: unknown): MlModelArtifact {
+export function validateArtifact(artifact: unknown, schema?: MlFeatureSpec[]): MlModelArtifact {
   const value = artifact as MlModelArtifact;
   if (!value || value.format !== ML_ARTIFACT_FORMAT) throw new Error('Unknown model artifact format');
   if (!Array.isArray(value.columns) || !value.columns.length) throw new Error('Model artifact has no columns');
   // Validated against the schema of the artifact's own feature version (unknown versions are rejected).
-  const known = new Set(featureSchemaFor(value.featureVersion).map((spec) => spec.name));
+  const known = new Set((schema ?? featureSchemaFor(value.featureVersion)).map((spec) => spec.name));
   for (const column of value.columns) if (!known.has(column.feature)) throw new Error(`Model uses unknown feature ${column.feature}`);
   if (value.algorithm === 'logistic_regression' && value.logistic?.coef.length !== value.columns.length) throw new Error('Coefficient count mismatch');
   if (value.algorithm === 'lightgbm' && !value.lightgbm?.trees?.length) throw new Error('LightGBM artifact has no trees');
   if (value.algorithm !== 'logistic_regression' && value.algorithm !== 'lightgbm') throw new Error('Unsupported algorithm');
   return value;
+}
+
+/** Raw model output (logit for binary models, the predicted value for regression models). */
+export function rawScoreOf(artifact: MlModelArtifact, features: MlFeatures): number {
+  const x = vectorize(features, artifact);
+  if (artifact.algorithm === 'logistic_regression') return artifact.logistic!.intercept + artifact.logistic!.coef.reduce((sum, weight, index) => sum + weight * x[index], 0);
+  return artifact.lightgbm!.trees.reduce((sum, tree) => sum + evalTree(tree.tree_structure, x), 0);
+}
+
+/** Calibrated probability of a binary model (Platt when fitted). */
+export function probabilityOf(artifact: MlModelArtifact, raw: number) {
+  return artifact.calibration ? sigmoid(artifact.calibration.a * raw + artifact.calibration.b) : sigmoid(raw);
 }
 
 export function predictMl(artifact: MlModelArtifact, features: MlFeatures): MlPrediction {

@@ -6,10 +6,11 @@ import { useState } from 'react';
 import { TokenLabel } from '../avatars';
 import { apiRequest, DataTable, EmptyState, ErrorState, fmt, LoadingState, Metric, PageHeader, Panel, Status, useApi } from '../components';
 
+import { AutonomousTab } from './autonomous-tab';
 import { CommunityTab } from './community-tab';
 import { PaperTab } from './paper-tab';
 
-const TABS = [['overview', 'Áttekintés'], ['paper', 'PAPER stratégiák'], ['community', 'Community ML'], ['dataset', 'Dataset'], ['models', 'Modellek'], ['predictions', 'Shadow predikciók'], ['analysis', 'Elemzés'], ['drift', 'Drift'], ['system', 'Rendszer']] as const;
+const TABS = [['overview', 'Áttekintés'], ['paper', 'PAPER stratégiák'], ['community', 'Community ML'], ['autonomous', 'Autonomous ML'], ['dataset', 'Dataset'], ['models', 'Modellek'], ['predictions', 'Shadow predikciók'], ['analysis', 'Elemzés'], ['drift', 'Drift'], ['system', 'Rendszer']] as const;
 type Tab = (typeof TABS)[number][0];
 
 const pct = (value: number | null | undefined, digits = 1) => (value == null ? '—' : `${(value * 100).toFixed(digits)}%`);
@@ -244,6 +245,7 @@ function System({ data }: { data: any }) {
 export default function MachineLearningPage() {
   const [tab, setTab] = useState<Tab>('overview');
   const { data, error, loading, refresh } = useApi<{ data: any }>('/api/ml/overview');
+  const { data: me } = useApi<{ data: { role: string } }>('/api/auth/me');
   return <div className="page-stack">
     <PageHeader eyebrow="Stratégiák" title="Machine Learning" subtitle="Szivárgásmentes adatgyűjtés minden jelöltről, offline tanítás, SHADOW predikció – kereskedési hatás nélkül." />
     <div className="segmented tab-bar" role="tablist" aria-label="Machine Learning nézetek">{TABS.map(([id, label]) => <button key={id} type="button" role="tab" aria-selected={tab === id} className={tab === id ? 'selected' : ''} onClick={() => setTab(id)}>{label}</button>)}</div>
@@ -251,6 +253,7 @@ export default function MachineLearningPage() {
       {tab === 'overview' ? <Overview data={data?.data ?? {}} /> : null}
       {tab === 'paper' ? <PaperTab /> : null}
       {tab === 'community' ? <CommunityTab /> : null}
+      {tab === 'autonomous' ? <AutonomousTab isAdmin={me?.data?.role === 'ADMIN'} /> : null}
       {tab === 'dataset' ? <Datasets data={data?.data ?? {}} /> : null}
       {tab === 'models' ? <Models data={data?.data ?? {}} onChanged={refresh} /> : null}
       {tab === 'predictions' ? <Predictions /> : null}

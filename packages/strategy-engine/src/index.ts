@@ -327,3 +327,4 @@ export * from './launch/index.js';
 export * from './ml/index.js';
 export * from './community/index.js';
 export * from './social/index.js';
+export * from './autonomous/index.js';

@@ -7,3 +7,7 @@ reports/*/
 !datasets/.gitkeep
 !models/.gitkeep
 !reports/.gitkeep
+autonomous-datasets/*/
+autonomous-models/*/
+!autonomous-datasets/.gitkeep
+!autonomous-models/.gitkeep

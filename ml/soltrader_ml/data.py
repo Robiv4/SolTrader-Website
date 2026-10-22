@@ -17,7 +17,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 # Feature version -> exported schema file (pnpm ml:schema). Unknown versions are refused, never guessed.
-SCHEMA_FILES = {'ML-FEATURES-v1': 'features-v1.json', 'ML-FEATURES-COMMUNITY-v1': 'features-community-v1.json'}
+SCHEMA_FILES = {'ML-FEATURES-v1': 'features-v1.json', 'ML-FEATURES-COMMUNITY-v1': 'features-community-v1.json', 'ML-FEATURES-AUTONOMOUS-v1': 'features-autonomous-v1.json'}
 
 
 def load_schema(path: Path | None = None, feature_version: str | None = None) -> dict:

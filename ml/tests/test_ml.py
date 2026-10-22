@@ -139,3 +139,55 @@ def test_training_never_overwrites_an_existing_model_version(tmp_path):
     assert train_main(['--dataset', str(directory), '--out', str(out), '--seed', '43']) == 0
     assert artifact.read_bytes() == before + b' '
 
+
+def test_autonomous_bundle_trains_with_group_safe_splits_and_exports_parity(tmp_path):
+    # SYNTHETIC pipeline smoke test only: says nothing about real trading performance.
+    from soltrader_ml.autonomous import group_safe_split, load_autonomous, main as autonomous_main
+    from soltrader_ml.synthetic import make_autonomous_dataset
+    directory = make_autonomous_dataset(tmp_path / 'auto-ds', rows=2400, seed=11)
+    frame, _ = load_autonomous(directory)
+    tr, va, te, _, purged = group_safe_split(frame, 60_000)
+    groups = frame['group_id'].to_numpy()
+    assert not (set(groups[tr]) & set(groups[te])) and not (set(groups[va]) & set(groups[te])) and not (set(groups[tr]) & set(groups[va]))
+    assert frame['snapshot_at_ms'].to_numpy()[tr].max() < frame['snapshot_at_ms'].to_numpy()[te].min()
+    out = tmp_path / 'auto-models'
+    assert autonomous_main(['--dataset', str(directory), '--out', str(out), '--seed', '42']) == 0
+    bundle_dir = out / 'ML-AUTO-AUTO-SYNTHETIC-s42'
+    meta = json.loads((bundle_dir / 'metadata.json').read_text())
+    bundle = json.loads((bundle_dir / 'bundle.json').read_text())
+    assert meta['status'] == 'TRAINED' and meta['readiness'] in {'INSUFFICIENT_DATA', 'RESEARCH_ONLY', 'SHADOW_READY'}
+    assert meta['metrics']['exportParityMaxDiff'] <= 1e-6
+    assert set(bundle['components']) == {'entryReturn', 'entryDownside', 'entryProfit', 'exitAdvantage', 'exitHold'}
+    assert bundle['components']['entryReturn']['objective'] == 'regression' and bundle['components']['entryProfit']['objective'] == 'binary'
+    # PORTFOLIO features are never model inputs (not reconstructable for replayed rows).
+    assert not any(column['feature'] in {'portfolioExposurePct', 'openPositions', 'accountDayPnlPct'} for component in bundle['components'].values() for column in component['columns'])
+    entry = meta['metrics']['entry']
+    assert {'policy', 'buyAll', 'randomSameCount', 'skipAll'} <= set(entry['backtest']) and {'impactX2', 'impactX3'} <= set(entry['liquidityStress'])
+    assert entry['liquidityStress']['impactX3']['netPnl'] <= entry['liquidityStress']['impactX2']['netPnl'] + 1e-9
+    # Synthetic data has a real signal: the entry return model finds it out of sample.
+    assert entry['entryReturn']['test']['spearman'] > 0.3
+    assert meta['metrics']['exit']['exitAdvantage']['test']['spearman'] > 0.3
+    # Immutable: a second run with the same dataset + seed writes nothing.
+    before = (bundle_dir / 'bundle.json').read_bytes()
+    assert autonomous_main(['--dataset', str(directory), '--out', str(out), '--seed', '42']) == 4
+    assert (bundle_dir / 'bundle.json').read_bytes() == before
+    # Fixture for the TypeScript parity test (trees trimmed to keep it small; expected values from the Python tree
+    # evaluator, which the trainer proved equal to LightGBM above).
+    import pandas as pd
+    from soltrader_ml.data import vectorize as vectorize_frame
+    from soltrader_ml.models import artifact_raw_score
+    for component in bundle['components'].values():
+        component['lightgbm']['trees'] = component['lightgbm']['trees'][:30]
+    rows = json.loads((bundle_dir / 'parity.json').read_text())[:10]
+    sample = pd.DataFrame([row['features'] for row in rows])
+    expected = {name: artifact_raw_score(component, vectorize_frame(sample, component['columns'], 'lightgbm')).tolist() for name, component in bundle['components'].items()}
+    fixture = {'bundle': bundle, 'rows': [{'features': row['features'], **{name: expected[name][i] for name in expected}} for i, row in enumerate(rows)]}
+    target = ROOT / 'packages' / 'strategy-engine' / 'test' / 'fixtures' / 'autonomous-parity.json'
+    target.write_text(json.dumps(fixture), encoding='utf-8')
+
+
+def test_autonomous_quality_gate_refuses_tiny_dataset(tmp_path):
+    from soltrader_ml.autonomous import main as autonomous_main
+    from soltrader_ml.synthetic import make_autonomous_dataset
+    directory = make_autonomous_dataset(tmp_path / 'auto-tiny', rows=200, seed=3)
+    assert autonomous_main(['--dataset', str(directory), '--out', str(tmp_path / 'm')]) == 3

@@ -24,17 +24,23 @@
 export const ML_TRAINING_KEY = 'ml:training:active';
 
 export type MlTradingState = 'DATA_COLLECTION' | 'MODEL_TRAINING' | 'ML_PAPER_ACTIVE' | 'TRADING_PAUSED' | 'MODEL_UNAVAILABLE';
-export type EntryStrategy = 'DEFAULT' | 'ML';
+/** DEFAULT = rule-based (legacy), ML = ML PAPER entry model (rule-based exits), ML_AUTONOMOUS = Autonomous ML bundle. */
+export type EntryStrategy = 'DEFAULT' | 'ML' | 'ML_AUTONOMOUS';
+export const ML_AUTONOMOUS_STRATEGY = 'ML_AUTONOMOUS';
+/** Feature version of Autonomous bundles (kept here to avoid an import cycle; equals ML_AUTONOMOUS_FEATURE_VERSION). */
+const AUTONOMOUS_FEATURE_VERSION = 'ML-FEATURES-AUTONOMOUS-v1';
 
 export interface StrategySelectionInput {
   /** ML_ONLY_ARCHITECTURE_ENABLED: the rule-based strategy can no longer open entries. */
   mlOnly: boolean;
   /** Stored selection; null = no row (ML-only: no model; legacy: DEFAULT). */
-  settings: { strategyMode: string; modelVersion: string | null; tradingPaused?: boolean | null } | null;
+  settings: { strategyMode: string; modelVersion: string | null; autonomousBundleVersion?: string | null; tradingPaused?: boolean | null } | null;
   /** false = the selection could not be read: fail-closed (no entries). */
   settingsReadable?: boolean;
   /** The selected model's registry row (null = not found / not looked up). */
   model: { version: string; paperApproved: boolean; status: string; featureVersion?: string | null } | null;
+  /** strategyMode ML_AUTONOMOUS: the selected Autonomous bundle's registry row (null = not found / not looked up). */
+  bundle?: { version: string; paperApproved: boolean; status: string; featureVersion?: string | null } | null;
   /** Feature versions the worker can build at decision time. */
   supportedFeatureVersion?: (featureVersion: string) => boolean;
   trainingInProgress?: boolean;
@@ -79,8 +85,19 @@ export function resolveEntryAuthority(input: StrategySelectionInput): EntryAutho
   if (input.settingsReadable === false) return blocked('TRADING_PAUSED', ['STRATEGY_SELECTION_UNREADABLE'], training);
   if (input.emergencyStop) return blocked('TRADING_PAUSED', ['EMERGENCY_STOP'], training);
   if (input.settings?.tradingPaused) return blocked('TRADING_PAUSED', ['TRADING_PAUSED_BY_USER'], training);
-  const mode = input.settings?.strategyMode === 'ML' ? 'ML' : 'DEFAULT';
+  const stored = input.settings?.strategyMode;
+  // Every unknown mode is treated as "no trading model" (never as DEFAULT buying).
+  const mode = stored === 'ML' ? 'ML' : stored === ML_AUTONOMOUS_STRATEGY ? ML_AUTONOMOUS_STRATEGY : stored === 'DEFAULT' || stored === undefined ? 'DEFAULT' : 'UNKNOWN';
   const modelVersion = input.settings?.modelVersion ?? null;
+  if (mode === ML_AUTONOMOUS_STRATEGY) {
+    // Autonomous ML: the selected bundle alone makes BUY / HOLD / SELL decisions in its own PAPER account.
+    const bundleVersion = input.settings?.autonomousBundleVersion ?? null;
+    if (!bundleVersion) return blocked(training ? 'MODEL_TRAINING' : 'DATA_COLLECTION', ['NO_TRADING_MODEL_SELECTED'], training);
+    const bundleReasons = modelUnavailableReasons(bundleVersion, input.bundle ?? null, (featureVersion) => featureVersion === AUTONOMOUS_FEATURE_VERSION);
+    if (bundleReasons.length) return blocked('MODEL_UNAVAILABLE', bundleReasons, training);
+    return { state: 'ML_PAPER_ACTIVE', mayOpenEntries: true, entryStrategy: ML_AUTONOMOUS_STRATEGY, authorizedModelVersion: bundleVersion, reasons: [], components: { dataCollection: 'RUNNING', training: training ? 'RUNNING' : 'IDLE', trading: 'ACTIVE' } };
+  }
+  if (mode === 'UNKNOWN') return blocked('DATA_COLLECTION', ['UNKNOWN_STRATEGY_MODE'], training);
   // ML-only: a DEFAULT row (old selection) or no row means "no trading model"; the model must be chosen explicitly again.
   const mlSelected = mode === 'ML' && modelVersion !== null;
   if (!input.mlOnly && mode === 'DEFAULT') {
@@ -101,11 +118,11 @@ export function resolveEntryAuthority(input: StrategySelectionInput): EntryAutho
 export function authorizeEntry(authority: EntryAuthority, signal: { entryStrategy: EntryStrategy; modelVersion?: string | null }): { allowed: true } | { allowed: false; reason: string } {
   if (!authority.mayOpenEntries || !authority.entryStrategy) return { allowed: false, reason: authority.reasons[0] ?? authority.state };
   if (signal.entryStrategy !== authority.entryStrategy) return { allowed: false, reason: signal.entryStrategy === 'DEFAULT' ? 'DEFAULT_STRATEGY_DISABLED' : 'ENTRY_STRATEGY_NOT_ACTIVE' };
-  if (signal.entryStrategy === 'ML' && (!signal.modelVersion || signal.modelVersion !== authority.authorizedModelVersion)) return { allowed: false, reason: 'ML_MODEL_NOT_SELECTED' };
+  if (signal.entryStrategy !== 'DEFAULT' && (!signal.modelVersion || signal.modelVersion !== authority.authorizedModelVersion)) return { allowed: false, reason: 'ML_MODEL_NOT_SELECTED' };
   return { allowed: true };
 }
 
 /** Strategies a user can choose in the UI (ML-only: no DEFAULT selector). */
 export function selectableStrategies(mlOnly: boolean): EntryStrategy[] {
-  return mlOnly ? ['ML'] : ['DEFAULT', 'ML'];
+  return mlOnly ? ['ML', ML_AUTONOMOUS_STRATEGY] : ['DEFAULT', 'ML', ML_AUTONOMOUS_STRATEGY];
 }

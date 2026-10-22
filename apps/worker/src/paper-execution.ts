@@ -443,13 +443,14 @@ export class PaperExecutionCoordinator {
           const selectedVersion = strategy?.strategyMode === 'ML' ? strategy.modelVersion : null;
           const selectedModel = selectedVersion && this.deps.prisma.mlModelVersion?.findUnique ? await this.deps.prisma.mlModelVersion.findUnique({ where: { version: selectedVersion }, select: { version: true, paperApproved: true, status: true, featureVersion: true } }) : null;
           const authority = resolveEntryAuthority({
-            mlOnly: true, settings: strategy ? { strategyMode: strategy.strategyMode, modelVersion: strategy.modelVersion, tradingPaused: (strategy as { tradingPaused?: boolean }).tradingPaused } : null,
+            mlOnly: true, settings: strategy ? { strategyMode: strategy.strategyMode, modelVersion: strategy.modelVersion, autonomousBundleVersion: (strategy as { autonomousBundleVersion?: string | null }).autonomousBundleVersion ?? null, tradingPaused: (strategy as { tradingPaused?: boolean }).tradingPaused } : null,
             model: selectedModel, supportedFeatureVersion: isSupportedFeatureVersion, tradingMode: user.tradingMode,
           });
           const verdict = authorizeEntry(authority, { entryStrategy: candidate.entryStrategy, modelVersion: typeof candidate.ml?.modelVersion === 'string' ? candidate.ml.modelVersion : null });
           if (!verdict.allowed) return this.rejectCandidate(candidate, verdict.reason, policy);
         }
-        const activeStrategy = strategy?.strategyMode === 'ML' ? 'ML' : 'DEFAULT';
+        // No row = legacy DEFAULT; any other mode (ML_AUTONOMOUS trades in its own account, unknown modes) matches no signal.
+        const activeStrategy = !strategy ? 'DEFAULT' : strategy.strategyMode === 'ML' || strategy.strategyMode === 'DEFAULT' ? strategy.strategyMode : 'NONE';
         if (candidate.entryStrategy !== activeStrategy) return this.rejectCandidate(candidate, 'ENTRY_STRATEGY_NOT_ACTIVE', policy);
         if (candidate.entryStrategy === 'ML') {
           const version = typeof candidate.ml?.modelVersion === 'string' ? candidate.ml.modelVersion : '';

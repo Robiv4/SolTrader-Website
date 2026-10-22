@@ -61,8 +61,8 @@ describe('operating states', () => {
     expect(resolveEntryAuthority(base({ mlOnly: false, settings: { strategyMode: 'DEFAULT', modelVersion: null }, model: null }))).toMatchObject({ mayOpenEntries: true, entryStrategy: 'DEFAULT' });
     expect(resolveEntryAuthority(base({ mlOnly: false }))).toMatchObject({ entryStrategy: 'ML', authorizedModelVersion: approved.version });
     expect(resolveEntryAuthority(base({ mlOnly: false, tradingMode: 'LIVE' })).mayOpenEntries).toBe(false);
-    expect(selectableStrategies(false)).toEqual(['DEFAULT', 'ML']);
-    expect(selectableStrategies(true)).toEqual(['ML']);
+    expect(selectableStrategies(false)).toEqual(['DEFAULT', 'ML', 'ML_AUTONOMOUS']);
+    expect(selectableStrategies(true)).toEqual(['ML', 'ML_AUTONOMOUS']);
   });
 });
 
@@ -92,3 +92,27 @@ describe('input schemas of existing models are unchanged', () => {
     expect(ML_COMMUNITY_FEATURE_SCHEMA.slice(0, ML_FEATURE_SCHEMA.length)).toEqual(ML_FEATURE_SCHEMA);
   });
 });
+
+describe('ML_AUTONOMOUS strategy mode', () => {
+  const bundle = { version: 'ML-AUTO-DS1-s42', paperApproved: true, status: 'SHADOW', featureVersion: 'ML-FEATURES-AUTONOMOUS-v1' };
+  const auto = (extra: Partial<StrategySelectionInput> = {}) => base({ settings: { strategyMode: 'ML_AUTONOMOUS', modelVersion: approved.version, autonomousBundleVersion: bundle.version }, bundle, ...extra });
+  it('the selected approved bundle alone is authorised (the ML PAPER model is not)', () => {
+    const authority = resolveEntryAuthority(auto());
+    expect(authority).toMatchObject({ state: 'ML_PAPER_ACTIVE', entryStrategy: 'ML_AUTONOMOUS', authorizedModelVersion: bundle.version });
+    expect(authorizeEntry(authority, { entryStrategy: 'ML_AUTONOMOUS', modelVersion: bundle.version })).toEqual({ allowed: true });
+    expect(authorizeEntry(authority, { entryStrategy: 'ML', modelVersion: approved.version })).toEqual({ allowed: false, reason: 'ENTRY_STRATEGY_NOT_ACTIVE' });
+    expect(authorizeEntry(authority, { entryStrategy: 'DEFAULT' })).toEqual({ allowed: false, reason: 'DEFAULT_STRATEGY_DISABLED' });
+    // Also in legacy mode an autonomous user never gets DEFAULT entries.
+    expect(resolveEntryAuthority(auto({ mlOnly: false })).entryStrategy).toBe('ML_AUTONOMOUS');
+  });
+  it('no / revoked / foreign bundle: no entries, no fallback', () => {
+    expect(resolveEntryAuthority(auto({ settings: { strategyMode: 'ML_AUTONOMOUS', modelVersion: null, autonomousBundleVersion: null } }))).toMatchObject({ state: 'DATA_COLLECTION', mayOpenEntries: false });
+    expect(resolveEntryAuthority(auto({ bundle: { ...bundle, paperApproved: false } }))).toMatchObject({ state: 'MODEL_UNAVAILABLE', mayOpenEntries: false });
+    expect(resolveEntryAuthority(auto({ bundle: { ...bundle, featureVersion: 'ML-FEATURES-v1' } })).reasons).toContain('MODEL_FEATURE_VERSION_UNSUPPORTED');
+    expect(resolveEntryAuthority(auto({ bundle: null })).reasons).toContain('MODEL_NOT_FOUND');
+  });
+  it('an unknown strategy mode is never DEFAULT buying', () => {
+    expect(resolveEntryAuthority(base({ mlOnly: false, settings: { strategyMode: 'SOMETHING_NEW', modelVersion: null }, model: null }))).toMatchObject({ mayOpenEntries: false, reasons: ['UNKNOWN_STRATEGY_MODE'] });
+  });
+});
+

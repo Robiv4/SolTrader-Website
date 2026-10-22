@@ -148,6 +148,14 @@ export class CommunityService {
     return result;
   }
 
+  /** On-chain buyer statistics known at `at` (Autonomous DYNAMICS features); null = token not tracked / disabled. */
+  onchainAt(mint: string, at: number) {
+    const token = this.tokens.get(mint);
+    if (!token || !this.deps.onchainEnabled) return null;
+    const stats = computeOnchainCommunityStats(token.trades, at);
+    return { at, newBuyerShare1m: stats.newBuyerShare1m, buyers1m: stats.buyers1m };
+  }
+
   latest(mint: string) {
     return this.tokens.get(mint)?.last ?? null;
   }

@@ -1470,6 +1470,8 @@ model MlPaperSettings {
   minLiquidityUsd       Decimal? @db.Decimal(14, 2)
   enabledAt             DateTime?
   enabledBy             String?
+  /// strategyMode ML_AUTONOMOUS: the selected Autonomous ML bundle (MlAutonomousModelBundle.version)
+  autonomousBundleVersion String?
   /// ML-only architecture: no NEW entries while paused (data collection and exit protection of open positions continue)
   tradingPaused         Boolean  @default(false)
   pausedAt              DateTime?
@@ -1587,3 +1589,194 @@ model CommunitySnapshot {
   @@index([mint, at])
   @@index([at])
 }
+
+/// Autonomous ML model bundle (entry value, downside, profit, exit value, hold components + policy + sizing): one
+/// immutable, versioned artifact (file + sha256). Never activated, approved or selected automatically.
+model MlAutonomousModelBundle {
+  id              String    @id @default(cuid())
+  version         String    @unique
+  /// TRAINED | VALIDATED | SHADOW | RETIRED
+  status          String    @default("TRAINED")
+  /// INSUFFICIENT_DATA | RESEARCH_ONLY | SHADOW_READY
+  readiness       String
+  featureVersion  String
+  labelVersion    String
+  datasetVersion  String
+  artifactPath    String
+  artifactHash    String
+  policy          Json
+  metrics         Json
+  statusHistory   Json
+  paperApproved   Boolean   @default(false)
+  paperApprovedAt DateTime?
+  paperApprovedBy String?
+  paperRevokedAt  DateTime?
+  paperRevokedBy  String?
+  createdBy       String?
+  trainedAt       DateTime
+  createdAt       DateTime  @default(now())
+}
+
+/// Time-correct decision sample (ENTRY = token candidate, POSITION = open autonomous position). Immutable.
+model MlAutonomousDecisionSnapshot {
+  id                    String   @id @default(cuid())
+  /// ENTRY | POSITION
+  kind                  String
+  mint                  String
+  candidateId           String?
+  positionId            String?
+  /// AGE_15S | AGE_30S | ... | REEVALUATION | POSITION_PERIODIC | MARKET_MOVE | LIQUIDITY_DROP | POSITION_EVENT
+  trigger               String
+  at                    DateTime
+  featureVersion        String
+  features              Json
+  observedAt            Json
+  featureHash           String
+  dataQuality           Int
+  lateDataExcluded      Json
+  validForTraining      Boolean
+  invalidReasons        Json
+  referencePriceUsd     Decimal? @db.Decimal(30, 18)
+  referenceLiquidityUsd Decimal? @db.Decimal(24, 8)
+  createdAt             DateTime @default(now())
+
+  outcome MlAutonomousOutcome?
+
+  @@index([kind, at])
+  @@index([mint, at])
+}
+
+/// Counterfactual label of a decision snapshot (AUTO-LABELS-v1), written by the labelling job; never back-dated.
+model MlAutonomousOutcome {
+  id             String   @id @default(cuid())
+  snapshotId     String   @unique
+  labelVersion   String
+  /// LABELLED | EXCLUDED
+  status         String
+  labels         Json
+  uncertainty    Json
+  exclusionReason String?
+  labelEndAt     DateTime
+  createdAt      DateTime @default(now())
+
+  snapshot MlAutonomousDecisionSnapshot @relation(fields: [snapshotId], references: [id], onDelete: Cascade)
+
+  @@index([status])
+}
+
+/// One decision of an Autonomous bundle (PAPER or SHADOW): action, outputs, sizes, execution result, safety blocks.
+model MlAutonomousDecision {
+  id               String    @id @default(cuid())
+  /// PAPER (account) | SHADOW (evaluation only, never executed)
+  mode             String
+  userId           String?
+  accountId        String?
+  bundleVersion    String
+  snapshotId       String?
+  mint             String
+  /// ENTRY | POSITION
+  kind             String
+  /// BUY | WAIT | SKIP | HOLD | PARTIAL_SELL | SELL | ERROR | PROTECTION_SELL
+  action           String
+  outputs          Json?
+  suggestedSizeUsd Decimal?  @db.Decimal(18, 6)
+  executedSizeUsd  Decimal?  @db.Decimal(18, 6)
+  featureHash      String
+  decidedAt        DateTime
+  /// EXECUTED | SAFETY_BLOCKED | NO_ACTION | SHADOW | REJECTED | ERROR
+  executionStatus  String
+  executionReason  String?
+  safetyBlockers   Json?
+  positionId       String?
+  /// One decision per (account / shadow bundle, mint, kind, decision point): duplicate orders are impossible.
+  idempotencyKey   String    @unique
+  createdAt        DateTime  @default(now())
+
+  @@index([bundleVersion, decidedAt])
+  @@index([userId, decidedAt])
+  @@index([accountId, decidedAt])
+}
+
+/// Separate virtual PAPER account of the Autonomous strategy (never the user's PAPER account, no real funds).
+model MlAutonomousAccount {
+  id             String   @id @default(cuid())
+  userId         String   @unique
+  /// Auditable account identifier
+  accountKey     String   @unique
+  initialBalance Decimal  @db.Decimal(18, 6)
+  cashBalance    Decimal  @db.Decimal(18, 6)
+  realizedPnl    Decimal  @default(0) @db.Decimal(18, 6)
+  feesPaid       Decimal  @default(0) @db.Decimal(18, 6)
+  impactCost     Decimal  @default(0) @db.Decimal(18, 6)
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  positions MlAutonomousPosition[]
+}
+
+model MlAutonomousPosition {
+  id                String    @id @default(cuid())
+  accountId         String
+  userId            String
+  mint              String
+  symbol            String?
+  bundleVersion     String
+  /// OPEN | CLOSED
+  status            String    @default("OPEN")
+  /// "<accountId>:<mint>" while OPEN (unique: never two open positions of one token), null once closed
+  openKey           String?   @unique
+  initialQuantity   Decimal   @db.Decimal(30, 12)
+  quantity          Decimal   @db.Decimal(30, 12)
+  entryFillPrice    Decimal   @db.Decimal(30, 18)
+  entryMarketPrice  Decimal   @db.Decimal(30, 18)
+  entryNotionalUsd  Decimal   @db.Decimal(18, 6)
+  entryFeeUsd       Decimal   @db.Decimal(18, 6)
+  entryImpactPct    Decimal   @db.Decimal(10, 4)
+  entryLiquidityUsd Decimal?  @db.Decimal(24, 8)
+  /// Entry context (ML-FEATURES-COMMUNITY-v1 part) frozen at entry, used by every POSITION decision
+  entryContext      Json
+  entrySnapshotId   String?
+  entryDecisionId   String?
+  highestPrice      Decimal   @db.Decimal(30, 18)
+  lowestPrice       Decimal   @db.Decimal(30, 18)
+  partiallySold     Boolean   @default(false)
+  realizedPnlUsd    Decimal   @default(0) @db.Decimal(18, 6)
+  feesUsd           Decimal   @default(0) @db.Decimal(18, 6)
+  exitReason        String?
+  openedAt          DateTime
+  lastEvaluatedAt   DateTime?
+  closedAt          DateTime?
+  createdAt         DateTime  @default(now())
+  updatedAt         DateTime  @updatedAt
+
+  account MlAutonomousAccount @relation(fields: [accountId], references: [id])
+  fills   MlAutonomousFill[]
+
+  @@index([accountId, status])
+  @@index([userId, status])
+}
+
+model MlAutonomousFill {
+  id             String   @id @default(cuid())
+  positionId     String
+  accountId      String
+  /// BUY | SELL
+  side           String
+  quantity       Decimal  @db.Decimal(30, 12)
+  fillPrice      Decimal  @db.Decimal(30, 18)
+  marketPrice    Decimal  @db.Decimal(30, 18)
+  notionalUsd    Decimal  @db.Decimal(18, 6)
+  feeUsd         Decimal  @db.Decimal(18, 6)
+  impactPct      Decimal  @db.Decimal(10, 4)
+  realizedPnlUsd Decimal? @db.Decimal(18, 6)
+  decisionId     String?
+  /// MODEL_BUY | MODEL_SELL | MODEL_PARTIAL_SELL | HARD_MAX_LOSS | LIQUIDITY_COLLAPSE | SELL_ROUTE_LOST | TECHNICAL_MAX_HOLD
+  reason         String
+  at             DateTime
+  createdAt      DateTime @default(now())
+
+  position MlAutonomousPosition @relation(fields: [positionId], references: [id])
+
+  @@index([accountId, at])
+}
+

@@ -45,7 +45,7 @@ describe('ML-only settings API', () => {
   it('no DEFAULT selector; without a model the user is in DATA_COLLECTION', async () => {
     const response = await request(app(true, 'USER')).get('/api/settings/ml-paper');
     expect(response.status).toBe(200);
-    expect(response.body.data).toMatchObject({ mlOnly: true, selectableStrategies: ['ML'], tradingState: { state: 'DATA_COLLECTION', mayOpenEntries: false }, liveTrading: 'DISABLED' });
+    expect(response.body.data).toMatchObject({ mlOnly: true, selectableStrategies: ['ML', 'ML_AUTONOMOUS'], tradingState: { state: 'DATA_COLLECTION', mayOpenEntries: false }, liveTrading: 'DISABLED' });
   });
 
   it('selecting DEFAULT is refused in ML-only mode (nothing stored)', async () => {
@@ -81,7 +81,7 @@ describe('ML-only settings API', () => {
 
   it('legacy mode (flag off): DEFAULT stays selectable and works as before', async () => {
     const view = await request(app(false, 'USER')).get('/api/settings/ml-paper');
-    expect(view.body.data).toMatchObject({ mlOnly: false, selectableStrategies: ['DEFAULT', 'ML'] });
+    expect(view.body.data).toMatchObject({ mlOnly: false, selectableStrategies: ['DEFAULT', 'ML', 'ML_AUTONOMOUS'] });
     const saved = await request(app(false, 'USER')).put('/api/settings/ml-paper').send({ strategyMode: 'DEFAULT' });
     expect(saved.status).toBe(200);
     expect(saved.body.data.strategyMode).toBe('DEFAULT');

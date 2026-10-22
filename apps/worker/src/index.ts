@@ -7,6 +7,7 @@ import { createMarketDataProvider, PrismaMarketDataRepository } from '@soltrader
 import { BotCommandSubscriber } from '@soltrader/shared';
 import { createClient } from 'redis';
 
+import { AutonomousEngine } from './autonomous/engine.js';
 import { CommunityService } from './community/community-service.js';
 import { DexScreenerClient } from './community/dexscreener.js';
 import { HttpBudget } from './community/http-budget.js';
@@ -203,6 +204,14 @@ const newLaunch = new NewLaunchService({
     await eventPublisher.publish('bot:launches', JSON.stringify({ type: 'launch_update', payload, timestamp: new Date().toISOString() }));
   },
 });
+
+// Autonomous ML PAPER engine (strategy ML_AUTONOMOUS): own decision snapshots + own virtual PAPER ledger. Collects data
+// for every launch; trades only for users who explicitly selected a PAPER-approved bundle (never automatically).
+const autonomousEngine = env.AUTONOMOUS_ML_ENABLED ? new AutonomousEngine({
+  prisma, logger, repoRoot: mlRepoRoot, accessor: () => newLaunch.autonomousAccessor(), community: communityService ?? undefined,
+  serverTradingMode: () => env.TRADING_MODE, initialBalanceUsd: env.AUTONOMOUS_PAPER_INITIAL_BALANCE, maxSnapshotsPerMinute: env.AUTONOMOUS_ML_MAX_SNAPSHOTS_PER_MIN,
+}) : null;
+let autonomousTimer: ReturnType<typeof globalThis.setInterval> | null = null;
 
 const paperExecution = new PaperExecutionCoordinator({
   mlOnly: env.ML_ONLY_ARCHITECTURE_ENABLED,
@@ -404,6 +413,10 @@ async function main() {
   await eventPublisher.connect();
   await loop.start();
   newLaunch.start();
+  if (autonomousEngine) {
+    autonomousTimer = globalThis.setInterval(() => void autonomousEngine.tick(), 2_000);
+    globalThis.setInterval(() => void eventPublisher.set('ml:autonomous:health', JSON.stringify(autonomousEngine.health()), { EX: 60 }).catch(() => undefined), 10_000);
+  }
   globalThis.setInterval(() => void tradeCandles.flush().catch(() => undefined), 5_000);
   // ML PAPER health (model load / approval / last prediction; no secrets) + bookkeeping of finished candidates.
   globalThis.setInterval(() => {
@@ -447,6 +460,7 @@ async function shutdown(signal: string) {
   await hotMonitor?.stop();
   socialService?.stop();
   communityService?.stop();
+  if (autonomousTimer) globalThis.clearInterval(autonomousTimer);
   await telegramProvider.stop();
   newLaunch.stop();
   await loop.stop();

@@ -28,7 +28,7 @@ export const ML_FEATURE_VERSION = 'ML-FEATURES-v1';
 export const ML_OPTIONAL_LATE_GROUPS: ReadonlyArray<string> = ['SOCIAL', 'COMMUNITY'];
 
 export type MlFeatureType = 'number' | 'boolean' | 'category';
-export type MlFeatureGroup = 'AGE' | 'MARKET' | 'STRUCTURE' | 'SECURITY' | 'RISK' | 'LAUNCH' | 'SOCIAL' | 'SOURCE' | 'COMMUNITY';
+export type MlFeatureGroup = 'AGE' | 'MARKET' | 'STRUCTURE' | 'SECURITY' | 'RISK' | 'LAUNCH' | 'SOCIAL' | 'SOURCE' | 'COMMUNITY' | 'DYNAMICS' | 'EXECUTION' | 'REGIME' | 'POSITION' | 'PORTFOLIO';
 
 export interface MlFeatureSpec {
   name: string;

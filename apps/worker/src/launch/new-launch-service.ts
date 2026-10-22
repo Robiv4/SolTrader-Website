@@ -276,7 +276,7 @@ export class NewLaunchService {
         model: stored?.modelVersion ? models.get(stored.modelVersion) ?? null : null, supportedFeatureVersion: isSupportedFeatureVersion, tradingMode: bot?.tradingMode ?? null,
       });
       // ML-only: the user is always an ML user (never a DEFAULT buyer); without an authorised model no ML step runs at all.
-      if (this.deps.mlOnly) strategy = { ...strategy, mode: 'ML', modelVersion: authority.authorizedModelVersion };
+      if (this.deps.mlOnly) strategy = authority.entryStrategy === 'ML_AUTONOMOUS' || strategy.mode === 'NONE' ? { ...strategy, mode: 'NONE' } : { ...strategy, mode: 'ML', modelVersion: authority.authorizedModelVersion };
       users.push({ userId: config.userId, settings, riskPolicy: scan.riskPolicy, riskConfig: toRiskEngineConfig(scan), intendedOrderUsd: account ? Number(account.equity) * settings.maxPositionPercent / 100 : null, strategy, authority });
     }
     this.userCache = { at: now, users };
@@ -338,12 +338,60 @@ export class NewLaunchService {
     this.metrics.researchCollected += 1;
   }
 
+  /**
+   * Read-only access for the Autonomous ML engine: launches, tracker state / samples, the effective quote (a silent
+   * bonding-curve token keeps its last trade price while the trade stream is live; otherwise the quote ages) and the
+   * mandatory token safety facts (fraud / honeypot / liquidity / impact / risk) with default safety limits.
+   */
+  autonomousAccessor() {
+    const lastStreamEventAt = () => {
+      let latest = 0;
+      for (const launch of this.tracker.launches.values()) if (launch.wallets && launch.lastTradeAt && launch.lastTradeAt > latest) latest = launch.lastTradeAt;
+      return latest;
+    };
+    return {
+      launches: () => [...this.tracker.launches.values()].map((launch) => ({ mint: launch.mint, source: launch.source, symbol: launch.symbol, detectedAt: launch.detectedAt, createdAt: launch.createdAt, firstTradeAt: launch.firstTradeAt, migrated: launch.migrated, trades: launch.buyCount + launch.sellCount })),
+      state: (mint: string, referenceOrderUsd: number) => this.tracker.state(mint, referenceOrderUsd),
+      security: (mint: string) => {
+        const memory = this.security.get(mint);
+        return memory ? { security: memory.security, completedAt: memory.completedAt } : null;
+      },
+      samples: (mint: string) => (this.tracker.state(mint, null)?.observations ?? []).map((observation) => ({ t: observation.takenAt, price: observation.priceUsd, liquidityUsd: observation.liquidityUsd, tradeCount: observation.buyCount + observation.sellCount })),
+      quote: (mint: string, now: number) => {
+        const quote = this.tracker.quote(mint, Number.POSITIVE_INFINITY);
+        if (!quote) return null;
+        const streamLive = now - lastStreamEventAt() <= 5_000;
+        const at = quote.streaming && !quote.migrated && streamLive ? now : quote.timestamp.getTime();
+        return { price: quote.priceUsd, liquidityUsd: quote.liquidityUsd, at, migrated: Boolean(quote.migrated), streaming: quote.streaming, impactPercentFor: quote.impactPercentFor };
+      },
+      tokenSafety: (mint: string, now: number, minLiquidityUsd: number) => {
+        const launch = this.tracker.launches.get(mint);
+        const memory = this.security.get(mint);
+        const state = this.tracker.state(mint, ML_REFERENCE_ORDER_USD);
+        if (!launch || !memory || !state) return { blockers: ['SECURITY_NOT_CHECKED'], riskScore: null, riskObservedAt: null };
+        const result = evaluateNewLaunch(state, memory.security, { riskScore: null, classification: null, hardBlockReasons: [] }, this.researchSettings, now);
+        const f = result.features;
+        const pseudoUser = { userId: 'ml-autonomous', settings: this.researchSettings, riskPolicy: 'EXPLORATORY', riskConfig: { thresholds: { ...DEFAULT_RISK_THRESHOLDS, minimumLiquidityUsd: minLiquidityUsd } } as unknown as UserContext['riskConfig'], intendedOrderUsd: null, strategy: DEFAULT_ML_PAPER_CONFIG, authority: null as unknown as EntryAuthority };
+        const risk = this.riskFor(launch, { liquidityUsd: f.liquidityUsd, ageSeconds: f.ageSeconds, volumeUsd: f.volumeUsd, transactionCount: f.transactionCount, impact: f.estimatedPriceImpact, largestHolder: f.largestHolderSupplyShare, largestBuyer: f.largestBuyerShare, volatility: f.launchVolatility, priceUsd: f.priceUsd }, memory.security, pseudoUser);
+        const blockers = mlEntrySafetyBlockers({ result, security: memory.security, riskScore: risk.riskScore, riskHardBlockReasons: risk.hardBlockReasons, settings: this.researchSettings, mlMinLiquidityUsd: minLiquidityUsd, detectedAt: launch.detectedAt, now });
+        if (risk.classification === null) blockers.push('RISK_NOT_CLASSIFIED');
+        return { blockers, riskScore: risk.riskScore, riskObservedAt: now };
+      },
+      candidateId: async (mint: string) => {
+        const launch = this.tracker.launches.get(mint);
+        return launch ? this.ensureCandidate(launch) : null;
+      },
+    };
+  }
+
   /** Open NEW_LAUNCH positions keep their tokens tracked (also re-created after a worker restart). */
   private async refreshKeepAlive(now: number) {
     if (now - this.lastKeepAliveAt < 10_000) return;
     this.lastKeepAliveAt = now;
     const open = await this.deps.prisma.trade.findMany({ where: { decisionSource: 'NEW_LAUNCH', status: 'OPEN' }, select: { tokenAddress: true } }).catch(() => []);
-    const mints = new Set(open.map((trade) => trade.tokenAddress));
+    // Open Autonomous ML positions (own PAPER ledger) keep their tokens tracked too (quotes for exits).
+    const autonomous = this.deps.prisma.mlAutonomousPosition?.findMany ? await this.deps.prisma.mlAutonomousPosition.findMany({ where: { status: 'OPEN' }, select: { mint: true } }).catch(() => []) : [];
+    const mints = new Set([...open.map((trade) => trade.tokenAddress), ...(autonomous ?? []).map((position) => position.mint)]);
     for (const mint of mints) {
       const candidate = await this.deps.prisma.launchCandidate.findUnique({ where: { mint } }).catch(() => null);
       this.tracker.keep(mint, candidate ? { source: candidate.source as LaunchEvent['source'], detectedAt: candidate.detectedAt.getTime(), createdAt: candidate.createdAt?.getTime() ?? null, bondingCurve: candidate.bondingCurve, poolAddress: candidate.poolAddress, creator: candidate.creator, name: candidate.name, symbol: candidate.symbol } : {});
@@ -550,7 +598,7 @@ export class NewLaunchService {
         continue;
       }
       // ML strategy users never get a rule-based entry (one strategy buys, never both); in ML-only mode nobody does.
-      if (!mlUser && !this.deps.mlOnly && result.decision === 'BUY' && risk.riskScore !== null && risk.classification) {
+      if (user.strategy.mode === 'DEFAULT' && !this.deps.mlOnly && result.decision === 'BUY' && risk.riskScore !== null && risk.classification) {
         const signalId = await this.createBuySignal(launch, user, result, risk, decisionRow.id, security.completedAt, now, state, security.security, gate, social);
         const current = this.decisions.get(key);
         if (current) current.signaled = Boolean(signalId);
