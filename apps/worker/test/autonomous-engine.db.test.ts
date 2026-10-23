@@ -100,7 +100,7 @@ class Market implements AutonomousLaunchAccessor {
 function setup(serverMode = 'PAPER') {
   let now = Date.now();
   const market = new Market(() => now);
-  const engine = () => new AutonomousEngine({ prisma, logger, repoRoot, accessor: () => market, serverTradingMode: () => serverMode, initialBalanceUsd: 1_000, maxSnapshotsPerMinute: 1_000, now: () => now });
+  const engine = () => new AutonomousEngine({ prisma, logger, repoRoot, accessor: () => market, serverTradingMode: () => serverMode, initialBalanceUsd: 1_000, maxSnapshotsPerMinute: 1_000, now: () => now, accountFilter: (userId) => users.includes(userId) });
   return { market, engine, now: () => now, advance: (ms: number) => { now += ms; }, setNow: (value: number) => { now = value; } };
 }
 

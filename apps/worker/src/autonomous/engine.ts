@@ -69,6 +69,10 @@ export interface AutonomousEngineDeps {
   minLiquidityUsd?: number;
   readBundle?: (artifactPath: string) => Promise<Buffer>;
   now?: () => number;
+  /** Test isolation: only these users' accounts are traded by this engine instance (default: every ML_AUTONOMOUS user). */
+  accountFilter?: (userId: string) => boolean;
+  /** Explicit SHADOW ("Modell ellenőrzése") bundle (default: the newest SHADOW bundle). */
+  shadowBundleVersion?: () => string | null;
 }
 
 interface AccountContext {
@@ -138,11 +142,14 @@ export class AutonomousEngine {
   private async refreshContext(now: number) {
     this.contextAt = now;
     const prisma = this.deps.prisma;
-    const settings = await prisma.mlPaperSettings.findMany({ where: { strategyMode: ML_AUTONOMOUS_STRATEGY } });
+    const settings = (await prisma.mlPaperSettings.findMany({ where: { strategyMode: ML_AUTONOMOUS_STRATEGY } })).filter((row) => !this.deps.accountFilter || this.deps.accountFilter(row.userId));
     const versions = new Set(settings.map((row) => row.autonomousBundleVersion).filter((version): version is string => Boolean(version)));
     const open = await prisma.mlAutonomousPosition.findMany({ where: { status: 'OPEN' }, select: { bundleVersion: true } });
     for (const row of open) versions.add(row.bundleVersion);
-    const shadow = await prisma.mlAutonomousModelBundle.findFirst({ where: { status: 'SHADOW' }, orderBy: { trainedAt: 'desc' } });
+    const explicitShadow = this.deps.shadowBundleVersion?.();
+    const shadow = explicitShadow !== undefined
+      ? explicitShadow ? await prisma.mlAutonomousModelBundle.findFirst({ where: { version: explicitShadow, status: 'SHADOW' } }) : null
+      : await prisma.mlAutonomousModelBundle.findFirst({ where: { status: 'SHADOW' }, orderBy: { trainedAt: 'desc' } });
     if (shadow) versions.add(shadow.version);
     const rows = versions.size ? await prisma.mlAutonomousModelBundle.findMany({ where: { version: { in: [...versions] } } }) : [];
     this.bundleRows = new Map(rows.map((row) => [row.version, row]));
@@ -406,7 +413,7 @@ export class AutonomousEngine {
   // ------------------------------------------------------------------ positions
 
   private async evaluatePositions(accessor: AutonomousLaunchAccessor, regime: AutonomousSnapshotInput['regime'], now: number) {
-    const positions = await this.deps.prisma.mlAutonomousPosition.findMany({ where: { status: 'OPEN' } });
+    const positions = (await this.deps.prisma.mlAutonomousPosition.findMany({ where: { status: 'OPEN' } })).filter((position) => !this.deps.accountFilter || this.deps.accountFilter(position.userId));
     for (const position of positions) {
       try {
         await this.evaluatePosition(accessor, regime, position, now);

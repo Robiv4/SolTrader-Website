@@ -24,7 +24,7 @@ import { paperStats } from './ml-paper.js';
 export const MIN_TRAINING_ROWS_PER_KIND = 300;
 export const READY_TRAINING_ROWS_PER_KIND = 2_000;
 /** Replayed POSITION decision points per completed path (REPLAY_POSITION_OFFSETS_MS). Upper bound for the estimate. */
-const POSITION_POINTS_PER_PATH = 10;
+const POSITION_POINTS_PER_PATH = 12;
 const ACTIVE = ['QUEUED', 'PREPARING_DATASET', 'TRAINING', 'VALIDATING', 'SAVING'];
 
 const fail = (res: Response, status: number, message: string, data?: unknown) => res.status(status).json({ ok: false, error: message, ...(data ? { data } : {}) });

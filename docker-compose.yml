@@ -122,6 +122,8 @@ services:
       REDIS_URL: redis://redis:6379
       REDIS_PASSWORD: ${REDIS_PASSWORD:?REDIS_PASSWORD must be set}
       ML_PYTHON: /opt/ml-venv/bin/python
+      # Node heap below mem_limit (the Python trainer runs in the same container): an OOM stays inside ml-trainer.
+      NODE_OPTIONS: ${ML_TRAINER_NODE_OPTIONS:---max-old-space-size=1024}
       ML_TRAINER_TIMEOUT_MIN: ${ML_TRAINER_TIMEOUT_MIN:-120}
       ML_TRAINER_NICE: ${ML_TRAINER_NICE:-10}
       ML_TRAINER_THREADS: ${ML_TRAINER_THREADS:-1}

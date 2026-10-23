@@ -87,7 +87,7 @@ pnpm ml:autonomous:status
 ```
 
 **Dataset sources:**
-- **REPLAY:** for every completed outcome path of an ML snapshot (AGE_30S / BUY_DECISION), one ENTRY row at the snapshot and POSITION rows of a virtual reference position at 30 s … 30 min. The dynamics and position state come from the path prefix only.
+- **REPLAY:** for every completed outcome path of an ML snapshot (AGE_30S / BUY_DECISION), one ENTRY row at the snapshot and POSITION rows of a virtual reference position at 10 s, 20 s, 30 s … 30 min (the engine evaluates a position from 10 s). The dynamics and position state come from the path prefix only.
 - **LIVE:** MlAutonomousDecisionSnapshot rows labelled from the candidate's path.
 - The manifest is the full coverage report: rows per kind / origin, exclusions per reason, null share per feature, label uncertainty, period and regimes.
 
@@ -138,6 +138,18 @@ pnpm ml:autonomous:status
 - **Sizing** is a deterministic policy over the model outputs (no learned sizing model yet).
 - **Execution** is simulated with the PAPER cost model (no partial fills, no latency model in the autonomous ledger).
 - **SHADOW decisions** exist for entries only (no shadow exit decisions without positions).
+- **Position size vs. replay:** replayed POSITION rows use a 20 USD reference order, so their cost / impact features
+  (`costsIncurredPct`, `estimatedExitImpactPct`, `exitCapacityRatio`, …) only cover that size. Live positions much
+  larger than 20 USD are partly out of distribution until live POSITION rows of real sizes are collected.
+
+## End-to-end test
+
+`pnpm test:e2e` (local development database only; refuses any non-local `DATABASE_URL`, cleans up every row / file):
+empty state → data collection → dataset → web training job (real Python trainer) → listed, not active → check,
+SHADOW decisions, approval, manual selection → PAPER BUY / HOLD / SELL and settlement → second model while the first
+stays active → manual switch (open position stays with its own model) → corrupted model: no BUY, the mandatory
+protection still closes the open position. The market and history are synthetic (learnable on purpose): the test
+proves the pipeline, not profitability.
 
 ## Web training (Machine Learning → „+ Új ML modell tanítása”)
 

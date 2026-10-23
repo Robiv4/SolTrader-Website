@@ -22,7 +22,8 @@ export const AUTONOMOUS_LABEL_VERSION = 'AUTO-LABELS-v1';
 export const ENTRY_HORIZON_MS = 600_000;
 export const HOLD_HORIZON_MS = 120_000;
 /** Decision points of replayed positions (after the path start = entry). */
-export const REPLAY_POSITION_OFFSETS_MS = [30_000, 60_000, 120_000, 180_000, 300_000, 450_000, 600_000, 900_000, 1_200_000, 1_800_000];
+// 10 s / 20 s: the engine evaluates a position from 10 s after entry (POSITION_INTERVAL_MS) - no serving skew.
+export const REPLAY_POSITION_OFFSETS_MS = [10_000, 20_000, 30_000, 60_000, 120_000, 180_000, 300_000, 450_000, 600_000, 900_000, 1_200_000, 1_800_000];
 const PATH_END_MS = 3_600_000;
 
 export type LabelExclusion = 'NO_PATH' | 'BEFORE_PATH_START' | 'NO_PRICE_AT_T' | 'DATA_GAP' | 'OBSERVATION_ENDED' | 'HORIZON_BEYOND_PATH';

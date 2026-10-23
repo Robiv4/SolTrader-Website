@@ -15,6 +15,7 @@ export default defineConfig({
     // The API suites hit the shared development database in parallel; allow for its latency.
     testTimeout: 15_000,
     include: ['**/*.test.ts'],
-    exclude: ['**/node_modules/**', '**/dist/**', '**/.next/**'],
+    // End-to-end suites run alone (pnpm test:e2e).
+    exclude: ['**/node_modules/**', '**/dist/**', '**/.next/**', '**/*.e2e.test.ts'],
   },
 });
