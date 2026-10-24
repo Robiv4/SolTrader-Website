@@ -5,7 +5,7 @@ import { useEffect, useState } from 'react';
 
 import { apiRequest, date, DataTable, EmptyState, fmt, LoadingState, Metric, Panel, Status, useApi } from '../components';
 
-import { isJobActive, JOB_STATUS_TEXT, stepsDone, TRAINING_STEPS, trainingStepStates } from './ml-view';
+import { datasetProgressRows, isJobActive, JOB_STATUS_TEXT, stepsDone, TRAINING_STEPS, trainingStepStates } from './ml-view';
 
 const STEP_ICON: Record<string, string> = { done: '✓', active: '●', pending: '○', failed: '✕', skipped: '–' };
 const pct = (value: number | null | undefined) => (value == null ? '—' : `${(value * 100).toFixed(1)}%`);
@@ -96,6 +96,7 @@ export function TrainingProgress({ jobId, isAdmin, onOpenModel }: { jobId: strin
   if (!job) return <LoadingState />;
   const status = JOB_STATUS_TEXT[job.status] ?? { text: job.status, tone: 'neutral' };
   const steps = trainingStepStates(job);
+  const datasetProgress = datasetProgressRows(job.result?.progress);
   const cancel = async () => {
     await apiRequest(`/api/ml/autonomous/training-jobs/${job.id}/cancel`, { method: 'POST', body: '{}' }).catch(() => undefined);
     refresh();
@@ -110,6 +111,10 @@ export function TrainingProgress({ jobId, isAdmin, onOpenModel }: { jobId: strin
     <ol className="training-steps">
       {steps.map((step) => <li key={step.key} className={`training-step ${step.state}`}><span aria-hidden="true">{STEP_ICON[step.state]}</span> {step.label}</li>)}
     </ol>
+    {datasetProgress.length ? <div className="status-list">
+      <p className="sfield-help">Dataset-előkészítés (mért értékek{job.status === 'PREPARING_DATASET' ? ', frissül' : ''})</p>
+      {datasetProgress.map((row) => <div key={row.label} className="status-row"><span>{row.label}</span><span>{row.value}</span></div>)}
+    </div> : null}
     {job.error ? <p className="settings-warning">{job.error}</p> : null}
     {job.status === 'COMPLETED' && job.bundleVersion ? <p className="settings-message success">Elkészült: <strong>{job.bundleVersion}</strong> ({job.readiness}). A modell nem aktív; az alkalmasságot a Modellek fülön látod.</p> : null}
     <div className="card-toolbar">

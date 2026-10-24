@@ -16,6 +16,6 @@ export default defineConfig({
     testTimeout: 15_000,
     include: ['**/*.test.ts'],
     // End-to-end suites run alone (pnpm test:e2e).
-    exclude: ['**/node_modules/**', '**/dist/**', '**/.next/**', '**/*.e2e.test.ts'],
+    exclude: ['**/node_modules/**', '**/dist/**', '**/.next/**', '**/*.e2e.test.ts', '**/*.stress.test.ts'],
   },
 });

@@ -134,6 +134,29 @@ describe('training job runner', () => {
     expect((await prisma.mlTrainingJob.findUniqueOrThrow({ where: { id: stale.id } })).status).toBe('FAILED');
   });
 
+  it('long dataset preparation keeps the lease: another trainer\'s recovery never marks it INTERRUPTED', async () => {
+    const created = await job();
+    const leaseMs = 1_500;
+    let recoveredDuringBuild = 0;
+    await runner({
+      leaseMs, heartbeatMs: 50,
+      buildDataset: async (_client, options) => {
+        // 4.8 s of work in small steps (3x the lease), like a long paged build; progress is reported meanwhile.
+        for (let step = 0; step < 12; step += 1) {
+          await new Promise((resolve) => globalThis.setTimeout(resolve, 400));
+          options.onProgress?.({ phase: 'REPLAY', replay: { processed: step, total: 12 }, live: { processed: 0, total: 0 }, rows: { entry: step, position: step * 12, replay: step * 13, live: 0 }, excluded: 0, csv: { rowsWritten: 0, bytes: 0, chunks: 0 }, heapUsedMb: 50 });
+          await runner({ owner: 'other-trainer', leaseMs }).recover(false);
+          if ((await prisma.mlTrainingJob.findUniqueOrThrow({ where: { id: created.id } })).status !== 'PREPARING_DATASET') recoveredDuringBuild += 1;
+        }
+        return dataset({ entry: 900, position: 900 })();
+      },
+      runTrainer: async () => ({ exitCode: 0, status: 'TRAINED', failures: [], dir: '/x', bundleVersion: 'B', readiness: 'INSUFFICIENT_DATA', cancelled: false, timedOut: false, stderrTail: '' }),
+      register: async () => ({ bundleVersion: `ML-AUTO-LEASE-${run}`, readiness: 'INSUFFICIENT_DATA', artifactHash: 'x' }),
+    }).poll();
+    expect(recoveredDuringBuild).toBe(0);
+    expect((await prisma.mlTrainingJob.findUniqueOrThrow({ where: { id: created.id } })).status).toBe('COMPLETED');
+  });
+
   const python = defaultPython(repoRoot);
   it.skipIf(!existsSync(python))('END TO END: real Python trainer on a SYNTHETIC dataset -> real bundle, verified checksum, TRAINED registry row', async () => {
     const version = `AUTO-E2E-${run}`;

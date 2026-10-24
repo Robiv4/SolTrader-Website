@@ -7,11 +7,14 @@
  *  - a job is claimed with a conditional update (QUEUED -> PREPARING_DATASET); a heartbeat keeps the lease;
  *  - after a restart every job that was running is marked FAILED (INTERRUPTED) - never COMPLETED;
  *  - cancel: the flag is read on every heartbeat; the Python child process is killed;
- *  - the stage shown is the real pipeline stage (no invented percentage or remaining time).
+ *  - the stage shown is the real pipeline stage (no invented percentage or remaining time); while the dataset is being
+ *    prepared the measured counts (snapshots read, rows, CSV bytes, heap) are stored in result.progress;
+ *  - the dataset build is streamed (bounded memory) and yields to the event loop on every page, so the heartbeat
+ *    keeps the lease during long builds; a cancel aborts the build (nothing is registered, own temp dirs removed).
  */
 import type { Prisma, PrismaClient } from '@prisma/client';
 
-import { buildAutonomousDatasetVersion, registerTrainerOutput, runAutonomousTrainer, sha256, type DatasetBuildResult, type TrainerResult } from './pipeline.js';
+import { buildAutonomousDatasetVersion, registerTrainerOutput, removeStaleBuildDirs, runAutonomousTrainer, sha256File, type DatasetBuildOptions, type DatasetBuildResult, type DatasetProgress, type TrainerResult } from './pipeline.js';
 
 export const TRAINING_RUNNING_STATUSES = ['PREPARING_DATASET', 'TRAINING', 'VALIDATING', 'SAVING'] as const;
 export const TRAINING_ACTIVE_STATUSES = ['QUEUED', ...TRAINING_RUNNING_STATUSES] as const;
@@ -19,6 +22,12 @@ export const TRAINING_TERMINAL_STATUSES = ['COMPLETED', 'FAILED', 'CANCELLED'] a
 /** Same gate as the Python trainer (MIN_ROWS_PER_KIND): fewer rows -> the job fails before training. */
 export const MIN_TRAINING_ROWS_PER_KIND = 300;
 const MAX_LOG_ENTRIES = 200;
+/** Progress rows are written at most this often (plus on every phase change). */
+const PROGRESS_WRITE_MS = 5_000;
+const PHASE_TEXT: Record<DatasetProgress['phase'], string> = {
+  COUNTING: 'Források számlálása', REPLAY: 'REPLAY sorok előállítása (outcome-pályák)', LIVE: 'LIVE sorok előállítása (döntési snapshotok)', WRITING_CSV: 'CSV írása (rendezett összefésülés)',
+  MANIFEST: 'Manifest és checksum készítése', REGISTERING: 'Dataset regisztrálása', DONE: 'Dataset kész',
+};
 
 type Job = Awaited<ReturnType<PrismaClient['mlTrainingJob']['findUniqueOrThrow']>>;
 
@@ -38,7 +47,7 @@ export interface JobRunnerDeps {
   kind?: string;
   now?: () => number;
   /** Test hooks (default: the real pipeline). */
-  buildDataset?: (prisma: PrismaClient, options: { rootDir: string; actor: string }) => Promise<DatasetBuildResult>;
+  buildDataset?: (prisma: PrismaClient, options: DatasetBuildOptions) => Promise<DatasetBuildResult>;
   runTrainer?: (options: Parameters<typeof runAutonomousTrainer>[0]) => Promise<TrainerResult>;
   register?: (prisma: PrismaClient, options: { rootDir: string; dir: string; datasetVersion: string; actor: string }) => Promise<{ bundleVersion: string; readiness: string; artifactHash: string }>;
 }
@@ -46,7 +55,7 @@ export interface JobRunnerDeps {
 const STAGE_TEXT: Record<string, string> = {
   PREPARING_DATASET: 'Dataset előkészítése', ENTRY_MODELS: 'Belépési (entry) modellek tanítása', EXIT_MODELS: 'Kilépési (exit) modellek tanítása',
   POSITION_SIZING: 'Pozícióméretezés beállítása (szabály a modellkimenetekből, nem külön tanult modell)', VALIDATION: 'Validáció (export-paritás, backtest, stressztesztek, alkalmasság)',
-  SAVING: 'Modellcsomag mentése', REGISTERING: 'Checksum ellenőrzése és regisztrálás',
+  SAVING: 'Modellcsomag mentése', REGISTERING: 'Checksum ellenőrzése és regisztrálás', LOADING_DATASET: 'Tanítóadat betöltése (darabokban, lemezre leképezett mátrixokkal)',
 };
 
 export class TrainingJobRunner {
@@ -55,6 +64,7 @@ export class TrainingJobRunner {
   private current: { id: string; abort: globalThis.AbortController } | null = null;
   /** Log / stage writes are serialized (read-modify-write of the JSON log must never lose an entry). */
   private writes: Promise<unknown> = Promise.resolve();
+  private lastProgress: DatasetProgress | null = null;
   readonly metrics = { claimed: 0, completed: 0, failed: 0, cancelled: 0, interrupted: 0, lastPollAt: null as number | null };
 
   constructor(private readonly deps: JobRunnerDeps) {}
@@ -64,7 +74,7 @@ export class TrainingJobRunner {
   }
 
   start(intervalMs = 5_000) {
-    void this.recover(true).then(() => this.poll());
+    void this.recover(true).then(() => this.cleanup()).then(() => this.poll());
     this.timer = globalThis.setInterval(() => void this.poll(), intervalMs);
   }
 
@@ -99,6 +109,13 @@ export class TrainingJobRunner {
     if (status === 'COMPLETED') this.metrics.completed += 1;
     else if (status === 'CANCELLED') this.metrics.cancelled += 1;
     else this.metrics.failed += 1;
+  }
+
+  /** Temporary work directories of jobs that can no longer finish (only directories carrying such a job's marker). */
+  async cleanup() {
+    const removed = await removeStaleBuildDirs(this.deps.prisma, this.deps.rootDir).catch(() => []);
+    if (removed.length) this.deps.logger.info({ removed }, 'Removed temporary training work directories of finished jobs');
+    return removed;
   }
 
   /**
@@ -153,18 +170,18 @@ export class TrainingJobRunner {
     const actor = `web:${job.requestedBy}`;
     try {
       await this.appendLog(job.id, 'PREPARING_DATASET', STAGE_TEXT.PREPARING_DATASET);
-      const dataset = await this.prepareDataset(job, actor);
+      const dataset = await this.prepareDataset(job, actor, abort.signal);
       const coverage = (dataset.manifest.coverage ?? {}) as { entry?: { total?: number }; position?: { total?: number }; excluded?: Record<string, number> };
       const entryRows = coverage.entry?.total ?? 0;
       const positionRows = coverage.position?.total ?? 0;
-      await this.appendLog(job.id, 'PREPARING_DATASET', `Dataset ${dataset.version}: ${dataset.rows} sor (belépés ${entryRows}, pozíció ${positionRows})`, { datasetVersion: dataset.version, result: { dataset: dataset.version, rows: dataset.rows, entryRows, positionRows, excluded: coverage.excluded ?? {} } as Prisma.InputJsonValue });
+      await this.appendLog(job.id, 'PREPARING_DATASET', `Dataset ${dataset.version}: ${dataset.rows} sor (belépés ${entryRows}, pozíció ${positionRows})`, { datasetVersion: dataset.version, result: { dataset: dataset.version, rows: dataset.rows, entryRows, positionRows, excluded: coverage.excluded ?? {}, progress: this.lastProgress } as unknown as Prisma.InputJsonValue });
       if (await this.cancelled(job.id, abort)) return this.finish(job.id, 'CANCELLED', { error: 'Megszakítva a felhasználó kérésére' });
       if (!this.deps.allowSmall && (entryRows < MIN_TRAINING_ROWS_PER_KIND || positionRows < MIN_TRAINING_ROWS_PER_KIND)) {
         return this.finish(job.id, 'FAILED', { error: `NINCS ELÉG TANÍTÓADAT: belépési minta ${entryRows}/${MIN_TRAINING_ROWS_PER_KIND}, pozíció minta ${positionRows}/${MIN_TRAINING_ROWS_PER_KIND}`, result: { dataset: dataset.version, entryRows, positionRows, excluded: coverage.excluded ?? {} } });
       }
       await this.deps.prisma.mlTrainingJob.updateMany({ where: { id: job.id, leaseOwner: this.deps.owner }, data: { status: 'TRAINING', stage: 'TRAINING' } });
       const trainer = await (this.deps.runTrainer ?? runAutonomousTrainer)({
-        python: this.deps.python, rootDir: this.deps.rootDir, datasetDir: dataset.directory, timeoutMs: this.deps.timeoutMs, signal: abort.signal, niceLevel: this.deps.niceLevel, threads: this.deps.threads, allowSmall: this.deps.allowSmall,
+        python: this.deps.python, rootDir: this.deps.rootDir, datasetDir: dataset.directory, timeoutMs: this.deps.timeoutMs, signal: abort.signal, jobId: job.id, niceLevel: this.deps.niceLevel, threads: this.deps.threads, allowSmall: this.deps.allowSmall,
         onStage: (stage) => {
           const status = stage === 'VALIDATION' ? 'VALIDATING' : stage === 'SAVING' ? 'SAVING' : 'TRAINING';
           void this.appendLog(job.id, stage, STAGE_TEXT[stage] ?? stage, { status, stage }).catch(() => undefined);
@@ -181,6 +198,7 @@ export class TrainingJobRunner {
       const registered = await (this.deps.register ?? registerTrainerOutput)(this.deps.prisma, { rootDir: this.deps.rootDir, dir: trainer.dir, datasetVersion: dataset.version, actor });
       return this.finish(job.id, 'COMPLETED', { bundleVersion: registered.bundleVersion, readiness: registered.readiness, result: { dataset: dataset.version, entryRows, positionRows, bundleVersion: registered.bundleVersion, readiness: registered.readiness, artifactHash: registered.artifactHash } });
     } catch (error) {
+      if (abort.signal.aborted && await this.cancelled(job.id, abort)) return this.finish(job.id, 'CANCELLED', { error: 'Megszakítva a felhasználó kérésére (dataset-előkészítés leállítva, semmi nincs regisztrálva)' });
       return this.finish(job.id, 'FAILED', { error: `HIBA: ${error instanceof Error ? error.message.slice(0, 400) : String(error)}` });
     } finally {
       globalThis.clearInterval(heartbeat);
@@ -195,17 +213,35 @@ export class TrainingJobRunner {
   }
 
   /** Requested dataset (hash verified) or a new immutable dataset from the current data. */
-  private async prepareDataset(job: Job, actor: string): Promise<DatasetBuildResult> {
+  private async prepareDataset(job: Job, actor: string, signal: globalThis.AbortSignal): Promise<DatasetBuildResult> {
     if (job.datasetVersion) {
       const row = await this.deps.prisma.mlDatasetVersion.findUnique({ where: { version: job.datasetVersion } });
       if (!row || row.featureVersion !== 'ML-FEATURES-AUTONOMOUS-v1') throw new Error(`Autonomous dataset ${job.datasetVersion} not found`);
-      const { readFileSync } = await import('node:fs');
       const path = await import('node:path');
       const file = path.join(this.deps.rootDir, row.filePath);
-      if (sha256(readFileSync(file)) !== row.fileHash) throw new Error('Dataset file hash mismatch (modified after creation)');
+      if (await sha256File(file) !== row.fileHash) throw new Error('Dataset file hash mismatch (modified after creation)');
       return { version: row.version, rows: row.rowCount, directory: path.dirname(file), fileHash: row.fileHash, manifest: row.manifest as Record<string, unknown> };
     }
-    return (this.deps.buildDataset ?? buildAutonomousDatasetVersion)(this.deps.prisma, { rootDir: this.deps.rootDir, actor });
+    let lastWrite = 0;
+    this.lastProgress = null;
+    let lastPhase: string | null = null;
+    const onProgress = (progress: DatasetProgress) => {
+      const phaseChanged = progress.phase !== lastPhase;
+      if (!phaseChanged && this.now() - lastWrite < PROGRESS_WRITE_MS) return;
+      lastWrite = this.now();
+      lastPhase = progress.phase;
+      const data = { result: { progress } as unknown as Prisma.InputJsonValue };
+      this.lastProgress = progress;
+      // Serialized with the log writes (one read-modify-write at a time); a failed progress write never fails the build.
+      if (phaseChanged) void this.appendLog(job.id, 'PREPARING_DATASET', `${PHASE_TEXT[progress.phase]} – REPLAY ${progress.replay.processed}/${progress.replay.total}, LIVE ${progress.live.processed}/${progress.live.total}, sorok: belépés ${progress.rows.entry}, pozíció ${progress.rows.position}`, data).catch(() => undefined);
+      else {
+        const next = this.writes.then(() => this.deps.prisma.mlTrainingJob.updateMany({ where: { id: job.id, leaseOwner: this.deps.owner }, data: { ...data, heartbeatAt: new Date(this.now()) } }));
+        this.writes = next.catch(() => undefined);
+      }
+    };
+    const dataset = await (this.deps.buildDataset ?? buildAutonomousDatasetVersion)(this.deps.prisma, { rootDir: this.deps.rootDir, actor, jobId: job.id, onProgress, signal });
+    await this.writes;
+    return dataset;
   }
 
   health() {

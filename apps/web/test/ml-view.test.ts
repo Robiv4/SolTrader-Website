@@ -4,7 +4,7 @@
  */
 import { describe, expect, it } from 'vitest';
 
-import { isJobActive, stepsDone, SUITABILITY_TEXT, tradingBanner, trainingStepStates } from '../app/machine-learning/ml-view';
+import { datasetProgressRows, isJobActive, stepsDone, SUITABILITY_TEXT, tradingBanner, trainingStepStates } from '../app/machine-learning/ml-view';
 
 const log = (...stages: string[]) => stages.map((stage, index) => ({ at: new Date(1_000 * index).toISOString(), stage, message: stage }));
 
@@ -54,5 +54,17 @@ describe('model suitability', () => {
   it('research models are never shown as selectable', () => {
     for (const code of ['INSUFFICIENT_DATA', 'RESEARCH_ONLY', 'NOT_CHECKED', 'CHECK_RUNNING', 'CHECK_COMPLETE', 'RETIRED']) expect(SUITABILITY_TEXT[code].text).not.toBe('Kereskedésre választható');
     expect(SUITABILITY_TEXT.APPROVED.text).toBe('Kereskedésre választható');
+  });
+});
+
+describe('dataset preparation progress', () => {
+  it('shows only the measured counts reported by the pipeline (nothing when there is no report)', () => {
+    expect(datasetProgressRows(null)).toEqual([]);
+    const rows = datasetProgressRows({ phase: 'REPLAY', replay: { processed: 1200, total: 84000 }, live: { processed: 0, total: 5000 }, rows: { entry: 1100, position: 12000, replay: 13100, live: 0 }, excluded: 37, csv: { rowsWritten: 0, bytes: 0, chunks: 0 }, heapUsedMb: 143 });
+    const byLabel = Object.fromEntries(rows.map((row) => [row.label, row.value]));
+    expect(byLabel['Fázis']).toBe('Snapshotok feldolgozása – REPLAY sorok');
+    expect(byLabel['Feldolgozott ML snapshotok (REPLAY)']).toBe(`${(1200).toLocaleString('hu-HU')} / ${(84000).toLocaleString('hu-HU')}`);
+    expect(byLabel['Memória (Node heap)']).toBe('143 MB');
+    expect(rows.some((row) => row.value.includes('%'))).toBe(false);
   });
 });

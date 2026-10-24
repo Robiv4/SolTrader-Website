@@ -78,105 +78,202 @@ const csvValue = (value: unknown) => {
   return /[",\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
 };
 
+export type DatasetExcludeFn = (reason: string) => void;
+
+/** ENTRY + replayed POSITION rows of one replay source (exclusions are reported, never guessed). */
+export function replaySourceRows(source: ReplaySource, exclude: DatasetExcludeFn): AutonomousDatasetRow[] {
+  const rows: AutonomousDatasetRow[] = [];
+  if (!source.snapshot.validForTraining) {
+    exclude('REPLAY_SNAPSHOT_INVALID');
+    return rows;
+  }
+  if (!source.path || typeof source.path.startAt !== 'number' || !Array.isArray(source.path.buckets) || !(source.path.entryPrice > 0)) {
+    exclude('REPLAY_PATH_INVALID');
+    return rows;
+  }
+  const t0 = source.snapshot.snapshotAt;
+  if (t0 !== source.path.startAt) {
+    exclude('REPLAY_PATH_START_MISMATCH');
+    return rows;
+  }
+  const at0 = pathPriceAt(source.path, t0, 'known');
+  const entrySnapshot = buildAutonomousSnapshot({ kind: 'ENTRY', at: t0, base: source.snapshot, samples: pathSamples(source.path, t0), quote: at0 ? { price: at0.price, liquidityUsd: at0.liquidityUsd, at: t0 } : null });
+  const entry = labelEntry(source.path, t0);
+  if (entry.status === 'LABELLED' && entrySnapshot.validForTraining) rows.push({ rowId: `R:${source.snapshot.id}:E`, groupId: source.mint, kind: 'ENTRY', origin: 'REPLAY', at: t0, labelEnd: entry.labelEndAt, features: entrySnapshot.features, labels: entryLabels(entry) });
+  else exclude(`ENTRY_${entry.exclusion ?? 'FEATURES_INVALID'}`);
+  for (const offset of REPLAY_POSITION_OFFSETS_MS) {
+    const t = t0 + offset;
+    const position = replayPosition(source.path, t);
+    const known = pathPriceAt(source.path, t, 'known');
+    if (!position || !known) {
+      exclude('POSITION_NO_PRICE_AT_T');
+      continue;
+    }
+    const label = labelPosition(source.path, t, position);
+    if (label.status !== 'LABELLED') {
+      exclude(`POSITION_${label.exclusion}`);
+      continue;
+    }
+    const snapshot = buildAutonomousSnapshot({ kind: 'POSITION', at: t, base: source.snapshot, samples: pathSamples(source.path, t), quote: { price: known.price, liquidityUsd: known.liquidityUsd, at: t }, position });
+    if (!snapshot.validForTraining) {
+      exclude('POSITION_FEATURES_INVALID');
+      continue;
+    }
+    rows.push({ rowId: `R:${source.snapshot.id}:P${offset / 1000}`, groupId: source.mint, kind: 'POSITION', origin: 'REPLAY', at: t, labelEnd: label.labelEndAt, features: snapshot.features, labels: positionLabels(label) });
+  }
+  return rows;
+}
+
+/** The labelled row of one live decision snapshot, or null (exclusion reported). */
+export function liveSourceRow(source: LiveSource, exclude: DatasetExcludeFn): AutonomousDatasetRow | null {
+  if (!source.validForTraining) {
+    exclude('LIVE_SNAPSHOT_INVALID');
+    return null;
+  }
+  if (source.kind === 'ENTRY') {
+    const label = labelEntry(source.path, source.at);
+    if (label.status !== 'LABELLED') {
+      exclude(`LIVE_ENTRY_${label.exclusion}`);
+      return null;
+    }
+    return { rowId: `L:${source.id}`, groupId: source.mint, kind: 'ENTRY', origin: 'LIVE', at: source.at, labelEnd: label.labelEndAt, features: source.features, labels: entryLabels(label) };
+  }
+  if (!source.position) {
+    exclude('LIVE_POSITION_STATE_MISSING');
+    return null;
+  }
+  const label = labelPosition(source.path, source.at, source.position);
+  if (label.status !== 'LABELLED') {
+    exclude(`LIVE_POSITION_${label.exclusion}`);
+    return null;
+  }
+  return { rowId: `L:${source.id}`, groupId: source.mint, kind: 'POSITION', origin: 'LIVE', at: source.at, labelEnd: label.labelEndAt, features: source.features, labels: positionLabels(label) };
+}
+
+/** Dataset row order: time, then row id (deterministic; the streaming builder merges sorted chunks with it). */
+export const compareAutonomousRows = (a: { at: number; rowId: string }, b: { at: number; rowId: string }) => a.at - b.at || a.rowId.localeCompare(b.rowId);
+
+const FEATURE_NAMES = ML_AUTONOMOUS_FEATURE_SCHEMA.map((spec) => spec.name);
+
+export const autonomousCsvHeader = () => [...AUTONOMOUS_META_COLUMNS, ...AUTONOMOUS_LABEL_COLUMNS, ...FEATURE_NAMES].join(',');
+
+export function autonomousCsvLine(row: AutonomousDatasetRow) {
+  return [
+    row.rowId, row.groupId, row.kind, row.origin, row.at, row.labelEnd, row.features.marketRegime ?? '',
+    ...AUTONOMOUS_LABEL_COLUMNS.map((name) => row.labels[name]),
+    ...FEATURE_NAMES.map((name) => row.features[name]),
+  ].map(csvValue).join(',');
+}
+
+export const autonomousRegimeKey = (row: AutonomousDatasetRow) => String(row.features.marketRegime ?? 'UNKNOWN');
+
+/**
+ * Incremental manifest statistics (bounded memory: counters per feature / reason / regime and the set of token ids).
+ * `count()` is order independent; `ordered()` must be called once per row in the final (sorted) row order - it fixes the
+ * period and the regime key order exactly like the in-memory builder did.
+ */
+export class AutonomousDatasetStats {
+  rows = 0;
+  private readonly groups = new Set<string>();
+  private readonly excluded: Record<string, number> = {};
+  private readonly nulls = new Array<number>(FEATURE_NAMES.length).fill(0);
+  private readonly regimeCounts = new Map<string, number>();
+  private readonly regimeOrder: string[] = [];
+  private first: number | null = null;
+  private last: number | null = null;
+  private readonly counts = { entry: 0, entryReplay: 0, entryLive: 0, positives: 0, position: 0, positionReplay: 0, positionLive: 0, holdBetter: 0, liquidityAssumed: 0, coarse: 0 };
+
+  readonly exclude: DatasetExcludeFn = (reason) => {
+    this.excluded[reason] = (this.excluded[reason] ?? 0) + 1;
+  };
+
+  get excludedTotal() {
+    return Object.values(this.excluded).reduce((sum, value) => sum + value, 0);
+  }
+
+  get entryRows() {
+    return this.counts.entry;
+  }
+
+  get positionRows() {
+    return this.counts.position;
+  }
+
+  get replayRows() {
+    return this.counts.entryReplay + this.counts.positionReplay;
+  }
+
+  get liveRows() {
+    return this.counts.entryLive + this.counts.positionLive;
+  }
+
+  count(row: AutonomousDatasetRow) {
+    this.rows += 1;
+    this.groups.add(row.groupId);
+    for (let index = 0; index < FEATURE_NAMES.length; index += 1) {
+      const value = row.features[FEATURE_NAMES[index]];
+      if (value === null || value === undefined) this.nulls[index] += 1;
+    }
+    const regime = autonomousRegimeKey(row);
+    this.regimeCounts.set(regime, (this.regimeCounts.get(regime) ?? 0) + 1);
+    const counts = this.counts;
+    if (row.kind === 'ENTRY') {
+      counts.entry += 1;
+      if (row.origin === 'REPLAY') counts.entryReplay += 1;
+      else counts.entryLive += 1;
+      if ((row.labels.entry_net_pct ?? 0) > 0) counts.positives += 1;
+    } else {
+      counts.position += 1;
+      if (row.origin === 'REPLAY') counts.positionReplay += 1;
+      else counts.positionLive += 1;
+      if ((row.labels.hold_advantage_pct ?? 0) > 0) counts.holdBetter += 1;
+    }
+    if (row.labels.liquidity_assumed === 1) counts.liquidityAssumed += 1;
+    if ((row.labels.label_resolution_ms ?? 0) >= 15_000) counts.coarse += 1;
+  }
+
+  ordered(at: number, regimeKey: string) {
+    if (this.first === null) this.first = at;
+    this.last = at;
+    if (!this.regimeOrder.includes(regimeKey)) this.regimeOrder.push(regimeKey);
+  }
+
+  manifest(version: string): Record<string, unknown> {
+    const rows = this.rows;
+    const counts = this.counts;
+    return {
+      version, featureVersion: ML_AUTONOMOUS_FEATURE_VERSION, labelVersion: AUTONOMOUS_LABEL_VERSION, target: 'AUTONOMOUS_NET_PNL',
+      rows, groups: this.groups.size,
+      coverage: {
+        entry: { total: counts.entry, replay: counts.entryReplay, live: counts.entryLive, netPositive: counts.positives, netPositiveShare: counts.entry ? counts.positives / counts.entry : null },
+        position: { total: counts.position, replay: counts.positionReplay, live: counts.positionLive, holdBetter: counts.holdBetter },
+        excluded: { ...this.excluded }, featureNullShare: Object.fromEntries(FEATURE_NAMES.map((name, index) => [name, rows ? Math.round(1000 * this.nulls[index] / rows) / 1000 : null])),
+        labelUncertainty: { liquidityAssumed: counts.liquidityAssumed, coarseHorizonResolution: counts.coarse },
+        period: rows && this.first !== null && this.last !== null ? { from: new Date(this.first).toISOString(), to: new Date(this.last).toISOString() } : null,
+        regimes: Object.fromEntries(this.regimeOrder.map((key) => [key, this.regimeCounts.get(key) ?? 0])),
+      },
+    };
+  }
+}
+
+/**
+ * In-memory builder (small datasets and tests). The streaming builder in apps/worker (training/dataset-writer.ts)
+ * produces the same rows, CSV bytes and manifest from paged sources in bounded memory; both share the functions above.
+ */
 export function buildAutonomousDataset(input: { version: string; replay: ReplaySource[]; live: LiveSource[] }): AutonomousDatasetResult {
   const rows: AutonomousDatasetRow[] = [];
-  const excluded: Record<string, number> = {};
-  const exclude = (reason: string) => {
-    excluded[reason] = (excluded[reason] ?? 0) + 1;
-  };
-
-  for (const source of input.replay) {
-    if (!source.snapshot.validForTraining) {
-      exclude('REPLAY_SNAPSHOT_INVALID');
-      continue;
-    }
-    if (!source.path || typeof source.path.startAt !== 'number' || !Array.isArray(source.path.buckets) || !(source.path.entryPrice > 0)) {
-      exclude('REPLAY_PATH_INVALID');
-      continue;
-    }
-    const t0 = source.snapshot.snapshotAt;
-    if (t0 !== source.path.startAt) {
-      exclude('REPLAY_PATH_START_MISMATCH');
-      continue;
-    }
-    const at0 = pathPriceAt(source.path, t0, 'known');
-    const entrySnapshot = buildAutonomousSnapshot({ kind: 'ENTRY', at: t0, base: source.snapshot, samples: pathSamples(source.path, t0), quote: at0 ? { price: at0.price, liquidityUsd: at0.liquidityUsd, at: t0 } : null });
-    const entry = labelEntry(source.path, t0);
-    if (entry.status === 'LABELLED' && entrySnapshot.validForTraining) rows.push({ rowId: `R:${source.snapshot.id}:E`, groupId: source.mint, kind: 'ENTRY', origin: 'REPLAY', at: t0, labelEnd: entry.labelEndAt, features: entrySnapshot.features, labels: entryLabels(entry) });
-    else exclude(`ENTRY_${entry.exclusion ?? 'FEATURES_INVALID'}`);
-    for (const offset of REPLAY_POSITION_OFFSETS_MS) {
-      const t = t0 + offset;
-      const position = replayPosition(source.path, t);
-      const known = pathPriceAt(source.path, t, 'known');
-      if (!position || !known) {
-        exclude('POSITION_NO_PRICE_AT_T');
-        continue;
-      }
-      const label = labelPosition(source.path, t, position);
-      if (label.status !== 'LABELLED') {
-        exclude(`POSITION_${label.exclusion}`);
-        continue;
-      }
-      const snapshot = buildAutonomousSnapshot({ kind: 'POSITION', at: t, base: source.snapshot, samples: pathSamples(source.path, t), quote: { price: known.price, liquidityUsd: known.liquidityUsd, at: t }, position });
-      if (!snapshot.validForTraining) {
-        exclude('POSITION_FEATURES_INVALID');
-        continue;
-      }
-      rows.push({ rowId: `R:${source.snapshot.id}:P${offset / 1000}`, groupId: source.mint, kind: 'POSITION', origin: 'REPLAY', at: t, labelEnd: label.labelEndAt, features: snapshot.features, labels: positionLabels(label) });
-    }
-  }
-
+  const stats = new AutonomousDatasetStats();
+  for (const source of input.replay) rows.push(...replaySourceRows(source, stats.exclude));
   for (const source of input.live) {
-    if (!source.validForTraining) {
-      exclude('LIVE_SNAPSHOT_INVALID');
-      continue;
-    }
-    if (source.kind === 'ENTRY') {
-      const label = labelEntry(source.path, source.at);
-      if (label.status !== 'LABELLED') {
-        exclude(`LIVE_ENTRY_${label.exclusion}`);
-        continue;
-      }
-      rows.push({ rowId: `L:${source.id}`, groupId: source.mint, kind: 'ENTRY', origin: 'LIVE', at: source.at, labelEnd: label.labelEndAt, features: source.features, labels: entryLabels(label) });
-    } else {
-      if (!source.position) {
-        exclude('LIVE_POSITION_STATE_MISSING');
-        continue;
-      }
-      const label = labelPosition(source.path, source.at, source.position);
-      if (label.status !== 'LABELLED') {
-        exclude(`LIVE_POSITION_${label.exclusion}`);
-        continue;
-      }
-      rows.push({ rowId: `L:${source.id}`, groupId: source.mint, kind: 'POSITION', origin: 'LIVE', at: source.at, labelEnd: label.labelEndAt, features: source.features, labels: positionLabels(label) });
-    }
+    const row = liveSourceRow(source, stats.exclude);
+    if (row) rows.push(row);
   }
-
-  rows.sort((a, b) => a.at - b.at || a.rowId.localeCompare(b.rowId));
-  const featureNames = ML_AUTONOMOUS_FEATURE_SCHEMA.map((spec) => spec.name);
-  const lines = [[...AUTONOMOUS_META_COLUMNS, ...AUTONOMOUS_LABEL_COLUMNS, ...featureNames].join(',')];
+  rows.sort(compareAutonomousRows);
+  const lines = [autonomousCsvHeader()];
   for (const row of rows) {
-    lines.push([
-      row.rowId, row.groupId, row.kind, row.origin, row.at, row.labelEnd, row.features.marketRegime ?? '',
-      ...AUTONOMOUS_LABEL_COLUMNS.map((name) => row.labels[name]),
-      ...featureNames.map((name) => row.features[name]),
-    ].map(csvValue).join(','));
+    stats.count(row);
+    stats.ordered(row.at, autonomousRegimeKey(row));
+    lines.push(autonomousCsvLine(row));
   }
-  const count = (kind: string, origin?: string) => rows.filter((row) => row.kind === kind && (!origin || row.origin === origin)).length;
-  const nullShare = Object.fromEntries(featureNames.map((name) => [name, rows.length ? Math.round(1000 * rows.filter((row) => row.features[name] === null || row.features[name] === undefined).length / rows.length) / 1000 : null]));
-  const entryRows = rows.filter((row) => row.kind === 'ENTRY');
-  const positives = entryRows.filter((row) => (row.labels.entry_net_pct ?? 0) > 0).length;
-  const manifest = {
-    version: input.version, featureVersion: ML_AUTONOMOUS_FEATURE_VERSION, labelVersion: AUTONOMOUS_LABEL_VERSION, target: 'AUTONOMOUS_NET_PNL',
-    rows: rows.length, groups: new Set(rows.map((row) => row.groupId)).size,
-    coverage: {
-      entry: { total: entryRows.length, replay: count('ENTRY', 'REPLAY'), live: count('ENTRY', 'LIVE'), netPositive: positives, netPositiveShare: entryRows.length ? positives / entryRows.length : null },
-      position: { total: count('POSITION'), replay: count('POSITION', 'REPLAY'), live: count('POSITION', 'LIVE'), holdBetter: rows.filter((row) => row.kind === 'POSITION' && (row.labels.hold_advantage_pct ?? 0) > 0).length },
-      excluded, featureNullShare: nullShare,
-      labelUncertainty: { liquidityAssumed: rows.filter((row) => row.labels.liquidity_assumed === 1).length, coarseHorizonResolution: rows.filter((row) => (row.labels.label_resolution_ms ?? 0) >= 15_000).length },
-      period: rows.length ? { from: new Date(rows[0].at).toISOString(), to: new Date(rows[rows.length - 1].at).toISOString() } : null,
-      regimes: rows.reduce<Record<string, number>>((counts, row) => ({ ...counts, [String(row.features.marketRegime ?? 'UNKNOWN')]: (counts[String(row.features.marketRegime ?? 'UNKNOWN')] ?? 0) + 1 }), {}),
-    },
-  };
-  return { rows, csv: `${lines.join('\n')}\n`, manifest };
+  return { rows, csv: `${lines.join('\n')}\n`, manifest: stats.manifest(input.version) };
 }

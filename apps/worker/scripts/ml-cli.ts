@@ -12,7 +12,9 @@
  *   pnpm ml:status                      shadow collection / model status
  *   pnpm ml:test                        Python tests (split / purge / reproducibility / export parity)
  *   pnpm ml:autonomous:dataset          Autonomous ML dataset (ML-FEATURES-AUTONOMOUS-v1, AUTO-LABELS-v1): replayed entries /
- *                                       positions from outcome paths + labelled live decision snapshots
+ *                                       positions from outcome paths + labelled live decision snapshots (streamed,
+ *                                       bounded memory; the same builder as the web training; refused while a web
+ *                                       training job runs unless --force)
  *   pnpm ml:autonomous:train [--dataset AUTO-DATASET-vN] [--seed 42]
  *                                       train the Autonomous bundle (entry value / downside / profit, exit value / hold),
  *                                       register it as TRAINED (never approved, selected or activated automatically)
@@ -36,7 +38,7 @@ import { createClient } from 'redis';
 
 import { chunk, indexPaperTrades, loadAllPages, loadPaperTradesInBatches, matchPaperTrade, paperProvenance } from '../src/ml/dataset-source.js';
 import { ML_TRAINING_KEY, registerTrainedModel } from '../src/ml/model-registration.js';
-import { buildAutonomousDatasetVersion, defaultPython, registerTrainerOutput, runAutonomousTrainer } from '../src/training/pipeline.js';
+import { buildAutonomousDatasetVersion, defaultPython, registerTrainerOutput, runAutonomousTrainer, sha256File } from '../src/training/pipeline.js';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
 // Server-side configuration (DATABASE_URL, REDIS_URL) from the repository .env; values are never printed.
@@ -264,10 +266,28 @@ function test() {
   process.exitCode = run.status ?? 1;
 }
 
+/** The web training (ml-trainer) and the CLI share one machine: never two heavy dataset / training runs at once. */
+async function refuseWhileWebTrainingRuns(prisma: PrismaClient) {
+  const active = await prisma.mlTrainingJob.findUnique({ where: { activeKey: 'ACTIVE' }, select: { id: true, status: true } });
+  if (active && !args.includes('--force')) throw new Error(`A web training job is active (${active.id}, ${active.status}); wait for it or cancel it (--force overrides).`);
+}
+
 async function autonomousDataset() {
   const prisma = new PrismaClient();
   try {
-    const built = await buildAutonomousDatasetVersion(prisma, { rootDir: ROOT, actor, version: args.includes('--version') ? option('version', '') : undefined });
+    await refuseWhileWebTrainingRuns(prisma);
+    let lastPhase = '';
+    let lastAt = 0;
+    // Same streaming builder as the web training (one implementation); real counts on stderr.
+    const built = await buildAutonomousDatasetVersion(prisma, {
+      rootDir: ROOT, actor, version: args.includes('--version') ? option('version', '') : undefined,
+      onProgress: (progress) => {
+        if (progress.phase === lastPhase && Date.now() - lastAt < 5_000) return;
+        lastPhase = progress.phase;
+        lastAt = Date.now();
+        console.error(`dataset: ${progress.phase} replay ${progress.replay.processed}/${progress.replay.total} live ${progress.live.processed}/${progress.live.total} rows entry=${progress.rows.entry} position=${progress.rows.position} csv=${progress.csv.rowsWritten} rows ${Math.round(progress.csv.bytes / 1_048_576)} MB heap=${progress.heapUsedMb} MB`);
+      },
+    });
     await audit(prisma, 'ml_autonomous_dataset_created', { version: built.version, rows: built.rows, fileHash: built.fileHash });
     console.log(JSON.stringify({ version: built.version, rows: built.rows, coverage: built.manifest.coverage, directory: path.relative(ROOT, built.directory) }, (key, value) => (key === 'featureNullShare' ? undefined : value), 2));
   } finally {
@@ -284,7 +304,8 @@ async function autonomousTrain() {
     const datasetRow = await prisma.mlDatasetVersion.findUnique({ where: { version } });
     const directory = path.join(ML_DIR, 'autonomous-datasets', version);
     if (!datasetRow || datasetRow.featureVersion !== ML_AUTONOMOUS_FEATURE_VERSION || !existsSync(path.join(directory, 'dataset.csv'))) throw new Error(`Autonomous dataset ${version} not found`);
-    if (sha256(readFileSync(path.join(directory, 'dataset.csv'))) !== datasetRow.fileHash) throw new Error('Dataset file hash mismatch (modified after creation)');
+    if (await sha256File(path.join(directory, 'dataset.csv')) !== datasetRow.fileHash) throw new Error('Dataset file hash mismatch (modified after creation)');
+    await refuseWhileWebTrainingRuns(prisma);
     const python = defaultPython(ROOT);
     if (!existsSync(python)) throw new Error('Python environment missing: run pnpm ml:setup');
     const marker = await trainingMarker({ dataset: version, kind: 'AUTONOMOUS', startedAt: new Date().toISOString(), by: actor });

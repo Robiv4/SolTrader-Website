@@ -49,6 +49,37 @@ export function trainingStepStates(job: JobLike): Array<{ key: string; label: st
   });
 }
 
+export interface DatasetProgressLike {
+  phase: string;
+  replay: { processed: number; total: number };
+  live: { processed: number; total: number };
+  rows: { entry: number; position: number; replay: number; live: number };
+  excluded: number;
+  csv: { rowsWritten: number; bytes: number; chunks: number };
+  heapUsedMb: number;
+}
+
+const DATASET_PHASE_TEXT: Record<string, string> = {
+  COUNTING: 'Források számlálása', REPLAY: 'Snapshotok feldolgozása – REPLAY sorok', LIVE: 'LIVE sorok előállítása', WRITING_CSV: 'CSV írása',
+  MANIFEST: 'Manifest és checksum készítése', REGISTERING: 'Dataset regisztrálása', DONE: 'Dataset kész',
+};
+const count = (value: number) => value.toLocaleString('hu-HU');
+
+/** Measured dataset-preparation counts as label / value rows (only real numbers from the pipeline, no percentages). */
+export function datasetProgressRows(progress: DatasetProgressLike | null | undefined): Array<{ label: string; value: string }> {
+  if (!progress) return [];
+  return [
+    { label: 'Fázis', value: DATASET_PHASE_TEXT[progress.phase] ?? progress.phase },
+    { label: 'Feldolgozott ML snapshotok (REPLAY)', value: `${count(progress.replay.processed)} / ${count(progress.replay.total)}` },
+    { label: 'Feldolgozott döntési snapshotok (LIVE)', value: `${count(progress.live.processed)} / ${count(progress.live.total)}` },
+    { label: 'ENTRY / POSITION sorok', value: `${count(progress.rows.entry)} / ${count(progress.rows.position)}` },
+    { label: 'REPLAY / LIVE sorok', value: `${count(progress.rows.replay)} / ${count(progress.rows.live)}` },
+    { label: 'Kizárt minták', value: count(progress.excluded) },
+    { label: 'CSV-be írt sorok', value: `${count(progress.csv.rowsWritten)} (${(progress.csv.bytes / 1_048_576).toFixed(1)} MB, ${count(progress.csv.chunks)} rendezett darab)` },
+    { label: 'Memória (Node heap)', value: `${count(progress.heapUsedMb)} MB` },
+  ];
+}
+
 export function stepsDone(job: JobLike) {
   return trainingStepStates(job).filter((step) => step.state === 'done').length;
 }

@@ -108,6 +108,46 @@ pnpm ml:autonomous:status
   - `RESEARCH_ONLY`: everything else.
 - **Quality gate:** fewer than 300 rows per kind = no training at all.
 
+### Memory: streaming dataset preparation and training
+
+The web training and the CLI use the same builder (`buildAutonomousDatasetVersion`, apps/worker/src/training/pipeline.ts).
+Memory is bounded by page / chunk sizes, not by the database size:
+
+1. **Sources, paged:** `replaySourcePages` reads tracked snapshots with their outcome path keyset-paged
+   (`ML_DATASET_REPLAY_PAGE_SIZE`, default 200) and joins the community context of the page's candidates only.
+   `liveSourcePages` reads live snapshots per kind on the `(kind, at)` index (`ML_DATASET_LIVE_PAGE_SIZE`, default 500)
+   and joins the positions and the outcome paths of the page's own mints (same `pathFor` rule as before, so the
+   token-path join is correct across page boundaries). Pages are dropped after use.
+2. **Rows → sorted chunks:** rows are built by the same functions as the in-memory builder (`replaySourceRows`,
+   `liveSourceRow`), buffered up to `ML_DATASET_SORT_CHUNK_ROWS` (default 25 000), sorted and spilled to NDJSON chunk
+   files in a new own work directory (`ml/autonomous-datasets/.build-*`, with an `owner.json` marker).
+3. **Merge → CSV:** a k-way merge (at most 64 files at once, more in levels) writes `dataset.csv` line by line with a
+   streaming SHA-256 and the incremental manifest statistics (`AutonomousDatasetStats`: counts per kind / origin,
+   exclusions, null share per feature, label uncertainty, period, regimes, groups).
+4. **Commit:** a new version directory is reserved with an exclusive `mkdir` (two builders never get the same
+   version), the CSV is moved in, the manifest written, the hash re-read from disk and compared; then the label audit
+   rows and, last, the `MlDatasetVersion` row. Failure / cancel: the reserved directory and the work directory (both
+   own) are removed, nothing is registered. Existing datasets and models are never written.
+
+Output equality: for the same sources the CSV is byte-identical and the manifest equal to the previous in-memory
+builder (tests: `autonomous-dataset-parity.test.ts`, `dataset-writer.test.ts`, `dataset-streaming.e2e.test.ts`).
+Measured (synthetic, full 60-minute paths): 600 015 rows / 347 MB CSV under a 256 MB heap limit, peak heap 145 MB, the
+same SHA-256 as the old builder; 1 000 012 rows peak heap 173 MB. The old builder needed ~7 KB of heap per row
+(600 015 rows: 3.9 GB) and fails under 768 MB with the production error.
+
+**Python trainer:** by default `load_streaming` (ml/soltrader_ml/autonomous_data.py) reads the CSV in chunks: the
+meta / label columns into RAM, the raw feature values into a float64 memmap per kind in the work directory passed by
+the job (`--work-dir`, `ml/autonomous-models/.work-*`, removed after the child exits), category features as small
+integer codes. Column specs, training matrices (memory-mapped, built once per component, deleted after fitting) and
+predictions (in blocks) are computed from those arrays with the same element-wise code, so the bundle is identical to
+the in-memory path (`--in-memory`; test `test_autonomous_streaming.py`, plus a one-off check against the previous
+trainer: identical bundle, metrics and parity outputs). float64 is kept on purpose (float32 would change the LightGBM
+bins); hyperparameters, splits, purge / embargo, single thread and low priority are unchanged. Measured on the same 600 015-row
+synthetic dataset (553 860 POSITION rows): streaming peak private memory 724 MB (working set 1.8 GB incl. reclaimable
+memory-mapped file pages), 227 s; the previous in-memory path 3 366 MB, 305 s (it would exceed a 3 GB container);
+identical bundle and metrics. Free disk during a
+training: about 4x the final `dataset.csv` (measured: 347 MB CSV -> 575 MB raw arrays + the largest training matrix).
+
 ## Lifecycle (explicit administrator actions, e-mail confirmed)
 
 1. `TRAINED` (registered by the CLI) → `VALIDATED` → `SHADOW`. `POST /api/ml/autonomous/bundles/:v/status`, one step at a time. `INSUFFICIENT_DATA` never reaches SHADOW.

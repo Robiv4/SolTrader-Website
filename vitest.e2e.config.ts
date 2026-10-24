@@ -13,7 +13,7 @@ export default defineConfig({
   test: {
     globals: true,
     environment: 'node',
-    include: ['**/*.e2e.test.ts'],
+    include: ['**/*.e2e.test.ts', '**/*.stress.test.ts'],
     exclude: ['**/node_modules/**', '**/dist/**', '**/.next/**'],
     fileParallelism: false,
     testTimeout: 1_200_000,

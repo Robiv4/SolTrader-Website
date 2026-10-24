@@ -11,14 +11,22 @@ Policy thresholds (BUY / WAIT / SKIP, HOLD / PARTIAL_SELL / SELL) are chosen on 
 result of the decisions; the TEST block is only used for the final report (backtest, stress tests, regimes, periods).
 Splits are chronological with purge + embargo, and a token (group_id) never appears in two blocks.
 Readiness is conservative; a successful training run never means "fit to trade".
+
+Memory: by default the dataset is read in chunks into disk-backed arrays (autonomous_data.load_streaming); matrices are
+vectorized block-wise and memory-mapped, so the peak RAM does not grow with the full CSV. --in-memory keeps the
+original single-DataFrame path (same results; small datasets / reference).
 """
 from __future__ import annotations
 
 import argparse
+import gc
 import hashlib
 import json
 import math
+import os
 import random
+import shutil
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -26,7 +34,8 @@ import lightgbm as lgb
 import numpy as np
 import pandas as pd
 
-from .data import build_columns, load_schema, vectorize
+from .autonomous_data import load_in_memory, load_streaming
+from .data import load_schema
 from .metrics import classification_metrics, trading_stats
 from .models import LIGHTGBM_PARAMS, artifact_raw_score, export_artifact, fit_platt, probability, raw_score
 from .split import chronological_split, walk_forward
@@ -144,6 +153,46 @@ def backtest(net: np.ndarray, cost_impact: np.ndarray, mask: np.ndarray, size_us
     return stats
 
 
+def use_matrix(kind, columns, idx, fn):
+    """fn(x) with x = the vectorized rows idx (x[idx] of the in-memory path; a memory-mapped file for large data).
+    The file is closed and deleted right after use (disk space of the work directory)."""
+    holder = [kind.matrix(columns, idx)]
+    filename = getattr(holder[0], 'filename', None)
+    try:
+        return fn(holder[0])
+    finally:
+        mapped = getattr(holder[0], '_mmap', None)
+        holder.clear()
+        gc.collect()
+        if mapped is not None:
+            try:
+                mapped.close()
+            except (BufferError, ValueError):
+                pass
+        if filename:
+            try:
+                Path(filename).unlink()
+            except OSError:
+                pass
+
+
+def fit_rows(kind, columns, idx, seed: int, targets: list[tuple[str, np.ndarray]]):
+    """One model per (objective, labels) on the same vectorized training rows (built once)."""
+    return use_matrix(kind, columns, idx, lambda x: [fit(objective, x, y, seed) for objective, y in targets])
+
+
+def write_bundle(model_dir: Path, files: dict[str, str]):
+    """Immutable output: the version directory is created exclusively (a concurrent run with the same version fails),
+    metadata.json is written last (the registration requires it, so a crash never leaves a registrable bundle)."""
+    if model_dir.is_dir() and not any(model_dir.iterdir()):
+        model_dir.rmdir()  # an empty leftover directory holds nothing (os.rmdir refuses anything non-empty)
+    model_dir.mkdir(parents=True, exist_ok=False)
+    for name in ['bundle.json', 'parity.json', 'metadata.json']:
+        tmp = model_dir / f'.{name}.tmp'
+        tmp.write_text(files[name], encoding='utf-8')
+        os.replace(tmp, model_dir / name)
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description='Train the Autonomous ML bundle')
     parser.add_argument('--dataset', required=True)
@@ -151,78 +200,90 @@ def main(argv=None):
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--embargo-ms', type=int, default=60_000)
     parser.add_argument('--allow-small', action='store_true', help='smoke tests only (readiness stays INSUFFICIENT_DATA)')
+    parser.add_argument('--work-dir', help='own temporary directory for memory-mapped matrices (default: a new one under --out, removed afterwards)')
+    parser.add_argument('--in-memory', action='store_true', help='load the whole CSV into one DataFrame (small datasets / reference)')
     args = parser.parse_args(argv)
     random.seed(args.seed)
     np.random.seed(args.seed)
     directory = Path(args.dataset)
-    frame, manifest = load_autonomous(directory)
-    schema = load_schema(feature_version=manifest['featureVersion'])
     out_root = Path(args.out)
     out_root.mkdir(parents=True, exist_ok=True)
+    own_work_dir = args.work_dir is None
+    work_dir = Path(tempfile.mkdtemp(prefix='.work-', dir=out_root)) if own_work_dir else Path(args.work_dir)
+    try:
+        return train(args, directory, out_root, work_dir)
+    finally:
+        if own_work_dir:
+            shutil.rmtree(work_dir, ignore_errors=True)
+
+
+def train(args, directory: Path, out_root: Path, work_dir: Path):
+    manifest = json.loads((directory / 'manifest.json').read_text(encoding='utf-8'))
+    schema = load_schema(feature_version=manifest['featureVersion'])
     version = f"ML-AUTO-{manifest['version']}-s{args.seed}"
     model_dir = out_root / version
     if model_dir.exists() and any(model_dir.glob('*')):
         print(json.dumps({'status': 'MODEL_VERSION_EXISTS', 'failures': [f'{version} already exists (immutable)']}))
         return 4
-    entry = frame[(frame['kind'] == 'ENTRY') & frame['entry_net_pct'].notna()].reset_index(drop=True)
-    position = frame[(frame['kind'] == 'POSITION') & frame['hold_advantage_pct'].notna()].reset_index(drop=True)
+    emit('LOADING_DATASET', mode='in-memory' if args.in_memory else 'streaming')
+    kinds, manifest = load_in_memory(directory) if args.in_memory else load_streaming(directory, schema, work_dir)
+    entry, position = kinds['ENTRY'], kinds['POSITION']
     failures = []
-    if len(entry) < MIN_ROWS_PER_KIND:
-        failures.append(f'ENTRY rows {len(entry)} < {MIN_ROWS_PER_KIND}')
-    if len(position) < MIN_ROWS_PER_KIND:
-        failures.append(f'POSITION rows {len(position)} < {MIN_ROWS_PER_KIND}')
+    if entry.n < MIN_ROWS_PER_KIND:
+        failures.append(f'ENTRY rows {entry.n} < {MIN_ROWS_PER_KIND}')
+    if position.n < MIN_ROWS_PER_KIND:
+        failures.append(f'POSITION rows {position.n} < {MIN_ROWS_PER_KIND}')
     if failures and not args.allow_small:
         print(json.dumps({'status': 'DATA_QUALITY_GATE_FAILED', 'failures': failures}))
         return 3
 
     meta = {'featureVersion': manifest['featureVersion'], 'labelVersion': manifest['labelVersion']}
     components, metrics = {}, {'entry': {}, 'exit': {}}
-    emit('ENTRY_MODELS', entryRows=int(len(entry)))
+    emit('ENTRY_MODELS', entryRows=int(entry.n))
 
     # ---------------- entry components
-    tr, va, te, boundaries_entry, purged_entry = group_safe_split(entry, args.embargo_ms)
-    cols = build_columns(schema, entry.iloc[tr], 'lightgbm', exclude_groups=EXCLUDED_GROUPS)
-    x = vectorize(entry, cols, 'lightgbm')
-    net = entry['entry_net_pct'].to_numpy(dtype=float)
-    down = entry['entry_downside_pct'].to_numpy(dtype=float)
+    em = entry.meta
+    tr, va, te, boundaries_entry, purged_entry = group_safe_split(em, args.embargo_ms)
+    cols = entry.columns(schema, tr, EXCLUDED_GROUPS)
+    net = em['entry_net_pct'].to_numpy(dtype=float)
+    down = em['entry_downside_pct'].to_numpy(dtype=float)
     profit = (net > 0).astype(int)
-    m_ret = fit('regression', x[tr], net[tr], args.seed)
-    m_down = fit('regression', x[tr], down[tr], args.seed)
-    m_prof = fit('binary', x[tr], profit[tr], args.seed)
-    cal_prof = fit_platt(raw_score('lightgbm', m_prof, x[va]), profit[va]) if len(va) else None
-    pred = {name: model.predict(x, raw_score=True) for name, model in [('ret', m_ret), ('down', m_down), ('prof', m_prof)]}
+    m_ret, m_down, m_prof = fit_rows(entry, cols, tr, args.seed, [('regression', net[tr]), ('regression', down[tr]), ('binary', profit[tr])])
+    pred = {name: entry.predict(model, cols) for name, model in [('ret', m_ret), ('down', m_down), ('prof', m_prof)]}
+    # == raw_score(m_prof, x[va]): predictions are row-wise, the validation rows of the full prediction.
+    cal_prof = fit_platt(pred['prof'][va], profit[va]) if len(va) else None
     p_prof = probability(pred['prof'], cal_prof)
     entry_policy, val_value = choose_entry_policy(p_prof[va], pred['ret'][va], pred['down'][va], net[va])
-    cost_impact = entry['entry_cost_pct'].fillna(0).to_numpy(dtype=float)
-    impact_parts = (entry['entry_entry_impact_pct'].fillna(0) + entry['entry_exit_impact_pct'].fillna(0)).to_numpy(dtype=float)
+    cost_impact = em['entry_cost_pct'].fillna(0).to_numpy(dtype=float)
+    impact_parts = (em['entry_entry_impact_pct'].fillna(0) + em['entry_exit_impact_pct'].fillna(0)).to_numpy(dtype=float)
     selected = entry_selected(entry_policy, p_prof, pred['ret'], pred['down'])
-    test_mask = np.zeros(len(entry), dtype=bool)
+    test_mask = np.zeros(entry.n, dtype=bool)
     test_mask[te] = True
     rng = np.random.default_rng(args.seed)
-    random_mask = np.zeros(len(entry), dtype=bool)
+    random_mask = np.zeros(entry.n, dtype=bool)
     chosen = int((selected & test_mask).sum())
     if chosen and len(te):
         random_mask[rng.choice(te, size=min(chosen, len(te)), replace=False)] = True
     stress = {f'impactX{m}': backtest(net - (m - 1) * impact_parts, cost_impact, selected & test_mask) for m in (2, 3)}
     regimes = {}
-    for regime in sorted(entry['market_regime'].fillna('UNKNOWN').unique()):
-        mask = test_mask & (entry['market_regime'].fillna('UNKNOWN') == regime).to_numpy()
+    for regime in sorted(em['market_regime'].fillna('UNKNOWN').unique()):
+        mask = test_mask & (em['market_regime'].fillna('UNKNOWN') == regime).to_numpy()
         regimes[regime] = {'rows': int(mask.sum()), **backtest(net, cost_impact, selected & mask)}
     periods = []
     for block in np.array_split(np.array(te), 3) if len(te) >= 3 else []:
-        mask = np.zeros(len(entry), dtype=bool)
+        mask = np.zeros(entry.n, dtype=bool)
         mask[block] = True
-        periods.append({'fromMs': int(entry['snapshot_at_ms'].iloc[block[0]]), 'toMs': int(entry['snapshot_at_ms'].iloc[block[-1]]), **backtest(net, cost_impact, selected & mask)})
+        periods.append({'fromMs': int(em['snapshot_at_ms'].iloc[block[0]]), 'toMs': int(em['snapshot_at_ms'].iloc[block[-1]]), **backtest(net, cost_impact, selected & mask)})
     positives_skipped = test_mask & ~selected & (net > 0)
     folds = []
-    for fold in walk_forward(entry['snapshot_at_ms'].to_numpy(dtype=np.int64), entry['label_end_ms'].to_numpy(dtype=np.int64), folds=4, embargo_ms=args.embargo_ms):
+    for fold in walk_forward(em['snapshot_at_ms'].to_numpy(dtype=np.int64), em['label_end_ms'].to_numpy(dtype=np.int64), folds=4, embargo_ms=args.embargo_ms):
         if len(fold['train']) < 50 or len(fold['test']) < 10:
             continue
-        f_cols = build_columns(schema, entry.iloc[fold['train']], 'lightgbm', exclude_groups=EXCLUDED_GROUPS)
-        fx = vectorize(entry, f_cols, 'lightgbm')
-        f_ret = fit('regression', fx[fold['train']], net[fold['train']], args.seed).predict(fx[fold['test']], raw_score=True)
-        f_down = fit('regression', fx[fold['train']], down[fold['train']], args.seed).predict(fx[fold['test']], raw_score=True)
-        f_prof = probability(fit('binary', fx[fold['train']], profit[fold['train']], args.seed).predict(fx[fold['test']], raw_score=True), None)
+        f_cols = entry.columns(schema, fold['train'], EXCLUDED_GROUPS)
+        fm_ret, fm_down, fm_prof = fit_rows(entry, f_cols, fold['train'], args.seed, [('regression', net[fold['train']]), ('regression', down[fold['train']]), ('binary', profit[fold['train']])])
+        f_ret = entry.predict(fm_ret, f_cols, fold['test'])
+        f_down = entry.predict(fm_down, f_cols, fold['test'])
+        f_prof = probability(entry.predict(fm_prof, f_cols, fold['test']), None)
         mask = entry_selected(entry_policy, f_prof, f_ret, f_down)
         folds.append({'fold': fold['fold'], 'testRows': int(len(fold['test'])), 'spearman': spearman(net[fold['test']], f_ret), **backtest(net[fold['test']], cost_impact[fold['test']], mask)})
     train_rho, test_rho = spearman(net[tr], pred['ret'][tr]), spearman(net[te], pred['ret'][te])
@@ -243,17 +304,17 @@ def main(argv=None):
         components[name] = artifact
 
     # ---------------- exit components
-    emit('EXIT_MODELS', positionRows=int(len(position)))
-    tr, va, te, boundaries_exit, purged_exit = group_safe_split(position, args.embargo_ms)
-    pcols = build_columns(schema, position.iloc[tr], 'lightgbm', exclude_groups=EXCLUDED_GROUPS)
-    px = vectorize(position, pcols, 'lightgbm')
-    adv = position['hold_advantage_pct'].to_numpy(dtype=float)
+    emit('EXIT_MODELS', positionRows=int(position.n))
+    pm = position.meta
+    tr, va, te, boundaries_exit, purged_exit = group_safe_split(pm, args.embargo_ms)
+    pcols = position.columns(schema, tr, EXCLUDED_GROUPS)
+    adv = pm['hold_advantage_pct'].to_numpy(dtype=float)
     hold = (adv > 0).astype(int)
-    m_adv = fit('regression', px[tr], adv[tr], args.seed)
-    m_hold = fit('binary', px[tr], hold[tr], args.seed)
-    cal_hold = fit_platt(raw_score('lightgbm', m_hold, px[va]), hold[va]) if len(va) else None
-    p_adv = m_adv.predict(px, raw_score=True)
-    p_hold = probability(m_hold.predict(px, raw_score=True), cal_hold)
+    m_adv, m_hold = fit_rows(position, pcols, tr, args.seed, [('regression', adv[tr]), ('binary', hold[tr])])
+    raw_hold = position.predict(m_hold, pcols)
+    cal_hold = fit_platt(raw_hold[va], hold[va]) if len(va) else None
+    p_adv = position.predict(m_adv, pcols)
+    p_hold = probability(raw_hold, cal_hold)
     exit_policy, exit_val = choose_exit_policy(p_adv[va], p_hold[va], adv[va])
     sell, partial = exit_actions(exit_policy, p_adv[te], p_hold[te])
     metrics['exit'] = {
@@ -273,9 +334,9 @@ def main(argv=None):
     emit('VALIDATION')
     # ---------------- parity: exported trees == LightGBM (the TypeScript runtime replays the same trees)
     parity = 0.0
-    for name, model, matrix in [('entryReturn', m_ret, x), ('entryProfit', m_prof, x), ('exitAdvantage', m_adv, px)]:
-        sample = matrix[: min(200, len(matrix))]
-        parity = max(parity, float(np.max(np.abs(artifact_raw_score(components[name], sample) - model.predict(sample, raw_score=True)))) if len(sample) else 0.0)
+    for name, model, kind, columns in [('entryReturn', m_ret, entry, cols), ('entryProfit', m_prof, entry, cols), ('exitAdvantage', m_adv, position, pcols)]:
+        diff = use_matrix(kind, columns, np.arange(min(200, kind.n)), lambda sample: float(np.max(np.abs(artifact_raw_score(components[name], sample) - model.predict(sample, raw_score=True)))) if len(sample) else 0.0)
+        parity = max(parity, diff)
     if parity > 1e-6:
         print(json.dumps({'status': 'EXPORT_PARITY_FAILED', 'failures': [f'max diff {parity}']}))
         return 5
@@ -284,33 +345,38 @@ def main(argv=None):
     stressed = metrics['entry']['liquidityStress']['impactX2']
     positive_folds = [fold for fold in folds if fold['netPnl'] > 0]
     ready = (
-        not failures and len(entry) >= READY_MIN_ROWS and len(position) >= READY_MIN_ROWS and test_bt['trades'] >= 30 and test_bt['netPnl'] > 0
+        not failures and entry.n >= READY_MIN_ROWS and position.n >= READY_MIN_ROWS and test_bt['trades'] >= 30 and test_bt['netPnl'] > 0
         and (test_bt['profitFactor'] or 0) >= 1.2 and stressed['netPnl'] > 0 and len(folds) >= 3 and len(positive_folds) / len(folds) >= 0.75 and not metrics['entry']['overfitting']['risk']
         and metrics['exit']['test']['policyValuePct'] >= 0
     )
-    readiness = 'INSUFFICIENT_DATA' if failures or len(entry) < READY_MIN_ROWS or len(position) < READY_MIN_ROWS else 'SHADOW_READY' if ready else 'RESEARCH_ONLY'
+    readiness = 'INSUFFICIENT_DATA' if failures or entry.n < READY_MIN_ROWS or position.n < READY_MIN_ROWS else 'SHADOW_READY' if ready else 'RESEARCH_ONLY'
     trained_at = datetime.now(timezone.utc).isoformat()
     bundle = {
         'format': BUNDLE_FORMAT, 'bundleVersion': version, 'featureVersion': manifest['featureVersion'], 'labelVersion': manifest['labelVersion'], 'datasetVersion': manifest['version'],
         'createdAt': trained_at, 'components': components, 'policy': {'entry': entry_policy, 'exit': exit_policy}, 'sizing': dict(DEFAULT_SIZING),
     }
     emit('SAVING', readiness=readiness)
-    model_dir.mkdir(parents=True, exist_ok=True)
     text = json.dumps(bundle, separators=(',', ':'))
-    (model_dir / 'bundle.json').write_text(text, encoding='utf-8')
     artifact_hash = hashlib.sha256(text.encode('utf-8')).hexdigest()
     metadata = {
         'bundleVersion': version, 'status': 'TRAINED', 'readiness': readiness, 'featureVersion': manifest['featureVersion'], 'labelVersion': manifest['labelVersion'], 'datasetVersion': manifest['version'],
         'policy': bundle['policy'], 'sizing': bundle['sizing'], 'metrics': {**metrics, 'exportParityMaxDiff': parity, 'dataQualityFailures': failures, 'coverage': manifest.get('coverage')},
         'artifactHash': artifact_hash, 'trainedAt': trained_at, 'packages': package_versions(), 'seed': args.seed,
     }
-    (model_dir / 'metadata.json').write_text(json.dumps(metadata, indent=2, default=str), encoding='utf-8')
     # Parity fixture rows for the TypeScript test (features + expected raw outputs).
-    sample = entry.head(20)
-    sample_x = vectorize(sample, cols, 'lightgbm')
-    rows = [{'features': {spec['name']: (None if pd.isna(sample.iloc[i].get(spec['name'])) else sample.iloc[i].get(spec['name'])) for spec in schema['features'] if spec['name'] in sample.columns},
-             'entryReturn': float(m_ret.predict(sample_x[i:i + 1], raw_score=True)[0])} for i in range(len(sample))]
-    (model_dir / 'parity.json').write_text(json.dumps(rows, default=lambda value: value.item() if hasattr(value, 'item') else str(value)), encoding='utf-8')
+    count = min(20, entry.n)
+    names = {spec['name'] for spec in schema['features']}
+    raw_rows = entry.raw_rows(count)
+    expected = use_matrix(entry, cols, np.arange(count), lambda sample_x: [float(m_ret.predict(sample_x[i:i + 1], raw_score=True)[0]) for i in range(count)])
+    rows = [{'features': {name: (None if pd.isna(value) else value) for name, value in raw_rows[i].items() if name in names}, 'entryReturn': expected[i]} for i in range(count)]
+    try:
+        write_bundle(model_dir, {
+            'bundle.json': text, 'metadata.json': json.dumps(metadata, indent=2, default=str),
+            'parity.json': json.dumps(rows, default=lambda value: value.item() if hasattr(value, 'item') else str(value)),
+        })
+    except FileExistsError:
+        print(json.dumps({'status': 'MODEL_VERSION_EXISTS', 'failures': [f'{version} already exists (immutable, created concurrently)']}))
+        return 4
     print(json.dumps({'status': 'TRAINED', 'bundleVersion': version, 'readiness': readiness, 'dir': str(model_dir)}))
     return 0
 
